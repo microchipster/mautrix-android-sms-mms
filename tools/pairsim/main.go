@@ -70,6 +70,8 @@ type simConfig struct {
 	seed            bool
 	seedMMSPath     string
 	seedMMSText     string
+	seedRecipients  []string
+	seedSender      string
 	simSubID        int
 	simThreadID     int64
 	firstRow        int64
@@ -177,11 +179,23 @@ type pairEventsResponse struct {
 }
 
 type pairHeartbeatRequest struct {
-	DeviceID      string          `json:"device_id,omitempty"`
-	BatteryPct    int             `json:"battery_pct,omitempty"`
-	DefaultSMSApp bool            `json:"default_sms_app,omitempty"`
-	Permissions   map[string]bool `json:"permissions,omitempty"`
-	AppVersion    string          `json:"app_version,omitempty"`
+	DeviceID      string            `json:"device_id,omitempty"`
+	BatteryPct    int               `json:"battery_pct,omitempty"`
+	DefaultSMSApp bool              `json:"default_sms_app,omitempty"`
+	Permissions   map[string]bool   `json:"permissions,omitempty"`
+	AppVersion    string            `json:"app_version,omitempty"`
+	Subscriptions []simSubscription `json:"subscriptions,omitempty"`
+}
+
+// simSubscription mirrors the agent Subscription shape the bridge accepts in
+// heartbeats so it can exclude the phone's own numbers from participants.
+type simSubscription struct {
+	SubID       int    `json:"sub_id"`
+	SimSlot     int    `json:"sim_slot,omitempty"`
+	DisplayName string `json:"display_name,omitempty"`
+	Carrier     string `json:"carrier,omitempty"`
+	Number      string `json:"number,omitempty"`
+	DefaultSMS  bool   `json:"default_sms,omitempty"`
 }
 
 type errorResponse struct {
@@ -242,6 +256,7 @@ type simAttachment struct {
 
 func parseFlags() simConfig {
 	cfg := simConfig{}
+	var seedRecipientsRaw string
 	flag.StringVar(&cfg.bridgeURL, "bridge-url", "http://127.0.0.1:29322", "Bridge pairing API base URL")
 	flag.StringVar(&cfg.code, "code", "", "Pairing code displayed by the bridge management room login flow (required in pair/listen mode)")
 	flag.StringVar(&cfg.mode, "mode", "listen", "What to do after `pair`: `listen` (queue/heartbeat loop) or `pair` (exit after printing the token)")
@@ -253,6 +268,8 @@ func parseFlags() simConfig {
 	flag.BoolVar(&cfg.seed, "seed", true, "After pairing, post one fake incoming SMS so a portal room exists")
 	flag.StringVar(&cfg.seedMMSPath, "seed-mms", "", "After pairing, also post one fake incoming MMS carrying this file inline as base64 (exercises the app transport attachment path)")
 	flag.StringVar(&cfg.seedMMSText, "seed-mms-text", "Photo from the simulated phone", "Text body used with -seed-mms")
+	flag.StringVar(&seedRecipientsRaw, "seed-recipients", "", "Comma-separated recipient list for seeded messages (default: just -local-number); set this to seed a group MMS thread")
+	flag.StringVar(&cfg.seedSender, "seed-sender", "", "Sender address for seeded messages (default: -remote-number); use one of -seed-recipients for group threads")
 	flag.IntVar(&cfg.simSubID, "sub-id", 1, "SIM subscription ID used for fake messages")
 	flag.Int64Var(&cfg.simThreadID, "thread-id", 7, "Phone thread ID used for fake messages")
 	flag.Int64Var(&cfg.firstRow, "first-row", 9001, "First fake telephony provider row ID (bump it to avoid clashing with previous runs)")
@@ -270,6 +287,8 @@ func parseFlags() simConfig {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	cfg.seedRecipients = splitCSV(seedRecipientsRaw)
 
 	if cfg.deviceID == "" {
 		cfg.deviceID = "android-sim-" + randomHex(4)
@@ -352,6 +371,10 @@ func (s *sim) run(ctx context.Context) error {
 		log.Printf("mode=pair: exiting; token is not persisted")
 		return nil
 	}
+
+	// Report the SIM subscriptions before seeding so the bridge knows the
+	// phone's own numbers and excludes them from the seeded thread.
+	s.sendHeartbeat(ctx)
 
 	go s.heartbeatLoop(ctx)
 	if s.cfg.seed {
@@ -584,8 +607,8 @@ func (s *sim) seedPortal(ctx context.Context) error {
 		ThreadID:    s.cfg.simThreadID,
 		SubID:       s.cfg.simSubID,
 		TimestampMS: nowMS,
-		Sender:      s.cfg.simRemoteNumber,
-		Recipients:  []string{s.cfg.simLocalNumber},
+		Sender:      s.seedSender(),
+		Recipients:  s.seedParticipants(),
 		Body:        "Hello from the simulated phone",
 		Type:        1,
 		Read:        false,
@@ -596,7 +619,7 @@ func (s *sim) seedPortal(ctx context.Context) error {
 		ThreadID:      s.cfg.simThreadID,
 		SubID:         s.cfg.simSubID,
 		TimestampMS:   nowMS,
-		Sender:        s.cfg.simRemoteNumber,
+		Sender:        s.seedSender(),
 		HasAttachment: false,
 		Preview:       message.Body,
 		Recipients:    message.Recipients,
@@ -605,7 +628,7 @@ func (s *sim) seedPortal(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	log.Printf("seeded incoming SMS %s from %s in thread %d", messageID, s.cfg.simRemoteNumber, s.cfg.simThreadID)
+	log.Printf("seeded incoming SMS %s from %s to %v in thread %d", messageID, s.seedSender(), message.Recipients, s.cfg.simThreadID)
 	return nil
 }
 
@@ -626,8 +649,8 @@ func (s *sim) seedMMS(ctx context.Context) error {
 		ThreadID:    s.cfg.simThreadID,
 		SubID:       s.cfg.simSubID,
 		TimestampMS: nowMS,
-		Sender:      s.cfg.simRemoteNumber,
-		Recipients:  []string{s.cfg.simLocalNumber},
+		Sender:      s.seedSender(),
+		Recipients:  s.seedParticipants(),
 		Body:        s.cfg.seedMMSText,
 		IsMMS:       true,
 		Type:        1,
@@ -646,7 +669,7 @@ func (s *sim) seedMMS(ctx context.Context) error {
 		ThreadID:      s.cfg.simThreadID,
 		SubID:         s.cfg.simSubID,
 		TimestampMS:   nowMS,
-		Sender:        s.cfg.simRemoteNumber,
+		Sender:        s.seedSender(),
 		IsMMS:         true,
 		HasAttachment: true,
 		Preview:       message.Body,
@@ -656,7 +679,7 @@ func (s *sim) seedMMS(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	log.Printf("seeded incoming MMS %s with inline attachment %s (%s, %d bytes)", messageID, fileName, contentType, len(data))
+	log.Printf("seeded incoming MMS %s from %s to %v with inline attachment %s (%s, %d bytes)", messageID, s.seedSender(), message.Recipients, fileName, contentType, len(data))
 	return nil
 }
 
@@ -675,6 +698,39 @@ func contentTypeForFile(name string) string {
 	default:
 		return "application/octet-stream"
 	}
+}
+
+// seedParticipants returns the recipient set for seeded messages (group MMS
+// threads include several numbers here; the default is just the phone itself).
+func (s *sim) seedParticipants() []string {
+	if len(s.cfg.seedRecipients) > 0 {
+		return append([]string(nil), s.cfg.seedRecipients...)
+	}
+	return []string{s.cfg.simLocalNumber}
+}
+
+// seedSender returns the sender address for seeded messages.
+func (s *sim) seedSender() string {
+	if s.cfg.seedSender != "" {
+		return s.cfg.seedSender
+	}
+	return s.cfg.simRemoteNumber
+}
+
+// splitCSV parses a comma-separated flag value, trimming whitespace and
+// ignoring empty entries.
+func splitCSV(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -702,31 +758,42 @@ func (s *sim) postEvents(ctx context.Context, events []postedEvent) error {
 func (s *sim) heartbeatLoop(ctx context.Context) {
 	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
-	beat := func() {
-		reqCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		defer cancel()
-		_, err := s.doJSON(reqCtx, http.MethodPost, pairingPathPrefix+"/heartbeat", pairHeartbeatRequest{
-			DeviceID:      s.cfg.deviceID,
-			BatteryPct:    88,
-			DefaultSMSApp: true,
-			Permissions:   map[string]bool{"receive_sms": true, "send_mms": true, "mark_read": true},
-			AppVersion:    s.cfg.appVersion,
-		}, true, nil)
-		if err != nil {
-			log.Printf("heartbeat failed: %v", err)
-			return
-		}
-		log.Printf("heartbeat sent")
-	}
-	beat()
+	s.sendHeartbeat(ctx)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			beat()
+			s.sendHeartbeat(ctx)
 		}
 	}
+}
+
+// sendHeartbeat posts one heartbeat (with the simulated SIM subscription, so
+// the bridge learns the phone's own number).
+func (s *sim) sendHeartbeat(ctx context.Context) {
+	reqCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	_, err := s.doJSON(reqCtx, http.MethodPost, pairingPathPrefix+"/heartbeat", pairHeartbeatRequest{
+		DeviceID:      s.cfg.deviceID,
+		BatteryPct:    88,
+		DefaultSMSApp: true,
+		Permissions:   map[string]bool{"receive_sms": true, "send_mms": true, "mark_read": true},
+		AppVersion:    s.cfg.appVersion,
+		Subscriptions: []simSubscription{{
+			SubID:       s.cfg.simSubID,
+			SimSlot:     0,
+			DisplayName: "SIM 1",
+			Carrier:     "Simcarrier",
+			Number:      s.cfg.simLocalNumber,
+			DefaultSMS:  true,
+		}},
+	}, true, nil)
+	if err != nil {
+		log.Printf("heartbeat failed: %v", err)
+		return
+	}
+	log.Printf("heartbeat sent")
 }
 
 // ---------------------------------------------------------------------------
