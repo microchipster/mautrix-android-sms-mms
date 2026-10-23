@@ -370,7 +370,7 @@ func (nc *MyNetworkClient) rememberThreadRecipients(threadID int64, subID int, r
 	}
 	thread := nc.threads[threadID]
 	thread.ID = threadID
-	if subID != 0 {
+	if subID > 0 {
 		thread.SubID = subID
 	}
 	thread.Recipients = append([]string{}, recipients...)
@@ -436,6 +436,31 @@ func (nc *MyNetworkClient) handleAgentMessageUpdate(ctx context.Context, msgID s
 // handleAgentThreadUpdate refreshes the participant cache and, when the portal
 // already exists, pushes the new participant list to the Matrix room. Thread ID
 // changes never create a new room.
+// findPortalForThread locates the existing portal for a phone thread when the
+// event does not carry enough identity to rebuild the device-scoped portal
+// key. App transports report sub_id -1 on thread.updated events (the phone
+// thread identity there is implicit), so fall back to scanning the portals
+// already linked to this login.
+func (nc *MyNetworkClient) findPortalForThread(ctx context.Context, threadID int64) (*bridgev2.Portal, networkid.PortalKey, bool) {
+	userPortals, err := nc.bridge.DB.UserPortal.GetAllForLogin(ctx, nc.login.UserLogin)
+	if err != nil {
+		nc.log.Warn().Err(err).Msg("Failed to list portals for thread update fallback")
+		return nil, networkid.PortalKey{}, false
+	}
+	for _, userPortal := range userPortals {
+		portal, err := nc.bridge.GetExistingPortalByKey(ctx, userPortal.Portal)
+		if err != nil || portal == nil || portal.MXID == "" {
+			continue
+		}
+		meta, _ := portal.Metadata.(*PortalMetadata)
+		if meta == nil || meta.ThreadID != threadID {
+			continue
+		}
+		return portal, userPortal.Portal, true
+	}
+	return nil, networkid.PortalKey{}, false
+}
+
 func (nc *MyNetworkClient) handleAgentThreadUpdate(ctx context.Context, ev remoteEvent) {
 	nc.refreshThreads(ctx)
 	// App transports have no thread list endpoint, so the recipients carried
@@ -443,13 +468,28 @@ func (nc *MyNetworkClient) handleAgentThreadUpdate(ctx context.Context, ev remot
 	// restart (e.g. portals that were stored without participants).
 	nc.rememberThreadRecipients(ev.ThreadID, ev.SubID, ev.Recipients)
 	thread, ok := nc.cachedThread(ev.ThreadID)
+	nc.log.Debug().
+		Int64("thread_id", ev.ThreadID).
+		Int("sub_id", ev.SubID).
+		Strs("event_recipients", ev.Recipients).
+		Bool("cached", ok).
+		Msg("Handling thread update event")
 	if !ok {
 		return
 	}
 	portalKey := nc.portalKeyFor(thread.ID, thread.SubID)
 	portal, err := nc.bridge.GetExistingPortalByKey(ctx, portalKey)
 	if err != nil || portal == nil || portal.MXID == "" {
-		return
+		fallbackPortal, fallbackKey, ok := nc.findPortalForThread(ctx, thread.ID)
+		if !ok {
+			nc.log.Debug().
+				Str("portal_id", string(portalKey.ID)).
+				Any("err", err).
+				Msg("No portal to update for thread update event")
+			return
+		}
+		portal = fallbackPortal
+		portalKey = fallbackKey
 	}
 	chatInfo := nc.chatInfoForThread(ctx, thread)
 	if nc.applyPortalThread(portal, thread) {
@@ -642,7 +682,7 @@ func (nc *MyNetworkClient) applyPortalThread(portal *bridgev2.Portal, thread age
 		meta.ThreadID = thread.ID
 		changed = true
 	}
-	if thread.SubID != 0 && meta.SubID != thread.SubID {
+	if thread.SubID > 0 && meta.SubID != thread.SubID {
 		meta.SubID = thread.SubID
 		changed = true
 	}

@@ -630,6 +630,16 @@ func (s *pairingServer) handleEvents(w http.ResponseWriter, r *http.Request) {
 			accepted++
 		}
 	}
+	if len(req.Events) > 0 {
+		ev := s.log.Debug().
+			Str("device_id", device.deviceID).
+			Int("received", len(req.Events)).
+			Int("accepted", accepted)
+		for _, item := range req.Events {
+			ev = ev.Str("ev_"+item.Type, fmt.Sprintf("thread=%d recipients=%d", item.ThreadID, len(item.Recipients)))
+		}
+		ev.Msg("Received device events")
+	}
 	cursor := maxCursor(req.Cursor, device.snapshot().LastEventSeq)
 	writePairJSON(w, http.StatusOK, pairEventsResponse{Cursor: cursor, Accepted: accepted})
 }

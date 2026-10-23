@@ -47,6 +47,21 @@ func TestRememberThreadRecipients(t *testing.T) {
 	if len(thread.Recipients) != 2 || thread.SubID != 1 {
 		t.Fatalf("recipients after update = %+v", thread)
 	}
+
+	// App transports report sub_id -1 on thread.updated events when the
+	// phone thread identity is implicit; that must not overwrite a known sub.
+	nc.rememberThreadRecipients(33, -1, []string{"+15551112222"})
+	thread, _ = nc.cachedThread(33)
+	if thread.SubID != 1 {
+		t.Fatalf("sub id clobbered by unknown update: %+v", thread)
+	}
+
+	// A real sub id still wins.
+	nc.rememberThreadRecipients(33, 2, []string{"+15551112222"})
+	thread, _ = nc.cachedThread(33)
+	if thread.SubID != 2 {
+		t.Fatalf("sub id not updated: %+v", thread)
+	}
 }
 
 func TestMmsRowID(t *testing.T) {

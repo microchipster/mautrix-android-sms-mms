@@ -473,7 +473,7 @@ func (nc *MyNetworkClient) HandleMatrixReadReceipt(ctx context.Context, msg *bri
 	if nc.device != nil {
 		// Fire-and-forget: the read command is queued and acknowledged by the
 		// app's next events batch.
-		nc.device.enqueue(pairCommand{Type: "mark_read", ThreadID: meta.ThreadID, UpToMS: upToMS})
+		nc.device.enqueue(pairCommand{Type: "mark_read", ThreadID: meta.ThreadID, SubID: meta.SubID, UpToMS: upToMS})
 		return nil
 	}
 	if _, err := nc.agent.Read(ctx, meta.ThreadID, upToMS, nil); err != nil {

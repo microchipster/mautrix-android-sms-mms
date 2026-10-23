@@ -134,10 +134,12 @@ App → bridge event push; body is the agent `Event` shape plus payloads:
 Also `message.updated` (read/seen/status changes), `mms.downloaded`, `thread.updated`
 (`thread.updated` may carry `recipients`, the current participant list of the thread; app
 transports have no thread list endpoint, so this is how the bridge refreshes a portal's
-stored participants — e.g. after a bridge restart — without waiting for a new message),
-`send.result` (outcome for a queue command: `{send_id, message_id, thread_id, parts_sent,
-pending}` or `{send_id, error: {code, message}}`) and `ack` (a non-send queue command was
-handled: `{seq, type: "ack", send_id: "ack-<command_seq>", command_seq, thread_id, sub_id,
+stored participants — e.g. after a bridge restart — without waiting for a new message).
+When the phone cannot resolve the SIM for a thread it reports `sub_id: -1`; the bridge
+then matches the portal by thread id instead of rebuilding the device-scoped portal key.
+Other events: `send.result` (outcome for a queue command: `{send_id, message_id, thread_id,
+parts_sent, pending}` or `{send_id, error: {code, message}}`) and `ack` (a non-send queue
+command was handled: `{seq, type: "ack", send_id: "ack-<command_seq>", command_seq, thread_id, sub_id,
 timestamp_ms}` plus an optional `error: {code, message}`; `command_seq` is optional and
 carries the acknowledged command's queue sequence). An `ack` removes the matching
 queued command (`send_id`, the `ack-<seq>` suffix, or `command_seq` when present) so it is
