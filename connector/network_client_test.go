@@ -237,6 +237,20 @@ func TestAttachmentDataErrors(t *testing.T) {
 	if err != nil || string(data) != "png" || contentType != "image/png" {
 		t.Fatalf("inline data = %q, %q, %v", data, contentType, err)
 	}
+	// App-paired logins have no agent client: inline data must work, and a
+	// missing inline payload must return an error instead of panicking on the
+	// nil client.
+	data, contentType, err = attachmentData(context.Background(), nil, 534, agentapi.Attachment{
+		ContentType: "image/png",
+		PartID:      901,
+		Base64:      base64.StdEncoding.EncodeToString([]byte("png")),
+	})
+	if err != nil || string(data) != "png" || contentType != "image/png" {
+		t.Fatalf("inline data with nil agent = %q, %q, %v", data, contentType, err)
+	}
+	if _, _, err = attachmentData(context.Background(), nil, 534, agentapi.Attachment{PartID: 901}); err == nil {
+		t.Fatal("expected error when there is no inline data and no agent client")
+	}
 }
 
 func TestBuildRoomFeatures(t *testing.T) {

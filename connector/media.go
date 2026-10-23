@@ -93,6 +93,11 @@ func attachmentData(ctx context.Context, agent *AgentClient, mmsID int64, attach
 	if attachment.PartID == 0 || mmsID == 0 {
 		return nil, "", fmt.Errorf("attachment has no part id and no inline data")
 	}
+	if agent == nil {
+		// App-paired logins have no inbound HTTP agent: the phone must inline
+		// attachment bytes. Never dereference a nil client (this used to panic).
+		return nil, "", fmt.Errorf("attachment part %d has no inline data and the login has no agent client", attachment.PartID)
+	}
 	return agent.PartBytes(ctx, mmsID, attachment.PartID)
 }
 

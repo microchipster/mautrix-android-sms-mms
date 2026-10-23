@@ -42,6 +42,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -67,6 +68,8 @@ type simConfig struct {
 
 	waitMS          int
 	seed            bool
+	seedMMSPath     string
+	seedMMSText     string
 	simSubID        int
 	simThreadID     int64
 	firstRow        int64
@@ -207,19 +210,31 @@ type postedEvent struct {
 
 // simMessage is the agent Message shape of one phone-side row.
 type simMessage struct {
-	ID              string   `json:"id"`
-	ThreadID        int64    `json:"thread_id"`
-	SubID           int      `json:"sub_id"`
-	TimestampMS     int64    `json:"timestamp_ms"`
-	TimestampSentMS int64    `json:"timestamp_sent_ms,omitempty"`
-	Sender          string   `json:"sender"`
-	Recipients      []string `json:"recipients"`
-	Body            string   `json:"body,omitempty"`
-	IsMMS           bool     `json:"is_mms"`
-	Type            int      `json:"type"` // 1 inbox, 2 sent
-	Read            bool     `json:"read"`
-	Seen            bool     `json:"seen"`
-	Status          int      `json:"status"`
+	ID              string          `json:"id"`
+	ThreadID        int64           `json:"thread_id"`
+	SubID           int             `json:"sub_id"`
+	TimestampMS     int64           `json:"timestamp_ms"`
+	TimestampSentMS int64           `json:"timestamp_sent_ms,omitempty"`
+	Sender          string          `json:"sender"`
+	Recipients      []string        `json:"recipients"`
+	Body            string          `json:"body,omitempty"`
+	IsMMS           bool            `json:"is_mms"`
+	Type            int             `json:"type"` // 1 inbox, 2 sent
+	Read            bool            `json:"read"`
+	Seen            bool            `json:"seen"`
+	Status          int             `json:"status"`
+	Attachments     []simAttachment `json:"attachments,omitempty"`
+}
+
+// simAttachment is the agent Attachment shape. The app transport inlines the
+// bytes as base64 because the bridge cannot fetch parts from a NATed phone.
+type simAttachment struct {
+	PartID      int64  `json:"part_id,omitempty"`
+	ContentType string `json:"content_type,omitempty"`
+	FileName    string `json:"file_name,omitempty"`
+	Size        int64  `json:"size,omitempty"`
+	URL         string `json:"url,omitempty"`
+	Base64      string `json:"base64,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -236,6 +251,8 @@ func parseFlags() simConfig {
 	flag.StringVar(&cfg.appVersion, "app-version", defaultAppVersion, "App version to report")
 	flag.IntVar(&cfg.waitMS, "wait-ms", 25000, "Queue long-poll wait in milliseconds (capped by the bridge)")
 	flag.BoolVar(&cfg.seed, "seed", true, "After pairing, post one fake incoming SMS so a portal room exists")
+	flag.StringVar(&cfg.seedMMSPath, "seed-mms", "", "After pairing, also post one fake incoming MMS carrying this file inline as base64 (exercises the app transport attachment path)")
+	flag.StringVar(&cfg.seedMMSText, "seed-mms-text", "Photo from the simulated phone", "Text body used with -seed-mms")
 	flag.IntVar(&cfg.simSubID, "sub-id", 1, "SIM subscription ID used for fake messages")
 	flag.Int64Var(&cfg.simThreadID, "thread-id", 7, "Phone thread ID used for fake messages")
 	flag.Int64Var(&cfg.firstRow, "first-row", 9001, "First fake telephony provider row ID (bump it to avoid clashing with previous runs)")
@@ -340,6 +357,11 @@ func (s *sim) run(ctx context.Context) error {
 	if s.cfg.seed {
 		if err := s.seedPortal(ctx); err != nil {
 			log.Printf("seed message failed: %v", err)
+		}
+		if s.cfg.seedMMSPath != "" {
+			if err := s.seedMMS(ctx); err != nil {
+				log.Printf("seed MMS failed: %v", err)
+			}
 		}
 	}
 	return s.listenLoop(ctx)
@@ -585,6 +607,74 @@ func (s *sim) seedPortal(ctx context.Context) error {
 	}
 	log.Printf("seeded incoming SMS %s from %s in thread %d", messageID, s.cfg.simRemoteNumber, s.cfg.simThreadID)
 	return nil
+}
+
+// seedMMS posts one fake incoming MMS with an inline base64 attachment,
+// exercising the app transport's inline attachment path end to end.
+func (s *sim) seedMMS(ctx context.Context) error {
+	data, err := os.ReadFile(s.cfg.seedMMSPath)
+	if err != nil {
+		return fmt.Errorf("read -seed-mms file: %w", err)
+	}
+	fileName := filepath.Base(s.cfg.seedMMSPath)
+	contentType := contentTypeForFile(fileName)
+	nowMS := time.Now().UnixMilli()
+	messageID := fmt.Sprintf("mms:%d:%d", s.cfg.simSubID, s.nextRow)
+	s.nextRow++
+	message := &simMessage{
+		ID:          messageID,
+		ThreadID:    s.cfg.simThreadID,
+		SubID:       s.cfg.simSubID,
+		TimestampMS: nowMS,
+		Sender:      s.cfg.simRemoteNumber,
+		Recipients:  []string{s.cfg.simLocalNumber},
+		Body:        s.cfg.seedMMSText,
+		IsMMS:       true,
+		Type:        1,
+		Read:        false,
+		Attachments: []simAttachment{{
+			PartID:      1,
+			ContentType: contentType,
+			FileName:    fileName,
+			Size:        int64(len(data)),
+			Base64:      base64.StdEncoding.EncodeToString(data),
+		}},
+	}
+	err = s.postEvents(ctx, []postedEvent{{
+		Type:          "message.new",
+		MessageID:     messageID,
+		ThreadID:      s.cfg.simThreadID,
+		SubID:         s.cfg.simSubID,
+		TimestampMS:   nowMS,
+		Sender:        s.cfg.simRemoteNumber,
+		IsMMS:         true,
+		HasAttachment: true,
+		Preview:       message.Body,
+		Recipients:    message.Recipients,
+		Message:       message,
+	}})
+	if err != nil {
+		return err
+	}
+	log.Printf("seeded incoming MMS %s with inline attachment %s (%s, %d bytes)", messageID, fileName, contentType, len(data))
+	return nil
+}
+
+func contentTypeForFile(name string) string {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	case ".txt":
+		return "text/plain"
+	default:
+		return "application/octet-stream"
+	}
 }
 
 // ---------------------------------------------------------------------------
