@@ -9,3 +9,6 @@ agent-data/
 logs/
 /mautrix-android-sms-mms
 /android-sms-mms-adb-agent
+
+# Local pairsim test binary
+pairsim
