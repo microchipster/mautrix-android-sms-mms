@@ -11,4 +11,4 @@ logs/
 /android-sms-mms-adb-agent
 
 # Local pairsim test binary
-pairsim
+/tools/pairsim/pairsim
