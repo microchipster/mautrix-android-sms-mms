@@ -355,11 +355,16 @@ Locally verified with the simulator: one room per thread (no fracturing), correc
 participants (the phone's own number is learned from heartbeats/`own_numbers` and never
 becomes a ghost), membership changes update the existing room in place, Matrix → phone
 group sends queue one multi-recipient `send_sms` (the app turns it into one group MMS) with
-attachments inlined. Remaining: real group MMS matrix (3+ participants, membership changes,
-attachments both ways, tapback round trip) on hardware, app-side inline base64 for incoming
-MMS parts + heartbeat subscriptions, auto-fit attachment pipeline, delivery states,
-GrapheneOS non-root acceptance run, push all three repos to the Forgejo mirror, release
-signing + tagging.
+attachments inlined. The app inlines incoming MMS parts as base64, reports heartbeat
+subscriptions and acknowledges queue commands with explicit sequence numbers; the release
+APK is signed (pass flow) and pairs against the local bridge on the test phone, including
+Matrix → phone sends, read receipts and portal participant repair. Repositories are pushed:
+`microchipster/mautrix-android-sms-mms` (bridge + agent),
+`repos/fossify-messages-bridge` (app fork, branch `bridge`) and
+`repos/fossify-mmslib-bridge` (mmslib fork); `repos/Messages` stays a read-only upstream
+mirror. Remaining: real group MMS matrix (3+ participants, membership changes,
+attachments both ways, tapback round trip) on hardware, auto-fit attachment pipeline,
+delivery states, GrapheneOS non-root acceptance run, release tagging.
 
 ## 9. Testing
 
