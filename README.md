@@ -40,9 +40,34 @@ optional and only adds speed/back-compat paths; GrapheneOS works without it.
 
 - `docs/PLAN.md` — full plan, phases, correctness spec, group-chat checklist.
 - `docs/AGENT_API.md` — agent HTTP API contract.
+- `docs/PAIRING_PROTOCOL.md` — app pairing protocol (QR + manual, queue/events API).
 - `docs/SIGNING.md` — Android signing flow for the app backend.
 - `docs/research-adb-reference.md` — telephony provider / ADB reference.
 - `docs/research-app-base.md` — app base evaluation (Fossify fork).
+
+## Bridge configuration (`simple-config.yaml`)
+
+The bridge keeps connector settings in `simple-config.yaml` (referenced from the
+main config as `network: simple-config.yaml`). All values have safe defaults;
+older configs without the new sections keep working.
+
+```yaml
+device_name: ""                 # optional login/room-topic name override
+
+pairing:
+  # Serve the public app pairing API (`/_smsmms/v1/`). Default: true.
+  enabled: true
+  # Address the pairing API binds to. Default: ":29322".
+  # Reverse-proxy it under the bridge's public host with TLS.
+  listen: ":29322"
+  # Externally reachable bridge base URL embedded in the pairing payload.
+  # Default: "" (falls back to the homeserver public address).
+  public_url: "https://matrix.example.com"
+```
+
+Pair with the Fossify Messages bridge app via `login app-pair` in the management
+room (QR code or manual code). `devices` lists paired devices and
+`unpair <device_id|all>` revokes them.
 
 ## License
 
