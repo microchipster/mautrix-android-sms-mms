@@ -33,17 +33,50 @@ Keys that already exist in pass (namespace `<user>`):
 `android/com.example.termuxintents`, `android/com.example.calendarwriter`,
 `android/com.example.lastlocation`.
 
-## Nothing is at risk — but do this
+## Persistence, backup and recovery (current state)
 
-1. **Back up the password store now** (commit + push `~/.password-store`; confirm a remote
-   exists). Its git history is the safety net for existing keystores.
-2. **Offline export**: `pass show <user>/android/<appId>/release.keystore > release.jks` +
-   the `storepass` entry, stored somewhere offline (password manager backup/encrypted USB).
-3. The Fossify fork needs a **new** keystore (new app id / new app), generated with the
-   same script at fork time — there is nothing to migrate from the old SMS setup
-   (`eu.droogers.smsmatrix` is a third-party app; no key of ours involved).
-4. Do not regenerate the keystore of an app users already installed with a previous key —
-   signature mismatch blocks updates (`INSTALL_FAILED_UPDATE_INCOMPATIBLE`).
+Keys for the fork live in `pass` under namespace `<user>`:
+
+- keystore: `~/.password-store/<user>/android/org.fossify.messages.bridge/release.keystore`
+  (PKCS12, alias `release`, storepass == keypass)
+- password: `pass` entry `<user>/android/org.fossify.messages.bridge/storepass`, cached for
+  automation at `~/.config/android/org.fossify.messages.bridge/storepass` (chmod 600)
+- certificate to recognise a good key: `CN=org.fossify.messages.bridge, OU=Android,
+  O=<user>`, SHA-256 `678d78dd1d9953c6363739c136bafa59683c66760b63dc33f88416889df2b34b`
+  (check with `apksigner verify --print-certs <apk>`)
+
+`~/.password-store` is a git repository with remote
+`ssh://git@git.example.com/<user>/auth.git`; the fork's keystore and password are committed
+and pushed (`git -C ~/.password-store log -- <user>/android/org.fossify.messages.bridge`).
+That is the primary off-machine copy — **keep it pushed** after any key change.
+
+Things that have bitten us and are now guarded:
+
+- `scripts/build-release.sh` (app repo) **refuses to generate a new key** unless
+  `--generate-key` is passed. A silently generated key would produce an APK that cannot
+  upgrade the installed one (`INSTALL_FAILED_UPDATE_INCOMPATIBLE` unless users uninstall
+  first, losing app settings but not telephony history).
+- Reading `pass` entries needs an unlocked GPG agent (the signing key is
+  passphrase-protected; non-interactive reads fail with "public key decryption failed").
+  Writing new entries only needs the public key. If reads are unavailable, restore the
+  cached password file instead (contents equal to the `storepass` entry).
+- Do not regenerate the keystore of any app users already installed with a previous key.
+
+Restore on a fresh machine:
+
+1. `git clone` the pass repo to `~/.password-store` (or `git -C ~/.password-store pull`).
+2. Unlock the GPG key, `pass show <user>/android/org.fossify.messages.bridge/storepass`
+   (or restore the cached `~/.config/android/<appId>/storepass` from backup).
+3. Symlink the keystore: `ln -sfn ~/.password-store/<user>/android/<appId>/release.keystore app/release.keystore`.
+4. `scripts/build-release.sh` builds and `apksigner verify --print-certs` confirms the
+   certificate fingerprint above.
+
+Offline copy (recommended, covers loss of the git remote and of the GPG key):
+a GPG-encrypted archive of the keystore + password + this certificate fingerprint, stored
+off-machine (already prepared at `~/backups/android-signing/`).
+
+Also existing in `pass` (older apps, same flow): `android/com.example.termuxintents`,
+`android/com.example.calendarwriter`, `android/com.example.lastlocation`.
 
 ## Fork decisions to make
 
