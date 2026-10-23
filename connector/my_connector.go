@@ -62,6 +62,11 @@ func (c *MyConnector) StartPairingServer() error {
 func (c *MyConnector) Init(br *bridgev2.Bridge) {
 	c.bridge = br
 	c.log = br.Log.With().Str("component", "network-connector").Logger()
+	// The pairing server is created in NewMyConnector before the bridge
+	// logger exists (and NewMyConnector is typically called with a Nop
+	// logger), so its logger must be re-attached here or every pairing API
+	// log line is silently dropped.
+	c.pairingServer().log = c.log.With().Str("component", "app-pairing").Logger()
 	if c.config == nil {
 		c.config = NewSimpleConfig()
 	}
