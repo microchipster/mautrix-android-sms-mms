@@ -47,6 +47,9 @@ type pairedDevice struct {
 	lastPersisted time.Time
 	heartbeat     *pairHeartbeatRequest
 	heartbeatAt   time.Time
+	// Last SIM subscriptions reported by the app; re-applied when the login
+	// finishes loading if the first heartbeat arrived earlier.
+	lastSubscriptions []agentapi.Subscription
 
 	// Outgoing sends waiting for a send.result from the app.
 	waiters      map[string]chan pairSendResult
@@ -160,7 +163,14 @@ func (d *pairedDevice) snapshot() deviceSnapshot {
 func (d *pairedDevice) attachRuntime(nc *MyNetworkClient) {
 	d.mu.Lock()
 	d.runtime = nc
+	subscriptions := append([]agentapi.Subscription(nil), d.lastSubscriptions...)
 	d.mu.Unlock()
+	if len(subscriptions) > 0 {
+		// The app may send its first heartbeat before the login has finished
+		// loading; re-apply the remembered subscriptions now that the login
+		// metadata can be saved.
+		go d.applyHeartbeatSubscriptions(context.Background(), subscriptions)
+	}
 }
 
 func (d *pairedDevice) runtimeHandler() *MyNetworkClient {
@@ -226,6 +236,9 @@ func (d *pairedDevice) applyHeartbeatSubscriptions(ctx context.Context, subs []a
 		return
 	}
 	d.mu.Lock()
+	// Remember the reported subscriptions so they can be applied once the
+	// login finishes loading (the app may heartbeat before that happens).
+	d.lastSubscriptions = append([]agentapi.Subscription(nil), subs...)
 	runtime := d.runtime
 	d.mu.Unlock()
 	if runtime == nil || runtime.login == nil {
