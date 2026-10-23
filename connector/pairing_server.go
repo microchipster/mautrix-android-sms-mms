@@ -621,6 +621,7 @@ func (s *pairingServer) handleEvents(w http.ResponseWriter, r *http.Request) {
 					Msg("Device reported a command failure")
 			}
 			device.removeCommand(ev.SendID)
+			device.removeCommandBySeq(ev.CommandSeq)
 			device.removeCommandBySeq(ackCommandSeq(ev.SendID))
 			accepted++
 			continue

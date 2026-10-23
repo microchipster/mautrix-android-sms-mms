@@ -189,6 +189,10 @@ type remoteEvent struct {
 	PartsSent  int               `json:"parts_sent,omitempty"`
 	Pending    bool              `json:"pending,omitempty"`
 	Error      *remoteEventError `json:"error,omitempty"`
+	// CommandSeq is set on `ack` events and identifies the queue command the
+	// device acknowledged, so the command can be pruned without parsing the
+	// `ack-<seq>` send id.
+	CommandSeq int64 `json:"command_seq,omitempty"`
 }
 
 // remoteEventError is the error object of a send.result event.

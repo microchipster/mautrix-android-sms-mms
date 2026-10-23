@@ -486,10 +486,12 @@ func TestPairingAckPrunesQueuedCommands(t *testing.T) {
 		t.Fatalf("ack-1 should only prune the mark_read command, got %+v", got)
 	}
 
-	// An ack reporting an error still prunes the command.
+	// An ack reporting an error still prunes the command, even without a
+	// send id: the explicit command_seq identifies it.
 	body.Events = []remoteEvent{{
-		Event: agentapi.Event{Type: "ack", SendID: "ack-2"},
-		Error: &remoteEventError{Code: "unsupported", Message: "unknown command"},
+		Event:      agentapi.Event{Type: "ack"},
+		CommandSeq: 2,
+		Error:      &remoteEventError{Code: "unsupported", Message: "unknown command"},
 	}}
 	status, data = pairPostJSONAuth(t, httpServer.URL+"/_smsmms/v1/events", "ack-prune-token", body)
 	if status != http.StatusOK {

@@ -134,9 +134,11 @@ App → bridge event push; body is the agent `Event` shape plus payloads:
 Also `message.updated` (read/seen/status changes), `mms.downloaded`, `thread.updated`,
 `send.result` (outcome for a queue command: `{send_id, message_id, thread_id, parts_sent,
 pending}` or `{send_id, error: {code, message}}`) and `ack` (a non-send queue command was
-handled: `{seq, type: "ack", send_id: "ack-<command_seq>", thread_id, sub_id,
-timestamp_ms}` plus an optional `error: {code, message}`). An `ack` removes the matching
-queued command (`send_id`, plus the `ack-<seq>` suffix fallback) so it is never redelivered;
+handled: `{seq, type: "ack", send_id: "ack-<command_seq>", command_seq, thread_id, sub_id,
+timestamp_ms}` plus an optional `error: {code, message}`; `command_seq` is optional and
+carries the acknowledged command's queue sequence). An `ack` removes the matching
+queued command (`send_id`, the `ack-<seq>` suffix, or `command_seq` when present) so it is
+never redelivered;
 unknown event types are stored in the device inbox and ignored. Response:
 `{"cursor": 17, "accepted": 3}`.
 
