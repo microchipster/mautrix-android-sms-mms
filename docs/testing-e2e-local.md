@@ -310,17 +310,60 @@ curl -sS -XPOST "http://localhost:8008/_matrix/client/v3/rooms/$PORTAL/read_mark
 ```
 
 `pairsim` logs `command seq=2 type=mark_read {...}` and posts `thread.updated` + `ack`
-(`accepted=2`). `pairsim` also posts a heartbeat every 30 seconds; a manual probe:
+(`accepted=2`). `ack` events remove the matching queued command (settled by `send_id`, or by their
+`ack-<command_seq>` send ID). `pairsim` also posts a heartbeat every 30 seconds, now carrying the
+simulated SIM so the bridge can learn the phone's own number:
 
 ```sh
 curl -sS -XPOST http://127.0.0.1:29322/_smsmms/v1/heartbeat \
   -H 'Authorization: Bearer <device token>' -H 'Content-Type: application/json' \
   -d '{"device_id":"android-sim-01","battery_pct":88,"default_sms_app":true,
-       "permissions":{"receive_sms":true,"send_mms":true,"mark_read":true},"app_version":"pairsim/0.1.0"}'
+       "permissions":{"receive_sms":true,"send_mms":true,"mark_read":true},"app_version":"pairsim/0.1.0",
+       "subscriptions":[{"sub_id":1,"display_name":"SIM 1","number":"+15550001111","default_sms":true}]}'
 # {"ok":true,"server_time_ms":1792759965765}
 ```
 
-## 10. What to verify (checklist)
+The bridge merges these numbers with the `own_numbers` network config and excludes them from group
+participants, so `user_login.metadata` gains a `subscriptions` map
+(`{"1":{"sub_id":1,"phone_number":"+15550001111",...}}`).
+
+## 10. Group threads, own numbers and membership changes
+
+Group threads are the highest-risk area, so the local harness simulates them too: the simulator
+reports the SIM subscription in its heartbeat and then seeds a group thread where the phone's own
+number appears in the recipient list, exactly like Android's telephony provider stores it:
+
+```sh
+nohup ./bin/pairsim -device-id android-sim-30 -thread-id 16 -first-row 10000 -first-seq 1200 \
+  -seed-recipients "+15550001111,+15551112222,+15553334444" -seed-sender "+15551112222" \
+  -seed-mms ../seed.png -seed-mms-text "Group photo" > pairsim-group.log 2>&1 &
+```
+
+(pairing code as in step 7). Expected:
+
+- `pairsim` sends one heartbeat **before** the seeds (on purpose: the own number must be known
+  before the first message, otherwise it can become a ghost member);
+- one portal per thread, single room, even though the MMS carries an attachment;
+- `joined_members` contains ghosts for the *other* participants only — the phone's own number
+  (`-local-number`) must NOT appear;
+- the MMS arrives as `m.image` with the inline attachment byte-exact.
+
+Membership change: pair a second time with the same `-device-id`/`-thread-id` but a different
+recipient set (e.g. swap `+15553334444` for `+15556667777`, set `-seed-sender "+15556667777"`, bump
+`-first-row`/`-first-seq`). Expected: exactly one portal row remains and the room membership updates
+in place (added ghost joins, removed ghost leaves).
+
+Matrix → phone group send: send a message in the group portal room. The queued command must be a
+`send_sms` whose recipients exclude the phone's own number:
+
+```
+command seq=1 type=send_sms send_id=$... recipients=["+15551112222","+15553334444"] ...
+```
+
+The real app turns a multi-recipient `send_sms` into a single group MMS (see
+`docs/PAIRING_PROTOCOL.md`).
+
+## 11. What to verify (checklist)
 
 | Check | Evidence |
 | --- | --- |
@@ -333,6 +376,9 @@ curl -sS -XPOST http://127.0.0.1:29322/_smsmms/v1/heartbeat \
 | Matrix → phone send delivered | `pairsim` prints the `send_sms` command with the Matrix event ID as `send_id` |
 | `send.result` accepted, no duplicate | bridge log `Successfully sent message to phone ... pending=false`; no second Matrix event with the same body |
 | `mark_read` delivered | `pairsim` prints `command ... type=mark_read`; posts `thread.updated` + `ack` |
+| Group participants correct | own number never appears as a ghost; other participants do |
+| Membership change stays in one room | same `portal_id`, membership updated in place |
+| Matrix → phone group send | `send_sms` recipients exclude the own number |
 | Room sane | `m.room.name` matches the participant set; members are the user, the bot and the phone-number ghost(s) |
 
 ## Known local quirks and observations
@@ -340,16 +386,19 @@ curl -sS -XPOST http://127.0.0.1:29322/_smsmms/v1/heartbeat \
 - **Management-room encryption gate**: the test must grant the bot power level 100 and add
   `m.room.encryption: 0` to the room's power levels (step 6); without it the gate cannot enable
   encryption and commands only produce "room encryption could not be verified" notices.
-- **Acked non-send commands stay queued**: `ack` events are accepted but only `send.result`
-  removes a command (`removeCommand` is keyed by `send_id`). After the read receipt above, the
-  in-memory queue still lists the `mark_read` command. This is harmless while the app's command
-  cursor keeps advancing, but diverges from `docs/PAIRING_PROTOCOL.md` ("commands are removed
-  once acknowledged by an `events` batch that includes their `send.result`/`ack`").
-- **Simulated phone's own number**: app logins do not know the phone's SIM numbers, so the
-  fake local number becomes a ghost member and the portal is named like a group
-  (`+15550001111, +15551234567`). With the real app, own numbers would be filtered.
+- **Test user must join portal rooms** before reading them (`POST /join/<roomId>`, URL-encoded);
+  otherwise the timeline request returns 403.
+- **Own-number knowledge arrives with the first heartbeat**: if a message is ingested before any
+  heartbeat or `own_numbers` config is available, the phone's own number can still become a ghost
+  member. `own_numbers` in the network config is the deterministic fallback.
+- **Kill the bridge by listening socket**, not by name: `ss -ltnpH 'sport = :29322'` and kill the
+  reported PID in a separate shell call. Patterns like `pkill -f mautrix-android-sms-mms` match
+  your own command line and kill the invoking shell.
+- **Use a fresh log file per bridge restart** (`logs/bridge2.log`, `logs/bridge3.log`, ...):
+  restarting with `>` on a log the old process still has open produces a holed/garble-merging file.
 - The pairing code is visible in the bridge debug log (`logging.min_level: debug` is the
-  generated default). With the log level raised, read it from a Matrix client instead.
+  generated default; ANSI codes need stripping). With the log level raised, read it from a Matrix
+  client instead. `pairsim -mode pair` prints the device token to stderr as `device token: <tok>`.
 
 ## Cleanup
 
