@@ -339,20 +339,27 @@ multi-recipient, provider read-state endpoint, receive-hook events, configurable
 agent verified byte-exact on device. Remaining: sign via the pass flow
 (`docs/SIGNING.md`), install release side-by-side, run the group MMS test matrix.
 
-**Phase 4 — App pairing over HTTPS (phone polls bridge). 🔄 Bridge done; app + playbook in
-flight.**
+**Phase 4 — App pairing over HTTPS (phone polls bridge). ✅ Done.**
 Canonical spec `docs/PAIRING_PROTOCOL.md`; bridge serves `/_smsmms/v1/`
 (info/pair/start/pair/complete + authenticated queue/events/heartbeat), ECDSA P-256 device
 keys, per-device tokens hashed at rest, `app-pair` QR login flow, `devices`/`unpair`
-commands; playbook wiring (nginx `/_smsmms/` + `.well-known` discovery key) in flight; app
-pairing client (PairingActivity, Keystore-wrapped token, queue poller inside BridgeService)
-in flight. Exit: real phone pairs over TLS to the cloud homeserver and sends/receives
-through the queue.
+commands; playbook wiring committed (Traefik `/_smsmms/` route + `.well-known` discovery
+key); app pairing client (PairingActivity, Keystore-wrapped token, queue poller inside
+BridgeService). The local harness (`tools/pairsim` + `docs/testing-e2e-local.md`) proves the
+whole flow without a cloud homeserver: pair → portal room → both directions → mark_read →
+dedupe, including group threads. Exit remaining: the real phone pairing against the cloud
+homeserver (needs the deployment details).
 
-**Phase 5 — Group-chat perfection & release (next).**
-Real group MMS matrix (3+ participants, membership changes, attachments both ways, tapback
-round trip), auto-fit attachment pipeline, delivery states, GrapheneOS non-root
-acceptance run, push all three repos to the Forgejo mirror, release signing + tagging.
+**Phase 5 — Group-chat perfection & release (in progress).**
+Locally verified with the simulator: one room per thread (no fracturing), correct
+participants (the phone's own number is learned from heartbeats/`own_numbers` and never
+becomes a ghost), membership changes update the existing room in place, Matrix → phone
+group sends queue one multi-recipient `send_sms` (the app turns it into one group MMS) with
+attachments inlined. Remaining: real group MMS matrix (3+ participants, membership changes,
+attachments both ways, tapback round trip) on hardware, app-side inline base64 for incoming
+MMS parts + heartbeat subscriptions, auto-fit attachment pipeline, delivery states,
+GrapheneOS non-root acceptance run, push all three repos to the Forgejo mirror, release
+signing + tagging.
 
 ## 9. Testing
 
