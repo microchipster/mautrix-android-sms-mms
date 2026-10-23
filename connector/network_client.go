@@ -582,6 +582,20 @@ func (nc *MyNetworkClient) portalThreadSnapshot(portal *bridgev2.Portal) (thread
 	return meta.ThreadID, meta.SubID, recipients
 }
 
+// threadRecipients resolves the participant list used for portal metadata and
+// room membership. The phone's own numbers are dropped so they can never
+// become room members or send targets (PLAN §5.1), except in a self-thread -
+// a conversation the phone opened with its own number (e.g. a note to self) -
+// where the own number is the only counterpart and dropping it would make the
+// thread unsendable.
+func (nc *MyNetworkClient) threadRecipients(thread agentapi.Thread) []string {
+	recipients := filterOwnNumbers(thread.Recipients, nc.ownNumbers())
+	if len(recipients) > 0 {
+		return recipients
+	}
+	return filterOwnNumbers(thread.Recipients, nil)
+}
+
 // applyPortalThread stores the thread identity and participant set in the
 // portal metadata. It reports whether anything changed.
 func (nc *MyNetworkClient) applyPortalThread(portal *bridgev2.Portal, thread agentapi.Thread) bool {
@@ -593,7 +607,7 @@ func (nc *MyNetworkClient) applyPortalThread(portal *bridgev2.Portal, thread age
 		portal.Metadata = meta
 	}
 	changed := false
-	recipients := filterOwnNumbers(thread.Recipients, nc.ownNumbers())
+	recipients := nc.threadRecipients(thread)
 	if !stringSlicesEqual(meta.Recipients, recipients) {
 		meta.Recipients = recipients
 		changed = true
@@ -630,7 +644,7 @@ func (nc *MyNetworkClient) applyPortalThread(portal *bridgev2.Portal, thread age
 func (nc *MyNetworkClient) chatInfoForThread(ctx context.Context, thread agentapi.Thread) *bridgev2.ChatInfo {
 	// The agent already strips the phone's own numbers, but filter again so a
 	// leaked own number can never become a room member (PLAN §5.1).
-	recipients := filterOwnNumbers(thread.Recipients, nc.ownNumbers())
+	recipients := nc.threadRecipients(thread)
 	roomType := database.RoomTypeDM
 	if len(recipients) != 1 {
 		roomType = database.RoomTypeDefault
