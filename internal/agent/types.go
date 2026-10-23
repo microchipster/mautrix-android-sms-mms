@@ -87,25 +87,25 @@ type DeviceInfo struct {
 
 // BackendInfo tells the bridge which operations the agent can actually perform.
 type BackendInfo struct {
-	Read         string `json:"read"` // content-provider | sqlite
-	SendSMS      string `json:"send_sms,omitempty"`
-	SendMMS      bool   `json:"send_mms"`
-	CanMarkRead  bool   `json:"can_mark_read"`
-	Root         bool   `json:"root"`
+	Read          string `json:"read"` // content-provider | sqlite
+	SendSMS       string `json:"send_sms,omitempty"`
+	SendMMS       bool   `json:"send_mms"`
+	CanMarkRead   bool   `json:"can_mark_read"`
+	Root          bool   `json:"root"`
 	DefaultSMSApp string `json:"default_sms_app,omitempty"`
 }
 
 // Health is the /v1/health payload.
 type Health struct {
-	OK              bool          `json:"ok"`
-	ProtocolVersion int           `json:"protocol_version"`
-	Device          DeviceInfo    `json:"device"`
-	Root            bool          `json:"root"`
-	Backend         BackendInfo   `json:"backend"`
-	DefaultSMSApp   string        `json:"default_sms_app,omitempty"`
+	OK              bool           `json:"ok"`
+	ProtocolVersion int            `json:"protocol_version"`
+	Device          DeviceInfo     `json:"device"`
+	Root            bool           `json:"root"`
+	Backend         BackendInfo    `json:"backend"`
+	DefaultSMSApp   string         `json:"default_sms_app,omitempty"`
 	Subscriptions   []Subscription `json:"subscriptions,omitempty"`
-	Capabilities    []string      `json:"capabilities"`
-	Error           string        `json:"error,omitempty"`
+	Capabilities    []string       `json:"capabilities"`
+	Error           string         `json:"error,omitempty"`
 }
 
 // ProtocolVersion is the current agent API version.

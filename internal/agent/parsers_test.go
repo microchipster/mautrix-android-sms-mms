@@ -70,14 +70,14 @@ func TestParseMessageID(t *testing.T) {
 
 func TestCanonicalAddress(t *testing.T) {
 	cases := map[string]string{
-		"+1 (555) 123-4567":   "+15551234567",
-		"555-123-4567":        "+15551234567",
-		"5551234":             "+15551234",
-		"12345":               "12345",
-		"Testsender":          "TESTSENDER",
-		"user@example.com":    "user@example.com",
-		"+15551234567;foo=1":  "+15551234567",
-		"":                    "",
+		"+1 (555) 123-4567":  "+15551234567",
+		"555-123-4567":       "+15551234567",
+		"5551234":            "+15551234",
+		"12345":              "12345",
+		"Testsender":         "TESTSENDER",
+		"user@example.com":   "user@example.com",
+		"+15551234567;foo=1": "+15551234567",
+		"":                   "",
 	}
 	for in, want := range cases {
 		if got := CanonicalAddress(in); got != want {

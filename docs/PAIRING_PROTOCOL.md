@@ -154,9 +154,16 @@ whole `events` batch.
 ### `POST /_smsmms/v1/heartbeat` (Bearer)
 ```json
 {"device_id": "android-ab12", "battery_pct": 88, "default_sms_app": true,
- "permissions": {"receive_sms": true, "send_mms": true}, "app_version": "1.10.1-bridge1"}
+ "permissions": {"receive_sms": true, "send_mms": true}, "app_version": "1.10.1-bridge1",
+ "subscriptions": [{"sub_id": 1, "display_name": "SIM 1", "carrier": "Example Mobile",
+                    "number": "+15550001111", "default_sms": true}]}
 ```
 Used for bridge health display and to gate MMS/read features.
+
+The optional `subscriptions` array lets the bridge learn the phone's own numbers
+without manual configuration: reported numbers are merged with the `own_numbers`
+network config and excluded from group participants, so the phone's own address
+never becomes a ghost user in group rooms.
 
 ## 5. Behaviour rules
 

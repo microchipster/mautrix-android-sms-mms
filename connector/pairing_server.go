@@ -663,6 +663,9 @@ func (s *pairingServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	device.setHeartbeat(req)
+	if len(req.Subscriptions) > 0 {
+		device.applyHeartbeatSubscriptions(r.Context(), req.Subscriptions)
+	}
 	now := time.Now()
 	device.persistLastSeen(r.Context(), now)
 	writePairJSON(w, http.StatusOK, pairHeartbeatResponse{OK: true, ServerTimeMS: now.UnixMilli()})

@@ -315,6 +315,10 @@ type pairHeartbeatRequest struct {
 	DefaultSMSApp bool            `json:"default_sms_app,omitempty"`
 	Permissions   map[string]bool `json:"permissions,omitempty"`
 	AppVersion    string          `json:"app_version,omitempty"`
+	// Subscriptions optionally reports the SIMs of the phone. The bridge
+	// stores them so the phone's own numbers are excluded from participants
+	// (app-paired logins cannot read the adb agent's own_numbers config).
+	Subscriptions []agentapi.Subscription `json:"subscriptions,omitempty"`
 }
 
 // pairHeartbeatResponse is the POST /_smsmms/v1/heartbeat response.

@@ -885,21 +885,35 @@ func (nc *MyNetworkClient) deviceScope() string {
 }
 
 // ownNumbers returns the SIM numbers belonging to this phone.
+// ownNumbers returns the phone's own numbers: the SIM numbers the app
+// reported in its heartbeat plus the configured fallback list.
 func (nc *MyNetworkClient) ownNumbers() []string {
-	if nc.login == nil {
-		return nil
-	}
-	meta, _ := nc.login.Metadata.(*LoginMetadata)
-	if meta == nil || len(meta.Subscriptions) == 0 {
-		return nil
-	}
-	numbers := make([]string, 0, len(meta.Subscriptions))
-	for _, sub := range meta.Subscriptions {
-		if number := CanonicalAddress(sub.PhoneNumber); number != "" {
-			numbers = append(numbers, number)
+	var numbers []string
+	if nc.login != nil {
+		if meta, _ := nc.login.Metadata.(*LoginMetadata); meta != nil {
+			for _, sub := range meta.Subscriptions {
+				if number := CanonicalAddress(sub.PhoneNumber); number != "" {
+					numbers = append(numbers, number)
+				}
+			}
 		}
 	}
-	return numbers
+	if nc.connector != nil {
+		numbers = append(numbers, nc.connector.ownNumbers()...)
+	}
+	if len(numbers) <= 1 {
+		return numbers
+	}
+	seen := make(map[string]struct{}, len(numbers))
+	unique := numbers[:0]
+	for _, number := range numbers {
+		if _, ok := seen[number]; ok {
+			continue
+		}
+		seen[number] = struct{}{}
+		unique = append(unique, number)
+	}
+	return unique
 }
 
 // ownUserID is the network user ID representing the bridge user on this login.

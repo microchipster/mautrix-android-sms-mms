@@ -219,6 +219,51 @@ func (d *pairedDevice) persistLastSeen(ctx context.Context, now time.Time) {
 	}
 }
 
+// applyHeartbeatSubscriptions stores the SIM subscriptions reported by the
+// app so the bridge can exclude the phone's own numbers from participants.
+func (d *pairedDevice) applyHeartbeatSubscriptions(ctx context.Context, subs []agentapi.Subscription) {
+	if len(subs) == 0 {
+		return
+	}
+	d.mu.Lock()
+	runtime := d.runtime
+	d.mu.Unlock()
+	if runtime == nil || runtime.login == nil {
+		return
+	}
+	meta, _ := runtime.login.Metadata.(*LoginMetadata)
+	if meta == nil {
+		return
+	}
+	if meta.Subscriptions == nil {
+		meta.Subscriptions = make(map[int]SubscriptionInfo, len(subs))
+	}
+	changed := false
+	for i, sub := range subs {
+		id := sub.SubID
+		if id == 0 {
+			id = i + 1
+		}
+		info := SubscriptionInfo{
+			SubID:        id,
+			PhoneNumber:  sub.Number,
+			DisplayName:  sub.DisplayName,
+			IsDefaultSMS: sub.DefaultSMS,
+		}
+		if existing, ok := meta.Subscriptions[id]; ok && existing == info {
+			continue
+		}
+		meta.Subscriptions[id] = info
+		changed = true
+	}
+	if !changed {
+		return
+	}
+	if err := runtime.login.Save(ctx); err != nil {
+		runtime.log.Warn().Err(err).Str("device_id", d.deviceID).Msg("Failed to persist app device subscriptions")
+	}
+}
+
 // healthSnapshot synthesizes the agent Health shape for an app login so the
 // rest of the connector (send gating, capabilities, `!sms ping`) works
 // unchanged.

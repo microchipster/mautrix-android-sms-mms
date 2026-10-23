@@ -91,6 +91,11 @@ type SimpleConfig struct {
 	// DeviceName manually overrides the device display name used for the
 	// login's remote name / room topic.
 	DeviceName string `yaml:"device_name,omitempty"`
+	// OwnNumbers lists the phone's own numbers (E.164 or local format).
+	// Participants matching these are excluded from rooms. The adb agent
+	// filters own numbers itself; app-paired logins normally learn them from
+	// the app's heartbeat, and this list is the fallback for when that fails.
+	OwnNumbers []string `yaml:"own_numbers,omitempty"`
 	// Pairing configures the public app pairing API.
 	Pairing PairingConfig `yaml:"pairing,omitempty"`
 }
@@ -188,6 +193,20 @@ func (c *MyConnector) deviceNameOverride() string {
 		return strings.TrimSpace(c.config.DeviceName)
 	}
 	return ""
+}
+
+// ownNumbers returns the configured fallback list of the phone's own numbers.
+func (c *MyConnector) ownNumbers() []string {
+	if c == nil || c.config == nil {
+		return nil
+	}
+	numbers := make([]string, 0, len(c.config.OwnNumbers))
+	for _, number := range c.config.OwnNumbers {
+		if canonical := CanonicalAddress(number); canonical != "" {
+			numbers = append(numbers, canonical)
+		}
+	}
+	return numbers
 }
 
 // pairingEnabled reports whether the public pairing API should run. Older

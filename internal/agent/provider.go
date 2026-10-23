@@ -58,11 +58,11 @@ func (p *ContentProvider) Root() bool { return p.root }
 // Content query projections. Ambiguous columns (body/snippet/text) go last:
 // `content query` does not escape values, so only the last column may contain ", ".
 var (
-	smsProjection   = []string{"_id", "thread_id", "address", "date", "date_sent", "type", "read", "seen", "status", "sub_id", "body"}
+	smsProjection    = []string{"_id", "thread_id", "address", "date", "date_sent", "type", "read", "seen", "status", "sub_id", "body"}
 	threadProjection = []string{"_id", "date", "message_count", "recipient_ids", "read", "has_attachment", "snippet"}
-	mmsProjection   = []string{"_id", "thread_id", "date", "msg_box", "m_type", "m_size", "m_id", "sub", "sub_id", "read", "seen", "ct_t", "text_only"}
-	partProjection  = []string{"_id", "mid", "seq", "ct", "name", "fn", "cid", "cl", "_data", "text"}
-	addrProjection  = []string{"address", "type", "charset"}
+	mmsProjection    = []string{"_id", "thread_id", "date", "msg_box", "m_type", "m_size", "m_id", "sub", "sub_id", "read", "seen", "ct_t", "text_only"}
+	partProjection   = []string{"_id", "mid", "seq", "ct", "name", "fn", "cid", "cl", "_data", "text"}
+	addrProjection   = []string{"address", "type", "charset"}
 )
 
 func (p *ContentProvider) query(ctx context.Context, uri string, projection []string, where, sortBy string, limit int) ([]map[string]string, error) {
