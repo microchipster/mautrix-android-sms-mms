@@ -315,29 +315,44 @@ senders), `connector/agentclient.go` (HTTP client + event feed), and the app-mod
 
 ## 8. Phases
 
-**Phase 1 — ADB read path (no sending yet).**
-Agent skeleton + provider readers + poller + media fetch; bridge login (agent URL/token),
-threads → rooms, history backfill 30d, tapback reactions, agent health notices.
-Exit: SMS + MMS (incl. group) from a real phone land correctly in Matrix, with attachments
-and correct senders/participants; no duplicate rooms on restart.
+**Phase 1 — ADB read path. ✅ Done.**
+Agent provider readers + sweeper + media fetch; bridge login (agent URL/token), threads →
+rooms, history backfill 30d, tapback reactions, agent health notices. Validated on the
+LineageOS test phone: 32 threads, group-aware recipients, attachment bytes byte-exact
+(Magisk `su -c cat` CRLF corruption found and fixed), dedupe/watermarks persist across
+restarts.
 
-**Phase 2 — SMS sending.** `service call isms` (short) + Termux backend (multipart) +
-read-state write-back. Exit: Matrix→phone SMS works both directions with echo suppression
-proven by tests; long SMS handled (split via Termux or documented limitation).
+**Phase 2 — SMS sending + read state. ✅ Done (shell backend).**
+`service call isms` send with echo correlation, `content update` read+seen write-back
+verified on device (self-SMS round trip: send → provider row → read state). Group SMS
+correctly refused (group = MMS); long SMS split is opt-in; Termux multipart backend
+deferred (documented limitation until app mode).
 
-**Phase 3 — App mode (MMS sending + true push).** Fork Fossify Messages + mmslib per
-`docs/research-app-base.md` (BridgeService FGS + HTTP API, event-push hooks in
-SmsReceiver/MmsReceiver, provider-backed history/send, group flag forced on, N attachments
-in one MMS, read-state endpoints). Auto-fit image pipeline; group MMS send; delivery
-states. Exit: sending a group MMS with images from Matrix works end-to-end; read state
-syncs.
+**Phase 3 — App mode (Fossify fork). ✅ Implemented + verified on device; pending release
+signing and real group tests.**
+Fork committed (`fossify-messages` branch `bridge`, `fossify-mmslib` Apache-2.0
+LICENSE/NOTICE): vendored mmslib module, side-by-side `org.fossify.messages.bridge`
+(debug install tested), BridgeService FGS + hand-rolled HTTP API matching
+`docs/AGENT_API.md`, one-MMS-with-all-attachments fix, `Settings.group=true` for
+multi-recipient, provider read-state endpoint, receive-hook events, configurable
+`bridge_device_id` so app and ADB modes produce identical room IDs. Parity with the ADB
+agent verified byte-exact on device. Remaining: sign via the pass flow
+(`docs/SIGNING.md`), install release side-by-side, run the group MMS test matrix.
 
-**Phase 4 — App mode without ADB.** App webhooks + API as first-class transport; same
-connector; docs for both setups. Exit: feature parity smoke test in app mode.
+**Phase 4 — App pairing over HTTPS (phone polls bridge). 🔄 Bridge done; app + playbook in
+flight.**
+Canonical spec `docs/PAIRING_PROTOCOL.md`; bridge serves `/_smsmms/v1/`
+(info/pair/start/pair/complete + authenticated queue/events/heartbeat), ECDSA P-256 device
+keys, per-device tokens hashed at rest, `app-pair` QR login flow, `devices`/`unpair`
+commands; playbook wiring (nginx `/_smsmms/` + `.well-known` discovery key) in flight; app
+pairing client (PairingActivity, Keystore-wrapped token, queue poller inside BridgeService)
+in flight. Exit: real phone pairs over TLS to the cloud homeserver and sends/receives
+through the queue.
 
-**Phase 5 — Playbook integration + polish.** Two Ansible roles, docs pages, CHANGELOG
-entries (including the existing `matrix-bridge-sms` deprecation note if we replace it),
-packaging (container image, local preload), release tagging.
+**Phase 5 — Group-chat perfection & release (next).**
+Real group MMS matrix (3+ participants, membership changes, attachments both ways, tapback
+round trip), auto-fit attachment pipeline, delivery states, GrapheneOS non-root
+acceptance run, push all three repos to the Forgejo mirror, release signing + tagging.
 
 ## 9. Testing
 
