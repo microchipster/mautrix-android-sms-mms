@@ -89,6 +89,7 @@ func installDirectMessageCommandHandler(main *mxmain.BridgeMain) {
 		establishedNow, err := gate.ensureBotRoomEncrypted(ctx, main, evt.RoomID)
 		if err != nil {
 			main.Matrix.Log.Error().Err(err).Str("room_id", string(evt.RoomID)).Msg("Blocked message because room encryption could not be verified")
+			neuterBlockedMessage(evt)
 			_, _ = main.Bridge.Bot.SendMessage(ctx, evt.RoomID, event.EventMessage, &event.Content{Parsed: &event.MessageEventContent{
 				MsgType: event.MsgNotice,
 				Body:    fmt.Sprintf("Cannot process message: room encryption could not be verified (%v).", err),
@@ -97,6 +98,7 @@ func installDirectMessageCommandHandler(main *mxmain.BridgeMain) {
 		}
 		if establishedNow {
 			main.Matrix.Log.Info().Str("room_id", string(evt.RoomID)).Msg("Enabled encryption in previously unencrypted room")
+			neuterBlockedMessage(evt)
 			_, _ = main.Bridge.Bot.SendMessage(ctx, evt.RoomID, event.EventMessage, &event.Content{Parsed: &event.MessageEventContent{
 				MsgType: event.MsgNotice,
 				Body:    "This room is now encrypted with the bridge. Please send your message again.",
@@ -125,6 +127,21 @@ func installDirectMessageCommandHandler(main *mxmain.BridgeMain) {
 		// permissions, replies, and command errors.
 		message.Body = prefix + " " + message.Body
 	})
+}
+
+// neuterBlockedMessage strips a message that must not reach the bridge queue.
+//
+// appservice event handlers cannot cancel events (they return no value), and
+// bridgev2 routes any EventMessage in the management room - or a prefixed
+// command in any bot DM - to the command processor (bridgev2/queue.go).
+// Clearing the content and retyping the event makes every downstream branch
+// miss, so a blocked message fails closed instead of executing as a command.
+func neuterBlockedMessage(evt *event.Event) {
+	if evt == nil {
+		return
+	}
+	evt.Content = event.Content{}
+	evt.Type = event.EventReaction
 }
 
 func isJoinedOrInvited(member *event.MemberEventContent) bool {

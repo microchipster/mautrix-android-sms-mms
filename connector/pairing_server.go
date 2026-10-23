@@ -607,12 +607,45 @@ func (s *pairingServer) handleEvents(w http.ResponseWriter, r *http.Request) {
 			accepted++
 			continue
 		}
+		if ev.Type == "ack" {
+			// The app acknowledges commands whose result is not covered by
+			// send.result (mark_read, ping). Acks for commands without a
+			// send id carry `ack-<seq>`; prune both ways so acked commands
+			// cannot be re-delivered after a reconnect.
+			if ev.Error != nil {
+				s.log.Warn().
+					Str("device_id", device.deviceID).
+					Str("send_id", ev.SendID).
+					Str("error", ev.Error.Code).
+					Str("message", ev.Error.Message).
+					Msg("Device reported a command failure")
+			}
+			device.removeCommand(ev.SendID)
+			device.removeCommandBySeq(ackCommandSeq(ev.SendID))
+			accepted++
+			continue
+		}
 		if device.pushEvent(ev) {
 			accepted++
 		}
 	}
 	cursor := maxCursor(req.Cursor, device.snapshot().LastEventSeq)
 	writePairJSON(w, http.StatusOK, pairEventsResponse{Cursor: cursor, Accepted: accepted})
+}
+
+// ackCommandSeq extracts the command sequence number from an ack send id.
+// Ack events for commands without a send id use `ack-<seq>` (see the app's
+// BridgeCommandExecutor); acks for send commands carry the original send id
+// and are pruned by removeCommand instead.
+func ackCommandSeq(sendID string) int64 {
+	if !strings.HasPrefix(sendID, "ack-") {
+		return 0
+	}
+	seq, err := strconv.ParseInt(strings.TrimPrefix(sendID, "ack-"), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return seq
 }
 
 func (s *pairingServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {

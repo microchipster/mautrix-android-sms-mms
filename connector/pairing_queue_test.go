@@ -445,3 +445,63 @@ func TestPairingRevokedTokenRejected(t *testing.T) {
 		t.Fatalf("revoked token status = %d, want 401", resp.StatusCode)
 	}
 }
+
+func TestPairingAckPrunesQueuedCommands(t *testing.T) {
+	server, httpServer := newTestPairingServerHTTP(t)
+	device := newTestPairedDevice(t, server, "android-ack-prune", "ack-prune-token")
+
+	read := device.enqueue(pairCommand{Type: "mark_read", ThreadID: 33, UpToMS: 123})
+	ping := device.enqueue(pairCommand{Type: "ping"})
+	if read.Seq != 1 || ping.Seq != 2 {
+		t.Fatalf("unexpected command seqs: %d, %d", read.Seq, ping.Seq)
+	}
+
+	queued := func() []pairCommand {
+		device.mu.Lock()
+		defer device.mu.Unlock()
+		return append([]pairCommand(nil), device.commands...)
+	}
+	if got := queued(); len(got) != 2 {
+		t.Fatalf("expected 2 queued commands, got %+v", got)
+	}
+
+	body := pairEventsRequest{
+		DeviceID: "android-ack-prune",
+		Events: []remoteEvent{{
+			Event: agentapi.Event{Type: "ack", SendID: "ack-1", ThreadID: 33, SubID: 1},
+		}},
+	}
+	status, data := pairPostJSONAuth(t, httpServer.URL+"/_smsmms/v1/events", "ack-prune-token", body)
+	if status != http.StatusOK {
+		t.Fatalf("ack events status = %d (%s)", status, data)
+	}
+	var response pairEventsResponse
+	if err := json.Unmarshal(data, &response); err != nil {
+		t.Fatalf("failed to decode events response: %v", err)
+	}
+	if response.Accepted != 1 {
+		t.Fatalf("unexpected events response: %+v", response)
+	}
+	if got := queued(); len(got) != 1 || got[0].Type != "ping" || got[0].Seq != 2 {
+		t.Fatalf("ack-1 should only prune the mark_read command, got %+v", got)
+	}
+
+	// An ack reporting an error still prunes the command.
+	body.Events = []remoteEvent{{
+		Event: agentapi.Event{Type: "ack", SendID: "ack-2"},
+		Error: &remoteEventError{Code: "unsupported", Message: "unknown command"},
+	}}
+	status, data = pairPostJSONAuth(t, httpServer.URL+"/_smsmms/v1/events", "ack-prune-token", body)
+	if status != http.StatusOK {
+		t.Fatalf("ack error events status = %d (%s)", status, data)
+	}
+	if err := json.Unmarshal(data, &response); err != nil {
+		t.Fatalf("failed to decode events response: %v", err)
+	}
+	if response.Accepted != 1 {
+		t.Fatalf("unexpected events response: %+v", response)
+	}
+	if got := queued(); len(got) != 0 {
+		t.Fatalf("all acked commands should be pruned, got %+v", got)
+	}
+}

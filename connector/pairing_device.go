@@ -343,8 +343,26 @@ func (d *pairedDevice) removeCommand(sendID string) {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.removeCommandLocked(func(cmd pairCommand) bool { return cmd.SendID == sendID })
+}
+
+// removeCommandBySeq drops a queued command by its sequence number. Ack events
+// for commands without a send id carry `ack-<seq>` instead; see ackCommandSeq
+// in pairing_server.go.
+func (d *pairedDevice) removeCommandBySeq(seq int64) {
+	if seq <= 0 {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.removeCommandLocked(func(cmd pairCommand) bool { return cmd.Seq == seq })
+}
+
+// removeCommandLocked drops the first command matching match. The caller must
+// hold the device lock.
+func (d *pairedDevice) removeCommandLocked(match func(pairCommand) bool) {
 	for i, cmd := range d.commands {
-		if cmd.SendID == sendID {
+		if match(cmd) {
 			d.commands = append(d.commands[:i], d.commands[i+1:]...)
 			return
 		}
