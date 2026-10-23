@@ -174,3 +174,30 @@ func TestPairingConfigFromSidecarFile(t *testing.T) {
 		t.Errorf("pairing public_url = %q", cfg.Pairing.PublicURL)
 	}
 }
+
+func TestHomeserverPublicURLPrecedence(t *testing.T) {
+	// An explicit network override wins, even without a bridge.
+	nc := &MyConnector{config: &SimpleConfig{PublicHomeserverURL: "https://hs.example.com"}}
+	if got := nc.homeserverPublicURL(); got != "https://hs.example.com" {
+		t.Errorf("homeserverPublicURL() = %q, want the explicit network override", got)
+	}
+
+	// Without an override the pairing public URL is used, because the playbook
+	// serves the pairing API on the homeserver's public hostname.
+	nc = &MyConnector{config: &SimpleConfig{Pairing: PairingConfig{PublicURL: "https://matrix.example.com"}}}
+	if got := nc.homeserverPublicURL(); got != "https://matrix.example.com" {
+		t.Errorf("homeserverPublicURL() = %q, want the pairing public URL", got)
+	}
+
+	// Nothing configured: stay empty rather than advertise a wrong address.
+	nc = &MyConnector{config: &SimpleConfig{}}
+	if got := nc.homeserverPublicURL(); got != "" {
+		t.Errorf("homeserverPublicURL() = %q, want empty", got)
+	}
+
+	// Nil receiver stays safe.
+	var nilConnector *MyConnector
+	if got := nilConnector.homeserverPublicURL(); got != "" {
+		t.Errorf("nil homeserverPublicURL() = %q, want empty", got)
+	}
+}

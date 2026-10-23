@@ -91,6 +91,11 @@ type SimpleConfig struct {
 	// DeviceName manually overrides the device display name used for the
 	// login's remote name / room topic.
 	DeviceName string `yaml:"device_name,omitempty"`
+	// PublicHomeserverURL is the externally reachable homeserver URL advertised
+	// to the phone (pairing payloads and `GET /_smsmms/v1/info`). Leave it empty
+	// for the common single-host deployment: `homeserver.public_address` is used
+	// when set, then the pairing public URL, then the internal address.
+	PublicHomeserverURL string `yaml:"public_homeserver_url,omitempty"`
 	// OwnNumbers lists the phone's own numbers (E.164 or local format).
 	// Participants matching these are excluded from rooms. The adb agent
 	// filters own numbers itself; app-paired logins normally learn them from
@@ -248,16 +253,29 @@ func (c *MyConnector) pairingBridgeURL() string {
 }
 
 // homeserverPublicURL returns the homeserver address the app should use. The
-// public address wins so reverse-proxied setups do not leak the internal one.
+// public address wins so reverse-proxied setups do not leak the internal one;
+// the pairing public URL is a good stand-in when it is not configured, because
+// the playbook serves the pairing API on the homeserver's public hostname.
 func (c *MyConnector) homeserverPublicURL() string {
-	if c == nil || c.bridge == nil || c.bridge.Matrix == nil {
+	if c == nil {
 		return ""
+	}
+	if c.config != nil {
+		if public := strings.TrimSpace(c.config.PublicHomeserverURL); public != "" {
+			return public
+		}
+	}
+	if c.bridge == nil || c.bridge.Matrix == nil {
+		return c.pairingPublicURL()
 	}
 	matrixConnector, ok := c.bridge.Matrix.(*matrix.Connector)
 	if !ok || matrixConnector.Config == nil {
-		return ""
+		return c.pairingPublicURL()
 	}
 	if public := strings.TrimSpace(matrixConnector.Config.Homeserver.PublicAddress); public != "" {
+		return public
+	}
+	if public := c.pairingPublicURL(); public != "" {
 		return public
 	}
 	return strings.TrimSpace(matrixConnector.Config.Homeserver.Address)
