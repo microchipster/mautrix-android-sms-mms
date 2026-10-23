@@ -13,6 +13,18 @@ function fixperms {
 	chown -R $UID:$GID /data
 }
 
+if [[ $# -gt 0 ]]; then
+	# The command line given to the container (e.g. by the playbook) already names
+	# its own config and registration files, so run it as-is. Bare flags (like
+	# `-version`) are appended to the default binary instead.
+	cd /data
+	fixperms
+	if [[ "$1" == -* ]]; then
+		exec su-exec $UID:$GID $BINARY_NAME "$@"
+	fi
+	exec su-exec $UID:$GID "$@"
+fi
+
 if [[ ! -f /data/config.yaml ]]; then
 	$BINARY_NAME -c /data/config.yaml -e
 	echo "Didn't find a config file."
