@@ -1,0 +1,14 @@
+.git/
+.gitignore
+*.md
+!README.md
+docs/
+mautrix-android-sms-mms
+android-sms-mms-adb-agent
+agent-data/
+config.yaml
+registration.yaml
+*.db
+*.db-shm
+*.db-wal
+logs/

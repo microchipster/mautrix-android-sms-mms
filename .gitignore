@@ -1,0 +1,11 @@
+registration.yaml
+config.yaml
+config.yml
+agent.yaml
+agent-data/
+*.db
+*.db-shm
+*.db-wal
+logs/
+/mautrix-android-sms-mms
+/android-sms-mms-adb-agent
