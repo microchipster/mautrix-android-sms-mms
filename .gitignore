@@ -12,3 +12,4 @@ logs/
 
 # Local pairsim test binary
 /tools/pairsim/pairsim
+__pycache__/
