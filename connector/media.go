@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"mime"
 	"path/filepath"
 	"strings"
@@ -74,6 +75,25 @@ func sanitizeFileName(name string) string {
 		name = name[:128]
 	}
 	return name
+}
+
+// attachmentData returns the bytes of one MMS attachment.
+//
+// Transports that cannot serve parts over HTTP after the event is delivered
+// inline them as base64 (app transport). The adb agent transport leaves the
+// inline data empty and serves bytes via GET /v1/mms/{id}/parts/{part_id}.
+func attachmentData(ctx context.Context, agent *AgentClient, mmsID int64, attachment agentapi.Attachment) ([]byte, string, error) {
+	if attachment.Base64 != "" {
+		data, err := base64.StdEncoding.DecodeString(attachment.Base64)
+		if err != nil {
+			return nil, "", fmt.Errorf("decode inline attachment for part %d: %w", attachment.PartID, err)
+		}
+		return data, attachment.ContentType, nil
+	}
+	if attachment.PartID == 0 || mmsID == 0 {
+		return nil, "", fmt.Errorf("attachment has no part id and no inline data")
+	}
+	return agent.PartBytes(ctx, mmsID, attachment.PartID)
 }
 
 // attachmentFileName picks a display filename for an MMS attachment, adding a

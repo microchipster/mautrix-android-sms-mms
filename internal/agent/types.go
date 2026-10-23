@@ -13,6 +13,11 @@ type Attachment struct {
 	FileName    string `json:"file_name,omitempty"`
 	Size        int64  `json:"size,omitempty"`
 	URL         string `json:"url,omitempty"`
+	// Base64 carries the part bytes inline for transports where the bridge
+	// cannot fetch them over HTTP afterwards (the app transport: the phone
+	// polls the bridge and is not reachable from it). The adb agent transport
+	// leaves it empty and serves bytes via GET /v1/mms/{id}/parts/{part_id}.
+	Base64 string `json:"base64,omitempty"`
 }
 
 // Message is the normalized representation of an SMS or MMS message.

@@ -140,6 +140,17 @@ queued command (`send_id`, plus the `ack-<seq>` suffix fallback) so it is never 
 unknown event types are stored in the device inbox and ignored. Response:
 `{"cursor": 17, "accepted": 3}`.
 
+Incoming messages with media carry their `agentapi.Message` payload inline, and for the app
+transport the attachment bytes themselves must be inlined in
+`attachments[].base64` (with `content_type` and `file_name`): the bridge cannot reach the
+phone over HTTP to fetch MMS parts, so an attachment without inline data is dropped and the
+message is delivered text-only (with a warning in the bridge log). The adb agent transport
+does the opposite — it leaves `base64` empty and serves bytes via
+`GET /v1/mms/{id}/parts/{part_id}`; the bridge prefers inline `base64` when present and
+falls back to that endpoint otherwise. Keep inline data within the cap in §5 (`unsupported`
+beyond it); prefer to omit oversized attachments (text-only delivery) over failing the
+whole `events` batch.
+
 ### `POST /_smsmms/v1/heartbeat` (Bearer)
 ```json
 {"device_id": "android-ab12", "battery_pct": 88, "default_sms_app": true,
@@ -163,7 +174,9 @@ Used for bridge health display and to gate MMS/read features.
 - Timestamps are milliseconds since epoch everywhere (MMS provider seconds are converted at
   the agent/app boundary).
 - Attachments are base64 with a hard cap (10485760 bytes encoded per attachment; the bridge
-  rejects larger sends with `unsupported`).
+  rejects larger sends with `unsupported`). For incoming media on the app transport the same
+  cap applies to `attachments[].base64` in `message.new`; oversized parts should be omitted
+  rather than failing the batch.
 
 ## 6. Bridge-side storage
 

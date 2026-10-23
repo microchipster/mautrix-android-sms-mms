@@ -5,7 +5,9 @@
 package connector
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -72,11 +74,13 @@ func TestStableLoginID(t *testing.T) {
 // implementation in tests.
 type fakeMediaIntent struct {
 	bridgev2.MatrixAPI
-	uploads []string
+	uploads      []string
+	lastUploaded []byte
 }
 
 func (f *fakeMediaIntent) UploadMedia(ctx context.Context, roomID id.RoomID, data []byte, fileName, mimeType string) (id.ContentURIString, *event.EncryptedFileInfo, error) {
 	f.uploads = append(f.uploads, fileName+"|"+mimeType)
+	f.lastUploaded = data
 	return id.ContentURIString("mxc://example.com/" + fileName), nil, nil
 }
 
@@ -182,6 +186,56 @@ func TestBuildConvertedMessageMissingPartFallsBackToText(t *testing.T) {
 	}
 	if converted.Parts[0].Content.Body != "text survives" {
 		t.Fatalf("fallback body = %q, want the original text", converted.Parts[0].Content.Body)
+	}
+}
+
+func TestBuildConvertedMessageInlineBase64Attachment(t *testing.T) {
+	// servePart=false makes every HTTP part fetch fail, so success proves the
+	// inline base64 path (used by the app transport) was taken.
+	nc := newMediaTestClient(t, false)
+	intent := &fakeMediaIntent{}
+	jpeg := []byte{0xFF, 0xD8, 0xFF, 0xE0, 'i', 'n', 'l', 'i', 'n', 'e'}
+	converted, err := nc.buildConvertedMessage(context.Background(), testPortal(), intent, agentapi.Message{
+		ID: "mms:1:534", ThreadID: 12, Body: "look at this",
+		Attachments: []agentapi.Attachment{{
+			PartID:      901,
+			ContentType: "image/jpeg",
+			FileName:    "photo.jpg",
+			Base64:      base64.StdEncoding.EncodeToString(jpeg),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("buildConvertedMessage() error: %v", err)
+	}
+	if len(converted.Parts) != 1 {
+		t.Fatalf("expected one part, got %d", len(converted.Parts))
+	}
+	part := converted.Parts[0]
+	if part.Content.MsgType != event.MsgImage || part.Content.Body != "look at this" || part.Content.FileName != "photo.jpg" {
+		t.Fatalf("unexpected part content: %+v", part.Content)
+	}
+	if len(intent.uploads) != 1 || intent.uploads[0] != "photo.jpg|image/jpeg" {
+		t.Fatalf("unexpected uploads: %v", intent.uploads)
+	}
+	if intent.lastUploaded == nil || !bytes.Equal(intent.lastUploaded, jpeg) {
+		t.Fatalf("uploaded bytes = %v, want %v", intent.lastUploaded, jpeg)
+	}
+}
+
+func TestAttachmentDataErrors(t *testing.T) {
+	nc := newMediaTestClient(t, false)
+	if _, _, err := attachmentData(context.Background(), nc.agent, 534, agentapi.Attachment{PartID: 901}); err == nil {
+		t.Fatal("expected error when the part cannot be fetched")
+	}
+	if _, _, err := attachmentData(context.Background(), nc.agent, 534, agentapi.Attachment{Base64: "!!not-base64!!"}); err == nil {
+		t.Fatal("expected error for invalid inline base64")
+	}
+	data, contentType, err := attachmentData(context.Background(), nc.agent, 534, agentapi.Attachment{
+		ContentType: "image/png",
+		Base64:      base64.StdEncoding.EncodeToString([]byte("png")),
+	})
+	if err != nil || string(data) != "png" || contentType != "image/png" {
+		t.Fatalf("inline data = %q, %q, %v", data, contentType, err)
 	}
 }
 

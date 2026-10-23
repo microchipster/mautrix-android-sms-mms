@@ -796,22 +796,19 @@ func (nc *MyNetworkClient) buildConvertedMessage(ctx context.Context, portal *br
 	attachmentNames := make([]string, 0, len(msg.Attachments))
 	bodyAssigned := false
 	for _, attachment := range msg.Attachments {
-		if attachment.PartID == 0 || mmsID == 0 {
-			continue
-		}
 		fileName := attachmentFileName(attachment)
-		attachmentNames = append(attachmentNames, fileName)
-		data, contentType, err := nc.agent.PartBytes(ctx, mmsID, attachment.PartID)
+		data, contentType, err := attachmentData(ctx, nc.agent, mmsID, attachment)
 		if err != nil {
 			nc.log.Warn().Err(err).
 				Str("message_id", msg.ID).
 				Int64("part_id", attachment.PartID).
-				Msg("Failed to download MMS part; skipping attachment")
+				Msg("Failed to obtain MMS attachment; skipping")
 			continue
 		}
 		if len(data) == 0 {
 			continue
 		}
+		attachmentNames = append(attachmentNames, fileName)
 		if contentType == "" {
 			contentType = http.DetectContentType(data)
 		}
