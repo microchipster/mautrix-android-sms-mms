@@ -347,8 +347,11 @@ commands; playbook wiring committed (Traefik `/_smsmms/` route + `.well-known` d
 key); app pairing client (PairingActivity, Keystore-wrapped token, queue poller inside
 BridgeService). The local harness (`tools/pairsim` + `docs/testing-e2e-local.md`) proves the
 whole flow without a cloud homeserver: pair → portal room → both directions → mark_read →
-dedupe, including group threads. Exit remaining: the real phone pairing against the cloud
-homeserver (needs the deployment details).
+dedupe, including group threads. Exit done: the bridge is deployed to production
+(example.com) and the public pairing endpoint is verified
+(`https://matrix.example.com/_smsmms/v1/info` → `homeserver_url:
+https://matrix.example.com`, `pairing_enabled: true`); pairing the real phone against it
+is a user step (run `!sms login app-pair` and scan the QR in the app).
 
 **Phase 5 — Group-chat perfection & release (in progress).**
 Locally verified with the simulator: one room per thread (no fracturing), correct
@@ -362,9 +365,12 @@ Matrix → phone sends, read receipts and portal participant repair. Repositorie
 `microchipster/mautrix-android-sms-mms` (bridge + agent),
 `repos/fossify-messages-bridge` (app fork, branch `bridge`) and
 `repos/fossify-mmslib-bridge` (mmslib fork); `repos/Messages` stays a read-only upstream
-mirror. Remaining: real group MMS matrix (3+ participants, membership changes,
-attachments both ways, tapback round trip) on hardware, auto-fit attachment pipeline,
-delivery states, GrapheneOS non-root acceptance run, release tagging.
+mirror. A signed release (`v1.10.1-bridge.1`) with the APK is published on the app fork's
+releases page, and the READMEs (bridge + app) plus the playbook docs page carry the
+onboarding/pairing instructions. Remaining: real group MMS matrix (3+ participants,
+membership changes, attachments both ways, tapback round trip) on hardware, auto-fit
+attachment pipeline, delivery states, GrapheneOS non-root acceptance run, release tagging
+per version.
 
 ## 9. Testing
 
