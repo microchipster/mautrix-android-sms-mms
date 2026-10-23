@@ -279,7 +279,7 @@ func (nc *MyNetworkClient) handleRemoteEvent(ctx context.Context, ev remoteEvent
 			nc.handleAgentMessageUpdate(ctx, ev.MessageID)
 		}
 	case "thread.updated":
-		nc.handleAgentThreadUpdate(ctx, ev.ThreadID)
+		nc.handleAgentThreadUpdate(ctx, ev)
 	case "send.result":
 		nc.handleSendResult(ctx, ev)
 	default:
@@ -355,6 +355,28 @@ func (nc *MyNetworkClient) handleSendResult(ctx context.Context, ev remoteEvent)
 	nc.handleLateSendResult(pairSendResult{SendID: ev.SendID, MessageID: ev.MessageID, Error: ev.Error})
 }
 
+// rememberThreadRecipients merges the participant list reported by a
+// thread.updated event into the thread cache. App transports have no thread
+// list endpoint, so this is the only way to refresh portal recipient metadata
+// without waiting for a new message in the thread.
+func (nc *MyNetworkClient) rememberThreadRecipients(threadID int64, subID int, recipients []string) {
+	if threadID == 0 || len(recipients) == 0 {
+		return
+	}
+	nc.threadMu.Lock()
+	defer nc.threadMu.Unlock()
+	if nc.threads == nil {
+		nc.threads = make(map[int64]agentapi.Thread)
+	}
+	thread := nc.threads[threadID]
+	thread.ID = threadID
+	if subID != 0 {
+		thread.SubID = subID
+	}
+	thread.Recipients = append([]string{}, recipients...)
+	nc.threads[threadID] = thread
+}
+
 // cacheThreadForMessage keeps the thread cache warm for app logins, which
 // have no /v1/threads endpoint to refresh from.
 func (nc *MyNetworkClient) cacheThreadForMessage(msg agentapi.Message) {
@@ -414,9 +436,13 @@ func (nc *MyNetworkClient) handleAgentMessageUpdate(ctx context.Context, msgID s
 // handleAgentThreadUpdate refreshes the participant cache and, when the portal
 // already exists, pushes the new participant list to the Matrix room. Thread ID
 // changes never create a new room.
-func (nc *MyNetworkClient) handleAgentThreadUpdate(ctx context.Context, threadID int64) {
+func (nc *MyNetworkClient) handleAgentThreadUpdate(ctx context.Context, ev remoteEvent) {
 	nc.refreshThreads(ctx)
-	thread, ok := nc.cachedThread(threadID)
+	// App transports have no thread list endpoint, so the recipients carried
+	// by the event are the only way to refresh portal metadata after a bridge
+	// restart (e.g. portals that were stored without participants).
+	nc.rememberThreadRecipients(ev.ThreadID, ev.SubID, ev.Recipients)
+	thread, ok := nc.cachedThread(ev.ThreadID)
 	if !ok {
 		return
 	}

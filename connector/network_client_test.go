@@ -23,6 +23,32 @@ import (
 	agentapi "mautrix-android-sms-mms/internal/agent"
 )
 
+// TestRememberThreadRecipients covers refreshing the thread cache from
+// thread.updated events, which is how app-paired portals recover their
+// participant list after a bridge restart.
+func TestRememberThreadRecipients(t *testing.T) {
+	nc := &MyNetworkClient{}
+	nc.rememberThreadRecipients(33, 1, []string{"+15550100100"})
+	thread, ok := nc.cachedThread(33)
+	if !ok || thread.SubID != 1 || len(thread.Recipients) != 1 || thread.Recipients[0] != "+15550100100" {
+		t.Fatalf("cachedThread(33) = %+v, %v", thread, ok)
+	}
+
+	// An event without recipients must never clobber the cached list.
+	nc.rememberThreadRecipients(33, 0, nil)
+	thread, _ = nc.cachedThread(33)
+	if len(thread.Recipients) != 1 || thread.Recipients[0] != "+15550100100" {
+		t.Fatalf("recipients clobbered by empty update: %v", thread.Recipients)
+	}
+
+	// Later updates replace the list while keeping the known sub id.
+	nc.rememberThreadRecipients(33, 0, []string{"+15551112222", "+15553334444"})
+	thread, _ = nc.cachedThread(33)
+	if len(thread.Recipients) != 2 || thread.SubID != 1 {
+		t.Fatalf("recipients after update = %+v", thread)
+	}
+}
+
 func TestMmsRowID(t *testing.T) {
 	tests := map[string]int64{
 		"mms:1:534":   534,

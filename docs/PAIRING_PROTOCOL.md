@@ -131,7 +131,10 @@ App → bridge event push; body is the agent `Event` shape plus payloads:
    "is_mms": false, "has_attachment": false, "preview": "…", "send_id": "…"}
 ]}
 ```
-Also `message.updated` (read/seen/status changes), `mms.downloaded`, `thread.updated`,
+Also `message.updated` (read/seen/status changes), `mms.downloaded`, `thread.updated`
+(`thread.updated` may carry `recipients`, the current participant list of the thread; app
+transports have no thread list endpoint, so this is how the bridge refreshes a portal's
+stored participants — e.g. after a bridge restart — without waiting for a new message),
 `send.result` (outcome for a queue command: `{send_id, message_id, thread_id, parts_sent,
 pending}` or `{send_id, error: {code, message}}`) and `ack` (a non-send queue command was
 handled: `{seq, type: "ack", send_id: "ack-<command_seq>", command_seq, thread_id, sub_id,
