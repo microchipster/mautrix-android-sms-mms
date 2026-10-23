@@ -278,10 +278,14 @@ func (nc *MyNetworkClient) ensureBackfillTaskForPortal(ctx context.Context, port
 }
 
 // FetchMessages implements bridgev2.BackfillingNetworkAPI by paging backwards
-// through the phone's thread history.
+// through the phone's thread history. App-paired logins have no history
+// endpoint yet, so backfill is a no-op for them.
 func (nc *MyNetworkClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessagesParams) (*bridgev2.FetchMessagesResponse, error) {
 	portal := params.Portal
 	if portal == nil {
+		return &bridgev2.FetchMessagesResponse{HasMore: false}, nil
+	}
+	if nc.device != nil {
 		return &bridgev2.FetchMessagesResponse{HasMore: false}, nil
 	}
 	if params.ThreadRoot != "" {

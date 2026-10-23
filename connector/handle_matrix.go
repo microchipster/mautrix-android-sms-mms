@@ -47,12 +47,12 @@ func (nc *MyNetworkClient) HandleMatrixMessage(ctx context.Context, msg *bridgev
 			WithSendNotice(true)
 	}
 
-	// The agent may be down; give it a grace period like jmpchat does for XMPP.
+	// The phone may be down; give it a grace period like jmpchat does for XMPP.
 	healthCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	health, err := nc.waitForAgentHealth(healthCtx)
 	if err != nil {
-		errMsg := "The phone agent is not reachable; message was not sent"
+		errMsg := "The phone is not reachable; message was not sent"
 		nc.log.Warn().Err(err).Msg(errMsg)
 		sendNotice(nc.bridge.Bot, msg.Portal.MXID, errMsg)
 		return nil, bridgev2.WrapErrorInStatus(fmt.Errorf("%s: %v", errMsg, err)).WithSendNotice(true)
@@ -104,19 +104,13 @@ func (nc *MyNetworkClient) HandleMatrixMessage(ctx context.Context, msg *bridgev
 		Text:        text,
 		Attachments: attachments,
 	}
-	resp, err := nc.agent.Send(ctx, req)
+	resp, err := nc.sendToPhone(ctx, req)
 	if err != nil {
-		nc.log.Err(err).Str("portal_id", string(msg.Portal.ID)).Msg("Agent send failed")
+		nc.log.Err(err).Str("portal_id", string(msg.Portal.ID)).Msg("Phone send failed")
 		return nil, mapAgentSendError(err)
 	}
 
-	messageID := strings.TrimSpace(resp.MessageID)
-	if messageID == "" {
-		// The phone row hasn't appeared yet; keep a stable placeholder ID so
-		// the Matrix event can be stored and later deduplicated.
-		messageID = "pending-" + sendID
-	}
-	nc.markSentFromMatrix(networkid.MessageID(resp.MessageID), networkid.MessageID(messageID))
+	messageID := string(nc.recordOutgoingSend(resp, sendID))
 
 	nc.log.Info().
 		Str("portal_id", string(msg.Portal.ID)).
@@ -136,6 +130,83 @@ func (nc *MyNetworkClient) HandleMatrixMessage(ctx context.Context, msg *bridgev
 			},
 		},
 	}, nil
+}
+
+// sendToPhone dispatches an outgoing send to the active transport: the ADB
+// agent HTTP API or the app pairing command queue.
+func (nc *MyNetworkClient) sendToPhone(ctx context.Context, req SendRequest) (SendResponse, error) {
+	if nc.device != nil {
+		return nc.sendViaDevice(ctx, req)
+	}
+	nc.ensureAgent()
+	if nc.agent == nil || strings.TrimSpace(nc.agent.BaseURL) == "" {
+		return SendResponse{}, fmt.Errorf("no phone transport is configured for this login")
+	}
+	return nc.agent.Send(ctx, req)
+}
+
+// sendViaDevice enqueues a send command for the paired app and waits for the
+// matching send.result. When the app does not answer in time the command stays
+// queued and the caller falls back to a pending placeholder.
+func (nc *MyNetworkClient) sendViaDevice(ctx context.Context, req SendRequest) (SendResponse, error) {
+	for _, attachment := range req.Attachments {
+		if len(attachment.Base64) > pairingAttachmentMaxBase64 {
+			return SendResponse{}, &APIError{
+				Code: "unsupported",
+				Message: fmt.Sprintf("attachment %q exceeds the %d byte MMS limit",
+					attachment.FileName, pairingAttachmentMaxBase64),
+			}
+		}
+	}
+	commandType := "send_sms"
+	if len(req.Attachments) > 0 {
+		commandType = "send_mms"
+	}
+	command := pairCommand{
+		Type:        commandType,
+		SendID:      req.SendID,
+		ThreadID:    req.ThreadID,
+		SubID:       req.SubID,
+		Recipients:  req.Recipients,
+		Text:        req.Text,
+		Attachments: req.Attachments,
+	}
+	result, timedOut, err := nc.device.requestSend(ctx, command, pairingSendTimeout)
+	if err != nil {
+		return SendResponse{}, err
+	}
+	if timedOut {
+		nc.log.Warn().
+			Str("send_id", req.SendID).
+			Msg("Paired app did not acknowledge the send before the timeout; using a pending placeholder")
+		return SendResponse{SendID: req.SendID, Pending: true}, nil
+	}
+	if result.Error != nil {
+		return SendResponse{}, &APIError{Code: result.Error.Code, Message: result.Error.Message}
+	}
+	return SendResponse{
+		SendID:    req.SendID,
+		MessageID: result.MessageID,
+		ThreadID:  result.ThreadID,
+		PartsSent: result.PartsSent,
+		Pending:   result.Pending,
+	}, nil
+}
+
+// recordOutgoingSend stores the echo-suppression state for a send the phone
+// accepted and returns the message ID the bridge stores in its database.
+func (nc *MyNetworkClient) recordOutgoingSend(resp SendResponse, sendID string) networkid.MessageID {
+	messageID := strings.TrimSpace(resp.MessageID)
+	if messageID == "" {
+		// The phone row hasn't appeared yet; keep a stable placeholder ID so
+		// the Matrix event can be stored and later deduplicated by send_id.
+		messageID = "pending-" + sendID
+		if nc.device != nil && sendID != "" {
+			nc.device.trackPendingSend(sendID)
+		}
+	}
+	nc.markSentFromMatrix(networkid.MessageID(resp.MessageID), networkid.MessageID(messageID))
+	return networkid.MessageID(messageID)
 }
 
 // downloadMatrixAttachment downloads the media of an outgoing Matrix message
@@ -194,12 +265,15 @@ func mapAgentSendError(err error) error {
 		case apiErr.Code == "unsupported":
 			return bridgev2.WrapErrorInStatus(fmt.Errorf("the phone backend rejected the message: %s", apiErr.Message)).
 				WithSendNotice(true)
+		case apiErr.Code == "send_failed":
+			return bridgev2.WrapErrorInStatus(fmt.Errorf("the phone failed to send the message: %s", apiErr.Message)).
+				WithSendNotice(true)
 		case apiErr.Status == http.StatusUnauthorized:
 			return bridgev2.WrapErrorInStatus(fmt.Errorf("the agent rejected the bridge's token; check the agent token in the bridge login")).
 				WithSendNotice(true)
 		}
 	}
-	return bridgev2.WrapErrorInStatus(fmt.Errorf("failed to send message via agent: %w", err)).WithSendNotice(true)
+	return bridgev2.WrapErrorInStatus(fmt.Errorf("failed to send message via the phone: %w", err)).WithSendNotice(true)
 }
 
 // PreHandleMatrixReaction implements bridgev2.ReactionHandlingNetworkAPI.
@@ -275,8 +349,9 @@ func (nc *MyNetworkClient) sendReactionAsText(ctx context.Context, msg *bridgev2
 	} else {
 		text = fmt.Sprintf("Reacted %s", emoji)
 	}
-	resp, err := nc.agent.Send(ctx, SendRequest{
-		SendID:     "reaction-" + random.String(12),
+	sendID := "reaction-" + random.String(12)
+	resp, err := nc.sendToPhone(ctx, SendRequest{
+		SendID:     sendID,
 		ThreadID:   meta.ThreadID,
 		SubID:      meta.SubID,
 		Recipients: recipients,
@@ -285,7 +360,7 @@ func (nc *MyNetworkClient) sendReactionAsText(ctx context.Context, msg *bridgev2
 	if err != nil {
 		return mapAgentSendError(err)
 	}
-	nc.markSentFromMatrix(networkid.MessageID(resp.MessageID))
+	nc.recordOutgoingSend(resp, sendID)
 	return nil
 }
 
@@ -393,6 +468,12 @@ func (nc *MyNetworkClient) HandleMatrixReadReceipt(ctx context.Context, msg *bri
 	}
 	upToMS := msg.ReadUpTo.UnixMilli()
 	if upToMS <= 0 {
+		return nil
+	}
+	if nc.device != nil {
+		// Fire-and-forget: the read command is queued and acknowledged by the
+		// app's next events batch.
+		nc.device.enqueue(pairCommand{Type: "mark_read", ThreadID: meta.ThreadID, UpToMS: upToMS})
 		return nil
 	}
 	if _, err := nc.agent.Read(ctx, meta.ThreadID, upToMS, nil); err != nil {

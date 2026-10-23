@@ -41,14 +41,16 @@ const (
 )
 
 // MyNetworkClient implements bridgev2.NetworkAPI for one phone login: it
-// long-polls the agent event feed, bridges messages into Matrix rooms and
-// implements the Matrix -> phone direction.
+// long-polls the agent event feed (or, for app-paired logins, the pairing
+// server inbox), bridges messages into Matrix rooms and implements the
+// Matrix -> phone direction.
 type MyNetworkClient struct {
 	log       zerolog.Logger
 	bridge    *bridgev2.Bridge
 	login     *bridgev2.UserLogin
 	connector *MyConnector
 	agent     *AgentClient
+	device    *pairedDevice
 
 	startMu  sync.Mutex
 	started  bool
@@ -89,8 +91,29 @@ func NewMyNetworkClient(log zerolog.Logger, bridge *bridgev2.Bridge, login *brid
 		login:     login,
 		connector: connector,
 	}
-	nc.ensureAgent()
+	nc.ensureTransports()
 	return nc
+}
+
+// ensureTransports (re)creates the transport handles from the login metadata:
+// an AgentClient for ADB agent logins, a pairedDevice for app-paired logins.
+func (nc *MyNetworkClient) ensureTransports() {
+	nc.ensureDevice()
+	nc.ensureAgent()
+}
+
+// ensureDevice binds the pairing server's runtime state for app-paired logins.
+func (nc *MyNetworkClient) ensureDevice() {
+	if nc.login == nil || nc.connector == nil {
+		return
+	}
+	meta, _ := nc.login.Metadata.(*LoginMetadata)
+	if meta == nil || meta.Transport != LoginTransportApp || strings.TrimSpace(meta.DeviceID) == "" {
+		return
+	}
+	if nc.device == nil {
+		nc.device = nc.connector.pairingServer().ensureDevice(meta)
+	}
 }
 
 // ensureAgent (re)creates the HTTP client from the login metadata.
@@ -131,10 +154,10 @@ func (nc *MyNetworkClient) Start() {
 	nc.cancel = cancel
 	nc.startMu.Unlock()
 
-	nc.ensureAgent()
-	if nc.agent == nil || strings.TrimSpace(nc.agent.BaseURL) == "" {
-		nc.log.Error().Msg("Cannot start agent event loop: no agent URL configured")
-		nc.sendBridgeState(status.StateBadCredentials, "The login has no agent URL configured; log in again.", 300)
+	nc.ensureTransports()
+	if nc.device == nil && (nc.agent == nil || strings.TrimSpace(nc.agent.BaseURL) == "") {
+		nc.log.Error().Msg("Cannot start the event loop: no agent URL or paired device configured")
+		nc.sendBridgeState(status.StateBadCredentials, "The login has no transport configured; log in again.", 300)
 		close(loopDone)
 		return
 	}
@@ -143,9 +166,10 @@ func (nc *MyNetworkClient) Start() {
 
 func (nc *MyNetworkClient) eventLoop(ctx context.Context, stopCh <-chan struct{}, loopDone chan<- struct{}) {
 	defer close(loopDone)
-	log := nc.log.With().Str("component", "agent-event-loop").Logger()
+	log := nc.log.With().Str("component", "remote-event-loop").Logger()
 	backoff := time.Second
 	connected := false
+	reportedOffline := false
 	for {
 		select {
 		case <-stopCh:
@@ -153,15 +177,15 @@ func (nc *MyNetworkClient) eventLoop(ctx context.Context, stopCh <-chan struct{}
 		default:
 		}
 
-		events, err := nc.agent.Events(ctx, nc.getCursor(), agentEventPollTimeoutMS)
+		page, err := nc.pollRemoteEvents(ctx, nc.getCursor())
 		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
-			log.Warn().Err(err).Msg("Agent event poll failed")
+			log.Warn().Err(err).Msg("Remote event poll failed")
 			if connected {
 				connected = false
-				nc.sendBridgeState(status.StateTransientDisconnect, fmt.Sprintf("Agent unreachable: %v", err), int(backoff.Seconds())+5)
+				nc.sendBridgeState(status.StateTransientDisconnect, fmt.Sprintf("Phone not reachable: %v", err), int(backoff.Seconds())+5)
 			}
 			select {
 			case <-stopCh:
@@ -176,37 +200,181 @@ func (nc *MyNetworkClient) eventLoop(ctx context.Context, stopCh <-chan struct{}
 		}
 
 		backoff = time.Second
-		if !connected {
+		switch {
+		case page.Online && !connected:
 			connected = true
-			nc.log.Info().Msg("Connected to android-sms-mms agent event feed")
+			reportedOffline = false
+			nc.log.Info().Msg("Connected to the phone event feed")
 			nc.sendBridgeState(status.StateConnected, "", 0)
 			nc.refreshThreadsAndCatchup(ctx)
+		case !page.Online && connected:
+			connected = false
+			reportedOffline = true
+			nc.log.Warn().Msg("Paired phone app stopped responding")
+			nc.sendBridgeState(status.StateTransientDisconnect, "The paired phone app is not responding.", 60)
+		case !page.Online && !reportedOffline:
+			// The app login exists but the phone has not contacted the bridge
+			// yet (e.g. right after pairing, or while the phone is offline).
+			reportedOffline = true
+			nc.log.Warn().Msg("Paired phone app has not contacted the bridge yet")
+			nc.sendBridgeState(status.StateTransientDisconnect, "Waiting for the paired phone app to connect.", 60)
 		}
 
-		if events.Reset {
-			log.Warn().Msg("Agent event log was reset; re-scanning recent messages")
+		if page.Reset {
+			log.Warn().Msg("Remote event log was reset; re-scanning recent messages")
 			nc.setCursor(0)
 			nc.rescanRecentMessages(ctx)
 			continue
 		}
-		nc.setCursor(events.Cursor)
-		for _, ev := range events.Events {
-			nc.handleAgentEvent(ctx, ev)
+		nc.setCursor(page.Cursor)
+		for _, ev := range page.Events {
+			nc.handleRemoteEvent(ctx, ev)
 		}
 	}
 }
 
-func (nc *MyNetworkClient) handleAgentEvent(ctx context.Context, ev agentapi.Event) {
+// pollRemoteEvents fetches the next batch of remote events. Agent logins
+// long-poll the agent HTTP API; app logins long-poll the pairing server inbox.
+func (nc *MyNetworkClient) pollRemoteEvents(ctx context.Context, since int64) (remoteEventPage, error) {
+	if nc.device != nil {
+		return nc.device.waitEvents(ctx, since, time.Duration(agentEventPollTimeoutMS)*time.Millisecond)
+	}
+	nc.ensureAgent()
+	if nc.agent == nil {
+		return remoteEventPage{}, fmt.Errorf("no agent URL configured for this login")
+	}
+	response, err := nc.agent.Events(ctx, since, agentEventPollTimeoutMS)
+	if err != nil {
+		return remoteEventPage{}, err
+	}
+	events := make([]remoteEvent, len(response.Events))
+	for i, ev := range response.Events {
+		events[i] = remoteEvent{Event: ev}
+	}
+	return remoteEventPage{Events: events, Cursor: response.Cursor, Reset: response.Reset, Online: true}, nil
+}
+
+// handleRemoteEvent dispatches one event from either transport. Events pushed
+// by the app may carry the full message; otherwise message.* events make the
+// bridge fetch the message from the agent (app events without a payload are
+// synthesized from the event fields).
+func (nc *MyNetworkClient) handleRemoteEvent(ctx context.Context, ev remoteEvent) {
 	switch ev.Type {
 	case "message.new", "mms.downloaded":
-		nc.handleAgentMessage(ctx, ev.MessageID)
+		switch {
+		case ev.Message != nil:
+			nc.bridgeRemoteMessage(ctx, *ev.Message, ev.SendID)
+		case nc.device != nil:
+			nc.bridgeRemoteMessage(ctx, syntheticMessageFromEvent(ev), ev.SendID)
+		default:
+			nc.handleAgentMessage(ctx, ev.MessageID)
+		}
 	case "message.updated":
-		nc.handleAgentMessageUpdate(ctx, ev.MessageID)
+		switch {
+		case ev.Message != nil:
+			nc.handleRemoteMessageUpdate(ctx, *ev.Message)
+		case nc.device != nil:
+			// Without the full message there is nothing to refresh.
+		default:
+			nc.handleAgentMessageUpdate(ctx, ev.MessageID)
+		}
 	case "thread.updated":
 		nc.handleAgentThreadUpdate(ctx, ev.ThreadID)
+	case "send.result":
+		nc.handleSendResult(ctx, ev)
 	default:
-		nc.log.Debug().Str("event_type", ev.Type).Msg("Ignoring unknown agent event type")
+		nc.log.Debug().Str("event_type", ev.Type).Msg("Ignoring unknown remote event type")
 	}
+}
+
+// syntheticMessageFromEvent builds a minimal Message when the app pushes an
+// event without the full message payload. The body falls back to the preview.
+func syntheticMessageFromEvent(ev remoteEvent) agentapi.Message {
+	msg := agentapi.Message{
+		ID:          ev.MessageID,
+		ThreadID:    ev.ThreadID,
+		SubID:       ev.SubID,
+		TimestampMS: ev.TimestampMS,
+		Sender:      ev.Sender,
+		IsMMS:       ev.IsMMS,
+		Body:        ev.Preview,
+	}
+	if ev.Recipients != nil {
+		msg.Recipients = ev.Recipients
+	}
+	return msg
+}
+
+// bridgeRemoteMessage bridges an app-pushed message, applying the send_id
+// echo suppression for sends that only got a pending placeholder.
+func (nc *MyNetworkClient) bridgeRemoteMessage(ctx context.Context, msg agentapi.Message, sendID string) {
+	if sendID != "" && nc.device != nil && nc.device.consumePendingSend(sendID) {
+		if msg.ID != "" {
+			nc.markSentFromMatrix(networkid.MessageID(msg.ID))
+		}
+		nc.log.Debug().
+			Str("send_id", sendID).
+			Str("message_id", msg.ID).
+			Msg("Ignoring phone echo of a pending send from Matrix")
+		return
+	}
+	nc.bridgeAgentMessage(ctx, msg)
+}
+
+// handleRemoteMessageUpdate refreshes the in-memory tapback index from the
+// full message payload the app pushes for message.updated events.
+func (nc *MyNetworkClient) handleRemoteMessageUpdate(ctx context.Context, msg agentapi.Message) {
+	if msg.ID == "" || msg.Type == 3 || msg.Sender == "" {
+		return
+	}
+	nc.cacheThreadForMessage(msg)
+	nc.indexMessage(nc.portalKeyFor(msg.ThreadID, msg.SubID), indexedMessage{
+		ID:            networkid.MessageID(msg.ID),
+		Body:          msg.Body,
+		HasAttachment: len(msg.Attachments) > 0,
+	})
+}
+
+// handleSendResult resolves a pending outgoing send from the app.
+func (nc *MyNetworkClient) handleSendResult(ctx context.Context, ev remoteEvent) {
+	if nc.device == nil {
+		return
+	}
+	delivered := nc.device.resolveSend(pairSendResult{
+		SendID:    ev.SendID,
+		MessageID: ev.MessageID,
+		ThreadID:  ev.ThreadID,
+		PartsSent: ev.PartsSent,
+		Pending:   ev.Pending,
+		Error:     ev.Error,
+	})
+	if delivered {
+		return
+	}
+	// No one is waiting anymore: apply the echo suppression directly.
+	nc.handleLateSendResult(pairSendResult{SendID: ev.SendID, MessageID: ev.MessageID, Error: ev.Error})
+}
+
+// cacheThreadForMessage keeps the thread cache warm for app logins, which
+// have no /v1/threads endpoint to refresh from.
+func (nc *MyNetworkClient) cacheThreadForMessage(msg agentapi.Message) {
+	if msg.ThreadID == 0 {
+		return
+	}
+	recipients := append([]string{}, msg.Recipients...)
+	if msg.Sender != "" {
+		recipients = append(recipients, msg.Sender)
+	}
+	nc.threadMu.Lock()
+	if nc.threads == nil {
+		nc.threads = make(map[int64]agentapi.Thread)
+	}
+	nc.threads[msg.ThreadID] = agentapi.Thread{
+		ID:         msg.ThreadID,
+		SubID:      msg.SubID,
+		Recipients: recipients,
+	}
+	nc.threadMu.Unlock()
 }
 
 // handleAgentMessage fetches an agent message by ID and bridges it.
@@ -286,6 +454,9 @@ func (nc *MyNetworkClient) bridgeAgentMessage(ctx context.Context, msg agentapi.
 	if msg.Type == 3 {
 		// Drafts are never bridged.
 		return
+	}
+	if nc.device != nil {
+		nc.cacheThreadForMessage(msg)
 	}
 	portalKey := nc.portalKeyFor(msg.ThreadID, msg.SubID)
 	fromMe := msg.Sender == ""
@@ -543,8 +714,12 @@ func (nc *MyNetworkClient) cachedThread(threadID int64) (agentapi.Thread, bool) 
 	return thread, ok
 }
 
-// refreshThreads reloads the thread list from the agent.
+// refreshThreads reloads the thread list from the agent. App-paired logins
+// have no thread list endpoint; their cache is filled from message events.
 func (nc *MyNetworkClient) refreshThreads(ctx context.Context) {
+	if nc.device != nil {
+		return
+	}
 	threads, err := nc.agent.Threads(ctx)
 	if err != nil {
 		nc.log.Warn().Err(err).Msg("Failed to refresh thread list from agent")
@@ -567,8 +742,13 @@ func (nc *MyNetworkClient) refreshThreadsAndCatchup(ctx context.Context) {
 }
 
 // rescanRecentMessages walks all threads and re-bridges messages newer than the
-// stored sync position. Used when the agent's event log resets.
+// stored sync position. Used when the agent's event log resets. App-paired
+// logins have no history endpoint, so a reset cannot be recovered from here.
 func (nc *MyNetworkClient) rescanRecentMessages(ctx context.Context) {
+	if nc.device != nil {
+		nc.log.Warn().Msg("App pairing transport has no history endpoint; cannot rescan after a reset")
+		return
+	}
 	nc.refreshThreads(ctx)
 	nc.threadMu.Lock()
 	threads := make([]agentapi.Thread, 0, len(nc.threads))
@@ -748,9 +928,13 @@ func (nc *MyNetworkClient) setCursor(cursor int64) {
 	nc.cursorMu.Unlock()
 }
 
-// Health returns a (possibly cached) agent health snapshot. Callers that need
-// fresh state should pass a zero maxAge.
+// Health returns a (possibly cached) phone health snapshot. Callers that need
+// fresh state should pass a zero maxAge. App-paired logins synthesize the
+// agent Health shape from the device heartbeat/liveness.
 func (nc *MyNetworkClient) Health(ctx context.Context, maxAge time.Duration) (agentapi.Health, error) {
+	if nc.device != nil {
+		return nc.device.healthSnapshot(), nil
+	}
 	nc.ensureAgent()
 	if nc.agent == nil {
 		return agentapi.Health{}, fmt.Errorf("no agent URL configured for this login")
@@ -773,7 +957,7 @@ func (nc *MyNetworkClient) Health(ctx context.Context, maxAge time.Duration) (ag
 	return health, nil
 }
 
-// waitForAgentHealth polls the agent until it reports OK or the context ends.
+// waitForAgentHealth polls the phone until it reports OK or the context ends.
 func (nc *MyNetworkClient) waitForAgentHealth(ctx context.Context) (agentapi.Health, error) {
 	var lastErr error
 	for {
@@ -784,11 +968,11 @@ func (nc *MyNetworkClient) waitForAgentHealth(ctx context.Context) (agentapi.Hea
 		if err != nil {
 			lastErr = err
 		} else {
-			lastErr = fmt.Errorf("agent reports unhealthy state: %s", health.Error)
+			lastErr = fmt.Errorf("phone reports unhealthy state: %s", health.Error)
 		}
 		select {
 		case <-ctx.Done():
-			return health, fmt.Errorf("agent did not become healthy: %w", lastErr)
+			return health, fmt.Errorf("phone did not become reachable: %w", lastErr)
 		case <-time.After(3 * time.Second):
 		}
 	}
@@ -848,13 +1032,19 @@ func (nc *MyNetworkClient) IsThisUser(ctx context.Context, userID networkid.User
 }
 
 // IsLoggedIn implements bridgev2.NetworkAPI. It only reports local state; the
-// actual agent reachability is tracked via the event loop/bridge state.
+// actual phone reachability is tracked via the event loop/bridge state.
 func (nc *MyNetworkClient) IsLoggedIn() bool {
 	if nc.login == nil {
 		return false
 	}
 	meta, _ := nc.login.Metadata.(*LoginMetadata)
-	return meta != nil && strings.TrimSpace(meta.AgentURL) != ""
+	if meta == nil {
+		return false
+	}
+	if meta.Transport == LoginTransportApp {
+		return strings.TrimSpace(meta.DeviceID) != "" && strings.TrimSpace(meta.TokenSHA256) != ""
+	}
+	return strings.TrimSpace(meta.AgentURL) != ""
 }
 
 // agentMessageTimestamp converts the agent's millisecond timestamp into a
