@@ -23,17 +23,39 @@ var _ bridgev2.NetworkConnector = (*MyConnector)(nil)
 
 // MyConnector implements the bridgev2.NetworkConnector for Android SMS/MMS.
 type MyConnector struct {
-	log    zerolog.Logger
-	bridge *bridgev2.Bridge
-	config *SimpleConfig
+	log     zerolog.Logger
+	bridge  *bridgev2.Bridge
+	config  *SimpleConfig
+	pairing *pairingServer
 }
 
 // NewMyConnector creates a new instance of MyConnector.
 func NewMyConnector(log zerolog.Logger) *MyConnector {
-	return &MyConnector{
+	connector := &MyConnector{
 		log:    log.With().Str("component", "network-connector").Logger(),
 		config: NewSimpleConfig(),
 	}
+	connector.pairing = newPairingServer(connector.log, connector)
+	return connector
+}
+
+// pairingServer returns the app pairing manager, creating it on first use for
+// connectors built as a plain struct literal.
+func (c *MyConnector) pairingServer() *pairingServer {
+	if c.pairing == nil {
+		c.pairing = newPairingServer(c.log, c)
+	}
+	return c.pairing
+}
+
+// StartPairingServer starts the public app pairing API unless it is disabled
+// in the config. Called from the bridge entrypoint after startup.
+func (c *MyConnector) StartPairingServer() error {
+	if !c.pairingEnabled() {
+		c.log.Info().Msg("App pairing API is disabled by configuration")
+		return nil
+	}
+	return c.pairingServer().Start()
 }
 
 // Init initializes the connector with the bridge instance.
@@ -57,6 +79,8 @@ func (c *MyConnector) Init(br *bridgev2.Bridge) {
 		proc.AddHandler(CommandDeleteAllPortals)
 		proc.AddHandler(CommandLogout)
 		proc.AddHandler(CommandRebindRoom)
+		proc.AddHandler(CommandDevices)
+		proc.AddHandler(CommandUnpair)
 		c.log.Info().Msg("Registered custom commands")
 	} else {
 		c.log.Warn().Msg("Command processor not available for custom commands")
@@ -122,24 +146,40 @@ func (c *MyConnector) GetDBMetaTypes() database.MetaTypes {
 
 // GetLoginFlows implements bridgev2.NetworkConnector.
 func (c *MyConnector) GetLoginFlows() []bridgev2.LoginFlow {
-	return []bridgev2.LoginFlow{{
-		ID:   LoginFlowIDAgent,
-		Name: "ADB agent",
-		Description: "Connect to an android-sms-mms-adb-agent by URL and bearer token. " +
-			"The agent is the program that reads SMS/MMS from the phone over ADB.",
-	}}
+	return []bridgev2.LoginFlow{
+		{
+			ID:   LoginFlowIDAppPair,
+			Name: "App pairing (QR)",
+			Description: "Pair the Fossify Messages bridge app by scanning a QR code or entering " +
+				"the pairing code shown in the management room.",
+		},
+		{
+			ID:   LoginFlowIDAgent,
+			Name: "ADB agent",
+			Description: "Connect to an android-sms-mms-adb-agent by URL and bearer token. " +
+				"The agent is the program that reads SMS/MMS from the phone over ADB.",
+		},
+	}
 }
 
 // CreateLogin implements bridgev2.NetworkConnector.
 func (c *MyConnector) CreateLogin(ctx context.Context, user *bridgev2.User, flowID string) (bridgev2.LoginProcess, error) {
-	if flowID != LoginFlowIDAgent {
+	switch flowID {
+	case LoginFlowIDAppPair:
+		return &PairLogin{
+			User: user,
+			Main: c,
+			Log:  user.Log.With().Str("action", "login").Str("flow", flowID).Logger(),
+		}, nil
+	case LoginFlowIDAgent:
+		return &SimpleLogin{
+			User: user,
+			Main: c,
+			Log:  user.Log.With().Str("action", "login").Str("flow", flowID).Logger(),
+		}, nil
+	default:
 		return nil, fmt.Errorf("unsupported login flow ID: %s", flowID)
 	}
-	return &SimpleLogin{
-		User: user,
-		Main: c,
-		Log:  user.Log.With().Str("action", "login").Str("flow", flowID).Logger(),
-	}, nil
 }
 
 // GetConfig implements bridgev2.NetworkConnector.
@@ -175,9 +215,18 @@ func (c *MyConnector) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop implements bridgev2.NetworkConnector.
+// Stop implements bridgev2.NetworkConnector. It shuts the pairing API down
+// alongside the rest of the bridge.
 func (c *MyConnector) Stop() {
 	c.log.Info().Msg("MyConnector Stop called")
+	if c.pairing == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := c.pairing.Stop(ctx); err != nil {
+		c.log.Warn().Err(err).Msg("Failed to stop the app pairing API cleanly")
+	}
 }
 
 // LoadUserLogin implements bridgev2.NetworkConnector. Per-login work must not
@@ -200,6 +249,13 @@ func (c *MyConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLog
 		c,
 	)
 	login.Client = client
+	// App-paired logins register their device (token hash, queue, inbox) with
+	// the pairing server and attach this client as the event consumer.
+	if meta, _ := login.Metadata.(*LoginMetadata); meta != nil && meta.Transport == LoginTransportApp {
+		if device := c.pairingServer().ensureDevice(meta); device != nil {
+			device.attachRuntime(client)
+		}
+	}
 	client.Start()
 
 	c.log.Info().

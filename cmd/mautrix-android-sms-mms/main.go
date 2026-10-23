@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/appservice"
 	"maunium.net/go/mautrix/bridgev2/matrix/mxmain"
 	"maunium.net/go/mautrix/event"
@@ -23,17 +24,22 @@ var (
 )
 
 func main() {
-	connector := &connector.MyConnector{}
+	conn := connector.NewMyConnector(zerolog.Nop())
 
 	m := mxmain.BridgeMain{
 		Name:        "mautrix-android-sms-mms",
 		Description: "A Matrix bridge to Android SMS/MMS",
 		Version:     "0.1.0",
 		URL:         "",
-		Connector:   connector,
+		Connector:   conn,
 	}
 	m.PostInit = func() {
 		installDirectMessageCommandHandler(&m)
+	}
+	m.PostStart = func() {
+		if err := conn.StartPairingServer(); err != nil {
+			m.Log.Fatal().Err(err).Msg("Failed to start the app pairing API server")
+		}
 	}
 
 	m.InitVersion(Tag, Commit, BuildTime)

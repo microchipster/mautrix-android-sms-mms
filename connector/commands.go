@@ -41,11 +41,19 @@ var CommandPing = &commands.FullHandler{
 			fmt.Sprintf("Bridge state: %s", loginBridgeStateSummary(login)),
 		}
 		if meta, ok := login.Metadata.(*LoginMetadata); ok && meta != nil {
-			lines = append(lines,
-				fmt.Sprintf("Agent URL: %s", meta.AgentURL),
-				fmt.Sprintf("Device: %s (%s)", meta.DeviceModel, meta.DeviceSerial),
-				fmt.Sprintf("Send backend: %s", meta.SendBackend),
-			)
+			if meta.Transport == LoginTransportApp {
+				lines = append(lines,
+					"Transport: app pairing",
+					fmt.Sprintf("Device: %s (%s)", firstNotEmpty(meta.DeviceName, meta.DeviceModel), meta.DeviceID),
+					fmt.Sprintf("Paired at: %s", formatDeviceTimeMS(meta.PairedAtMS)),
+				)
+			} else {
+				lines = append(lines,
+					fmt.Sprintf("Agent URL: %s", meta.AgentURL),
+					fmt.Sprintf("Device: %s (%s)", meta.DeviceModel, meta.DeviceSerial),
+					fmt.Sprintf("Send backend: %s", meta.SendBackend),
+				)
+			}
 		}
 		healthCtx, cancel := context.WithTimeout(ce.Ctx, 10*time.Second)
 		defer cancel()
@@ -369,6 +377,157 @@ var CommandRebindRoom = &commands.FullHandler{
 	RequiresLogin: true,
 }
 
+// CommandDevices lists the app-paired devices of this Matrix user.
+var CommandDevices = &commands.FullHandler{
+	Func: func(ce *commands.Event) {
+		logins := appPairedLogins(ce.User)
+		if len(logins) == 0 {
+			ce.Reply("No paired phone app devices found. Run `login app-pair` to pair one.")
+			return
+		}
+		connector, _ := ce.Bridge.Network.(*MyConnector)
+		deviceIndex := map[string]*pairedDevice{}
+		if connector != nil {
+			for _, device := range connector.pairingServer().devicesForUser(ce.Ctx, ce.Bridge, ce.User.MXID) {
+				deviceIndex[device.deviceID] = device
+			}
+		}
+		lines := make([]string, 0, len(logins))
+		for _, login := range logins {
+			meta, _ := login.Metadata.(*LoginMetadata)
+			if meta == nil {
+				continue
+			}
+			lastSeen := meta.LastSeenMS
+			online := false
+			appVersion := strings.TrimSpace(meta.AppVersion)
+			if device := deviceIndex[meta.DeviceID]; device != nil {
+				snapshot := device.snapshot()
+				if !snapshot.LastSeen.IsZero() {
+					lastSeen = snapshot.LastSeen.UnixMilli()
+				}
+				online = snapshot.Online
+				if snapshot.AppVersion != "" {
+					appVersion = snapshot.AppVersion
+				}
+			}
+			liveness := "offline"
+			if online {
+				liveness = "online"
+			}
+			line := fmt.Sprintf("- `%s` %s — %s, last seen %s, paired %s",
+				meta.DeviceID,
+				firstNotEmpty(meta.DeviceName, meta.DeviceModel, "(unknown)"),
+				liveness,
+				formatDeviceTimeMS(lastSeen),
+				formatDeviceTimeMS(meta.PairedAtMS),
+			)
+			if appVersion != "" {
+				line += fmt.Sprintf(", app %s", appVersion)
+			}
+			line += fmt.Sprintf(", login `%s`", login.ID)
+			lines = append(lines, line)
+		}
+		sort.Strings(lines)
+		ce.Reply("%s\n\nUse `unpair <device_id|all>` to revoke a device.", strings.Join(lines, "\n"))
+	},
+	Name:    "devices",
+	Aliases: []string{"paired-devices"},
+	Help: commands.HelpMeta{
+		Section:     commands.HelpSectionAuth,
+		Description: "List app-paired phone devices",
+	},
+	RequiresLogin: true,
+}
+
+// CommandUnpair revokes a paired device's token and removes its bridge login.
+var CommandUnpair = &commands.FullHandler{
+	Func: func(ce *commands.Event) {
+		if len(ce.Args) != 1 {
+			ce.Reply("Usage: unpair <device_id|all>")
+			return
+		}
+		target := strings.TrimSpace(ce.Args[0])
+		if target == "" {
+			ce.Reply("Usage: unpair <device_id|all>")
+			return
+		}
+		logins := appPairedLogins(ce.User)
+		if target != "all" {
+			filtered := make([]*bridgev2.UserLogin, 0, 1)
+			for _, login := range logins {
+				meta, _ := login.Metadata.(*LoginMetadata)
+				if meta != nil && (meta.DeviceID == target || string(login.ID) == target) {
+					filtered = append(filtered, login)
+				}
+			}
+			logins = filtered
+		}
+		if len(logins) == 0 {
+			if target == "all" {
+				ce.Reply("No paired phone app devices found.")
+			} else {
+				ce.Reply("No paired device found with ID %q. Run `devices` to list them.", target)
+			}
+			return
+		}
+		connector, _ := ce.Bridge.Network.(*MyConnector)
+		unpaired := make([]string, 0, len(logins))
+		for _, login := range logins {
+			meta, _ := login.Metadata.(*LoginMetadata)
+			deviceID := string(login.ID)
+			if meta != nil && meta.DeviceID != "" {
+				deviceID = meta.DeviceID
+			}
+			if connector != nil && meta != nil && meta.DeviceID != "" {
+				// Drop the token immediately so in-flight requests fail even
+				// before the login deletion finishes.
+				connector.pairingServer().revokeDevice(meta.DeviceID)
+			}
+			login.Delete(ce.Ctx, status.BridgeState{StateEvent: status.StateLoggedOut}, bridgev2.DeleteOpts{
+				LogoutRemote: true,
+			})
+			unpaired = append(unpaired, deviceID)
+		}
+		sort.Strings(unpaired)
+		ce.Reply("Unpaired %d device(s): %s", len(unpaired), strings.Join(unpaired, ", "))
+	},
+	Name: "unpair",
+	Help: commands.HelpMeta{
+		Section:     commands.HelpSectionAuth,
+		Description: "Revoke an app-paired device (usage: unpair <device_id|all>)",
+		Args:        "<device_id|all>",
+	},
+	RequiresLogin: true,
+}
+
+// appPairedLogins returns the user's app-paired (transport "app") logins.
+func appPairedLogins(user *bridgev2.User) []*bridgev2.UserLogin {
+	if user == nil {
+		return nil
+	}
+	logins := make([]*bridgev2.UserLogin, 0, 1)
+	for _, login := range user.GetUserLogins() {
+		if login == nil {
+			continue
+		}
+		meta, _ := login.Metadata.(*LoginMetadata)
+		if meta == nil || meta.Transport != LoginTransportApp {
+			continue
+		}
+		logins = append(logins, login)
+	}
+	return logins
+}
+
+// formatDeviceTimeMS renders a millisecond timestamp for the management room.
+func formatDeviceTimeMS(value int64) string {
+	if value <= 0 {
+		return "never"
+	}
+	return time.UnixMilli(value).UTC().Format("2006-01-02 15:04:05 MST")
+}
+
 func sendNotice(bot bridgev2.MatrixAPI, roomID id.RoomID, msg string) {
 	if bot == nil || roomID == "" || msg == "" {
 		return
@@ -556,6 +715,8 @@ func managementRoomHelpText() string {
 		"- rebind-room <thread_key_or_address> <matrix_room_id>\n" +
 		"- list-logins\n" +
 		"- list-users\n" +
+		"- devices\n" +
+		"- unpair <device_id|all>\n" +
 		"- logout [login_id]\n" +
 		"- logout [login_id] purge\n" +
 		"- delete-all-portals yes\n" +
