@@ -108,6 +108,7 @@ func (p *ContentProvider) isOwn(address string) bool {
 // canonicalAddresses resolves canonical_addresses row IDs (with cache).
 func (p *ContentProvider) canonicalAddresses(ctx context.Context, ids []int64) []string {
 	out := make([]string, 0, len(ids))
+	seen := make(map[string]struct{}, len(ids))
 	for _, canonicalID := range ids {
 		p.addrMu.Lock()
 		address, ok := p.addrCache[canonicalID]
@@ -122,8 +123,40 @@ func (p *ContentProvider) canonicalAddresses(ctx context.Context, ids []int64) [
 			p.addrCache[canonicalID] = address
 			p.addrMu.Unlock()
 		}
-		if address != "" && !p.isOwn(address) {
-			out = append(out, CanonicalAddress(address))
+		if address == "" {
+			continue
+		}
+		for _, part := range splitMergedAddresses(address) {
+			if p.isOwn(part) {
+				continue
+			}
+			canonical := CanonicalAddress(part)
+			if canonical == "" {
+				continue
+			}
+			if _, ok := seen[canonical]; ok {
+				continue
+			}
+			seen[canonical] = struct{}{}
+			out = append(out, canonical)
+		}
+	}
+	return out
+}
+
+// splitMergedAddresses expands Android's merged multi-recipient address rows
+// ("a|b") into their individual addresses. Android/Fossify write such rows for
+// multi-recipient SMS when group messaging is disabled (ADDRESS_SEPARATOR is
+// "|"); they must never surface as ghosts or group members.
+func splitMergedAddresses(address string) []string {
+	if !strings.Contains(address, "|") {
+		return []string{address}
+	}
+	parts := strings.Split(address, "|")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			out = append(out, trimmed)
 		}
 	}
 	return out
