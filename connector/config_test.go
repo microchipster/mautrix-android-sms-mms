@@ -123,3 +123,54 @@ func TestSimpleConfigUnmarshalEmptyMappingKeepsDefaults(t *testing.T) {
 		t.Errorf("defaults not applied for empty mapping: %+v", cfg)
 	}
 }
+
+func TestPairingConfigDefaults(t *testing.T) {
+	cfg := unmarshalNetworkConfig(t, "network: {}\n")
+	if !cfg.Pairing.Enabled {
+		t.Error("pairing should be enabled by default")
+	}
+	if cfg.Pairing.Listen != pairingDefaultListen {
+		t.Errorf("pairing listen = %q, want %q", cfg.Pairing.Listen, pairingDefaultListen)
+	}
+	if cfg.Pairing.PublicURL != "" {
+		t.Errorf("pairing public_url = %q, want empty", cfg.Pairing.PublicURL)
+	}
+}
+
+func TestPairingConfigPartialMappingKeepsDefaults(t *testing.T) {
+	cfg := unmarshalNetworkConfig(t, "network:\n  pairing:\n    listen: \"127.0.0.1:12345\"\n")
+	if !cfg.Pairing.Enabled {
+		t.Error("pairing should stay enabled when the mapping only sets listen")
+	}
+	if cfg.Pairing.Listen != "127.0.0.1:12345" {
+		t.Errorf("pairing listen = %q, want 127.0.0.1:12345", cfg.Pairing.Listen)
+	}
+}
+
+func TestPairingConfigExplicitValues(t *testing.T) {
+	cfg := unmarshalNetworkConfig(t, "network:\n  pairing:\n    enabled: false\n    listen: \":9999\"\n    public_url: https://bridge.example.com\n")
+	if cfg.Pairing.Enabled {
+		t.Error("pairing should be disabled when enabled: false")
+	}
+	if cfg.Pairing.Listen != ":9999" {
+		t.Errorf("pairing listen = %q, want :9999", cfg.Pairing.Listen)
+	}
+	if cfg.Pairing.PublicURL != "https://bridge.example.com" {
+		t.Errorf("pairing public_url = %q", cfg.Pairing.PublicURL)
+	}
+}
+
+func TestPairingConfigFromSidecarFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "simple-config.yaml")
+	if err := os.WriteFile(path, []byte("pairing:\n  public_url: https://bridge.example.com\n"), 0o600); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+	cfg := unmarshalNetworkConfig(t, "network: "+path+"\n")
+	if !cfg.Pairing.Enabled || cfg.Pairing.Listen != pairingDefaultListen {
+		t.Errorf("pairing defaults not kept from the sidecar file: %+v", cfg.Pairing)
+	}
+	if cfg.Pairing.PublicURL != "https://bridge.example.com" {
+		t.Errorf("pairing public_url = %q", cfg.Pairing.PublicURL)
+	}
+}

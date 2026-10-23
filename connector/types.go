@@ -11,12 +11,36 @@ import (
 	"maunium.net/go/mautrix/id"
 )
 
+// Login transport identifiers stored in LoginMetadata.Transport.
+const (
+	// LoginTransportAgent is the ADB agent transport (also the default when
+	// the field is empty, for logins created before app pairing existed).
+	LoginTransportAgent = "adb"
+	// LoginTransportApp is the in-app transport: the Fossify Messages fork
+	// polls the bridge's pairing API for work and pushes events back.
+	LoginTransportApp = "app"
+)
+
 // LoginMetadata stores the agent (phone host) connection and sync state for a
 // bridge login. One login == one phone/device managed by one android-sms-mms-adb-agent.
 type LoginMetadata struct {
 	// AgentURL / AgentToken point at the android-sms-mms-adb-agent that manages the phone.
 	AgentURL   string `json:"agent_url,omitempty"`
 	AgentToken string `json:"agent_token,omitempty"`
+
+	// Transport distinguishes app-paired logins ("app") from agent logins
+	// ("adb", or empty for historical logins). App logins use the pairing
+	// API instead of an ADB agent HTTP endpoint.
+	Transport string `json:"transport,omitempty"`
+
+	// App pairing identity (set for Transport "app").
+	DeviceID    string `json:"device_id,omitempty"`
+	DeviceName  string `json:"device_name,omitempty"`
+	PubkeySPKI  string `json:"pubkey_spki,omitempty"`
+	TokenSHA256 string `json:"token_sha256,omitempty"`
+	PairedAtMS  int64  `json:"paired_at_ms,omitempty"`
+	LastSeenMS  int64  `json:"last_seen_ms,omitempty"`
+	AppVersion  string `json:"app_version,omitempty"`
 
 	// Device identity reported by the agent.
 	DeviceSerial   string `json:"device_serial,omitempty"`
