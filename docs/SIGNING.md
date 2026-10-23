@@ -72,8 +72,11 @@ Restore on a fresh machine:
    certificate fingerprint above.
 
 Offline copy (recommended, covers loss of the git remote and of the GPG key):
-a GPG-encrypted archive of the keystore + password + this certificate fingerprint, stored
-off-machine (already prepared at `~/backups/android-signing/`).
+a GPG-encrypted archive of the keystore + password + this certificate fingerprint
+(already prepared at
+`~/.config/android/org.fossify.messages.bridge/signing-backup-20261023.tar.gz.gpg`,
+GPG-encrypted to both <user> keys). Keep a copy off-machine too — moving it is just a
+`cp`; the path is a convention, not a requirement.
 
 Also existing in `pass` (older apps, same flow): `android/com.example.termuxintents`,
 `android/com.example.calendarwriter`, `android/com.example.lastlocation`.
