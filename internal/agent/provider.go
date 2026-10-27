@@ -126,7 +126,7 @@ func (p *ContentProvider) canonicalAddresses(ctx context.Context, ids []int64) [
 		if address == "" {
 			continue
 		}
-		for _, part := range splitMergedAddresses(address) {
+		for _, part := range SplitMergedAddresses(address) {
 			if p.isOwn(part) {
 				continue
 			}
@@ -144,11 +144,13 @@ func (p *ContentProvider) canonicalAddresses(ctx context.Context, ids []int64) [
 	return out
 }
 
-// splitMergedAddresses expands Android's merged multi-recipient address rows
+// SplitMergedAddresses expands Android's merged multi-recipient address rows
 // ("a|b") into their individual addresses. Android/Fossify write such rows for
 // multi-recipient SMS when group messaging is disabled (ADDRESS_SEPARATOR is
-// "|"); they must never surface as ghosts or group members.
-func splitMergedAddresses(address string) []string {
+// "|"); they must never surface as ghosts or group members. The bridge's
+// recipient canonicalization uses this too, because app-pushed participant
+// lists bypass the provider.
+func SplitMergedAddresses(address string) []string {
 	if !strings.Contains(address, "|") {
 		return []string{address}
 	}

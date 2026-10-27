@@ -23,12 +23,12 @@ func TestSplitMergedAddresses(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := splitMergedAddresses(tc.in)
+			got := SplitMergedAddresses(tc.in)
 			if len(got) == 0 && len(tc.want) == 0 {
 				return
 			}
 			if !reflect.DeepEqual(got, tc.want) {
-				t.Fatalf("splitMergedAddresses(%q) = %v, want %v", tc.in, got, tc.want)
+				t.Fatalf("SplitMergedAddresses(%q) = %v, want %v", tc.in, got, tc.want)
 			}
 		})
 	}

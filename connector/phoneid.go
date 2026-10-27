@@ -13,6 +13,8 @@ import (
 	"strings"
 
 	"maunium.net/go/mautrix/bridgev2/networkid"
+
+	agentapi "mautrix-android-sms-mms/internal/agent"
 )
 
 // This file is the SMS/MMS analogue of jmpchat's jid.go: it normalizes phone
@@ -69,22 +71,29 @@ func CanonicalAddress(address string) string {
 }
 
 // CanonicalRecipients canonicalizes, dedupes and sorts a recipient list.
-// Used to produce stable conversation keys and for diagnostics. It is not
-// used as the portal ID: the phone's thread ID is the stable conversation
-// identity, so that adding/removing a participant does not fracture a room.
+// Used for room names and membership; it is not used as the portal ID: the
+// phone's thread ID is the stable conversation identity, so that
+// adding/removing a participant does not fracture a room.
+//
+// Android's merged multi-recipient address rows ("a|b", written when group
+// messaging is disabled) are expanded first: app-pushed participant lists
+// bypass the agent's provider, which already filters them, and a merged row
+// must never surface as a ghost name or room member (PLAN §5.2).
 func CanonicalRecipients(addresses []string) []string {
 	seen := make(map[string]struct{}, len(addresses))
 	cleaned := make([]string, 0, len(addresses))
 	for _, address := range addresses {
-		c := CanonicalAddress(address)
-		if c == "" {
-			continue
+		for _, part := range agentapi.SplitMergedAddresses(address) {
+			c := CanonicalAddress(part)
+			if c == "" {
+				continue
+			}
+			if _, ok := seen[c]; ok {
+				continue
+			}
+			seen[c] = struct{}{}
+			cleaned = append(cleaned, c)
 		}
-		if _, ok := seen[c]; ok {
-			continue
-		}
-		seen[c] = struct{}{}
-		cleaned = append(cleaned, c)
 	}
 	sort.Strings(cleaned)
 	return cleaned
@@ -151,20 +160,43 @@ func MakePortalID(deviceScope string, threadID int64, subID int) networkid.Porta
 
 // ParsePortalID splits a thread portal ID produced by MakePortalID back into
 // its parts. ok is false when the ID does not have that shape.
+//
+// The sub ID may be negative ("thread-<scope>--1-42"): the provider reports
+// sub_id -1 when it cannot resolve the SIM, so those portal IDs must round-trip
+// like any other.
 func ParsePortalID(id networkid.PortalID) (deviceScope string, subID int, threadID int64, ok bool) {
-	parts := strings.Split(string(id), "-")
-	if len(parts) != 4 || parts[0] != "thread" || parts[1] == "" {
+	rest, found := strings.CutPrefix(string(id), "thread-")
+	if !found {
 		return "", 0, 0, false
 	}
-	sub, err := strconv.Atoi(parts[2])
+	last := strings.LastIndexByte(rest, '-')
+	if last < 0 {
+		return "", 0, 0, false
+	}
+	threadID, err := strconv.ParseInt(rest[last+1:], 10, 64)
 	if err != nil {
 		return "", 0, 0, false
 	}
-	thread, err := strconv.ParseInt(parts[3], 10, 64)
-	if err != nil {
-		return "", 0, 0, false
+	// Walk the remaining dashes from the right: the first one whose left part
+	// is a scope (non-empty, no dashes itself) and whose right part parses as
+	// an integer is the sub ID separator. This skips the sign dash of negative
+	// sub IDs and rejects IDs with extra fields.
+	subScope := rest[:last]
+	for i := len(subScope) - 1; i >= 0; i-- {
+		if subScope[i] != '-' {
+			continue
+		}
+		scope, subStr := subScope[:i], subScope[i+1:]
+		if scope == "" || strings.Contains(scope, "-") {
+			continue
+		}
+		sub, err := strconv.Atoi(subStr)
+		if err != nil {
+			continue
+		}
+		return scope, sub, threadID, true
 	}
-	return parts[1], sub, thread, true
+	return "", 0, 0, false
 }
 
 // DeviceScope derives a short, stable scope token from a device serial.

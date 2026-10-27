@@ -5,6 +5,7 @@
 package connector
 
 import (
+	"fmt"
 	"testing"
 
 	"maunium.net/go/mautrix/bridgev2/database"
@@ -53,6 +54,139 @@ func TestParseTapback(t *testing.T) {
 				t.Fatalf("parseTapback(%q) = %+v, want %+v", tc.body, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestParseTapbackEdgeCases covers the whitespace, quoting and rejection
+// corners of the tapback grammar. Anything that parses as a tapback but has no
+// match in the recent history is forwarded as plain text by the caller, so
+// false positives here are visible as odd reaction-looking messages.
+func TestParseTapbackEdgeCases(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		body   string
+		want   tapback
+		wantOK bool
+	}{
+		{name: "surrounding whitespace", body: "  Liked “see you at 8”  ", want: tapback{Emoji: "👍", TargetText: "see you at 8"}, wantOK: true},
+		{name: "trailing carriage return on media", body: "Liked an image\r", want: tapback{Emoji: "👍", IsMedia: true}, wantOK: true},
+		{name: "laughed at media", body: "Laughed at a video", want: tapback{Emoji: "😂", IsMedia: true}, wantOK: true},
+		{name: "emphasized media", body: "Emphasized a photo", want: tapback{Emoji: "‼️", IsMedia: true}, wantOK: true},
+		{name: "removed heart", body: "Removed a heart from “good morning”", want: tapback{Emoji: "❤️", TargetText: "good morning", IsRemoval: true}, wantOK: true},
+		{name: "removed laugh", body: "Removed a laugh from “that joke”", want: tapback{Emoji: "😂", TargetText: "that joke", IsRemoval: true}, wantOK: true},
+		{name: "removed question from media", body: "Removed a question from an image", want: tapback{Emoji: "❓", IsMedia: true, IsRemoval: true}, wantOK: true},
+		// Empty quotes parse (the matcher then refuses an empty target text
+		// and the caller forwards the text unchanged).
+		{name: "empty quote", body: "Liked “”", want: tapback{Emoji: "👍"}, wantOK: true},
+		{name: "lowercase verb", body: "liked “see you at 8”", wantOK: false},
+		{name: "double space after verb", body: "Loved  an image", wantOK: false},
+		{name: "multiline quote", body: "Liked “multi\nline”", wantOK: false},
+		{name: "digit in media noun", body: "Liked a 3D video", wantOK: false},
+		{name: "punctuation after media noun", body: "Liked an image!", wantOK: false},
+		{name: "trailing text after quote", body: "Removed a like from “x” extra", wantOK: false},
+		{name: "missing from clause", body: "Removed a like", wantOK: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := parseTapback(tc.body)
+			if ok != tc.wantOK {
+				t.Fatalf("parseTapback(%q) ok = %v, want %v", tc.body, ok, tc.wantOK)
+			}
+			if !tc.wantOK {
+				return
+			}
+			if got != tc.want {
+				t.Fatalf("parseTapback(%q) = %+v, want %+v", tc.body, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeTapbackQuotedText(t *testing.T) {
+	t.Parallel()
+	tests := map[string]string{
+		"see you at 8":     "see you at 8",
+		"see you at 8…":    "see you at 8",
+		"see you at 8...":  "see you at 8",
+		"see you at 8 …":   "see you at 8",
+		"  spaced  ":       "spaced",
+		"…":                "",
+		"...":              "",
+		"trailing…...":     "trailing…",
+		"look at this....": "look at this.",
+	}
+	for input, want := range tests {
+		if got := normalizeTapbackQuotedText(input); got != want {
+			t.Errorf("normalizeTapbackQuotedText(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestIndexMessageOrderAndLookback(t *testing.T) {
+	t.Parallel()
+	client := &MyNetworkClient{}
+	key := networkid.PortalKey{ID: "thread-deadbeef-1-42"}
+	for i := 0; i < tapbackLookback+5; i++ {
+		client.indexMessage(key, indexedMessage{ID: networkid.MessageID(fmt.Sprintf("m%d", i)), Body: "body"})
+	}
+
+	entries := client.indexedMessages(key)
+	if len(entries) != tapbackLookback {
+		t.Fatalf("index size = %d, want the %d entry lookback cap", len(entries), tapbackLookback)
+	}
+	if entries[0].ID != networkid.MessageID(fmt.Sprintf("m%d", tapbackLookback+4)) {
+		t.Fatalf("newest entry = %q, want the last indexed message", entries[0].ID)
+	}
+	if entries[len(entries)-1].ID != networkid.MessageID("m5") {
+		t.Fatalf("oldest entry = %q, want m5 after the cap", entries[len(entries)-1].ID)
+	}
+
+	// Indexes are per portal.
+	if other := client.indexedMessages(networkid.PortalKey{ID: "thread-deadbeef-2-42"}); len(other) != 0 {
+		t.Fatalf("other portal index = %v, want empty", other)
+	}
+
+	// An update moves to the front (newest-first) so tapbacks match the new body.
+	client.indexMessage(key, indexedMessage{ID: "m100", Body: "edited"})
+	if got := client.indexedMessages(key)[0]; got.ID != "m100" || got.Body != "edited" {
+		t.Fatalf("updated index entry = %+v, want m100 at the front", got)
+	}
+
+	// Empty message IDs are never indexed.
+	client.indexMessage(key, indexedMessage{})
+	if got := len(client.indexedMessages(key)); got != tapbackLookback {
+		t.Fatalf("index size after empty ID = %d, want %d", got, tapbackLookback)
+	}
+}
+
+func TestMatchIndexedTapbackTargetEdgeCases(t *testing.T) {
+	t.Parallel()
+	// Entries without an ID are skipped instead of returning an empty match.
+	messages := []indexedMessage{
+		{Body: "target"},
+		{ID: "m1", Body: "target"},
+	}
+	if got := matchIndexedTapbackTarget(messages, tapback{Emoji: "👍", TargetText: "target"}); got != "m1" {
+		t.Fatalf("match with an ID-less entry = %q, want m1", got)
+	}
+
+	// A quote longer than the stored body is not a prefix match.
+	short := []indexedMessage{{ID: "m1", Body: "short"}}
+	if got := matchIndexedTapbackTarget(short, tapback{Emoji: "👍", TargetText: "short and more"}); got != "" {
+		t.Fatalf("longer quote matched %q, want no match", got)
+	}
+
+	// Media tapbacks only match entries with attachments.
+	textOnly := []indexedMessage{{ID: "m1", Body: "pic"}}
+	if got := matchIndexedTapbackTarget(textOnly, tapback{Emoji: "👍", IsMedia: true}); got != "" {
+		t.Fatalf("media tapback matched a text-only entry: %q", got)
+	}
+
+	// Carrier-truncated quotes still match after the ellipsis is normalized.
+	long := []indexedMessage{{ID: "m1", Body: "a long body"}}
+	if got := matchIndexedTapbackTarget(long, tapback{Emoji: "👍", TargetText: "a long…"}); got != "m1" {
+		t.Fatalf("truncated quote match = %q, want m1", got)
 	}
 }
 

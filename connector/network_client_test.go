@@ -9,8 +9,11 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -326,6 +329,200 @@ func TestAttachmentDataErrors(t *testing.T) {
 	}
 	if _, _, err = attachmentData(context.Background(), nil, 534, agentapi.Attachment{PartID: 901}); err == nil {
 		t.Fatal("expected error when there is no inline data and no agent client")
+	}
+}
+
+// TestBuildConvertedMessageMultiPartMMS covers a multi-part MMS with a
+// caption: every attachment becomes its own event part, the caption is only
+// put on the first part and only the first part carries the message metadata
+// (bridgev2 stores that as the message row).
+func TestBuildConvertedMessageMultiPartMMS(t *testing.T) {
+	t.Parallel()
+	nc := newMediaTestClient(t, false)
+	intent := &fakeMediaIntent{}
+	jpeg := []byte{0xFF, 0xD8, 0xFF, 0xE0, 'j', 'p', 'e', 'g'}
+	png := []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A}
+
+	converted, err := nc.buildConvertedMessage(context.Background(), testPortal(), intent, agentapi.Message{
+		ID: "mms:1:534", ThreadID: 12, Body: "look at these",
+		Attachments: []agentapi.Attachment{
+			{PartID: 901, ContentType: "image/jpeg", FileName: "one.jpg", Base64: base64.StdEncoding.EncodeToString(jpeg)},
+			{PartID: 902, ContentType: "image/png", FileName: "two.png", Base64: base64.StdEncoding.EncodeToString(png)},
+		},
+	})
+	if err != nil {
+		t.Fatalf("buildConvertedMessage() error: %v", err)
+	}
+	if len(converted.Parts) != 2 {
+		t.Fatalf("expected 2 parts, got %d", len(converted.Parts))
+	}
+	first, second := converted.Parts[0], converted.Parts[1]
+	if first.Content.MsgType != event.MsgImage || first.Content.Body != "look at these" || first.Content.FileName != "one.jpg" {
+		t.Fatalf("first part = %+v", first.Content)
+	}
+	if second.Content.MsgType != event.MsgImage || second.Content.Body != "two.png" || second.Content.FileName != "two.png" {
+		t.Fatalf("second part = %+v", second.Content)
+	}
+	if second.DBMetadata != nil {
+		t.Fatalf("second part carries metadata: %+v", second.DBMetadata)
+	}
+	meta, _ := first.DBMetadata.(*MessageMetadata)
+	if meta == nil || meta.Body != "look at these" || !meta.HasAttachment {
+		t.Fatalf("first part metadata = %+v", meta)
+	}
+	if want := []string{"one.jpg|image/jpeg", "two.png|image/png"}; !slices.Equal(intent.uploads, want) {
+		t.Fatalf("uploads = %v, want %v", intent.uploads, want)
+	}
+	if !bytes.Equal(intent.lastUploaded, png) {
+		t.Fatalf("last uploaded bytes = %v, want the second part", intent.lastUploaded)
+	}
+}
+
+// TestBuildConvertedMessageMultiPartAttachmentOnly covers an attachment-only
+// multi-part MMS: each part is named after its file and the message metadata
+// body lists all attachments.
+func TestBuildConvertedMessageMultiPartAttachmentOnly(t *testing.T) {
+	t.Parallel()
+	nc := newMediaTestClient(t, false)
+	converted, err := nc.buildConvertedMessage(context.Background(), testPortal(), &fakeMediaIntent{}, agentapi.Message{
+		ID: "mms:1:534", ThreadID: 12,
+		Attachments: []agentapi.Attachment{
+			{PartID: 901, ContentType: "image/jpeg", FileName: "one.jpg", Base64: base64.StdEncoding.EncodeToString([]byte("jpeg"))},
+			{PartID: 902, ContentType: "image/png", FileName: "two.png", Base64: base64.StdEncoding.EncodeToString([]byte("png"))},
+		},
+	})
+	if err != nil {
+		t.Fatalf("buildConvertedMessage() error: %v", err)
+	}
+	if len(converted.Parts) != 2 || converted.Parts[0].Content.Body != "one.jpg" || converted.Parts[1].Content.Body != "two.png" {
+		t.Fatalf("unexpected parts: %+v", converted.Parts)
+	}
+	meta, _ := converted.Parts[0].DBMetadata.(*MessageMetadata)
+	if meta == nil || meta.Body != "one.jpg, two.png" || !meta.HasAttachment {
+		t.Fatalf("attachment-only metadata = %+v", meta)
+	}
+}
+
+// TestBuildConvertedMessageSkipsUnreadablePart covers a partially broken
+// multi-part MMS: the readable parts must still be bridged.
+func TestBuildConvertedMessageSkipsUnreadablePart(t *testing.T) {
+	t.Parallel()
+	nc := newMediaTestClient(t, false)
+	intent := &fakeMediaIntent{}
+	converted, err := nc.buildConvertedMessage(context.Background(), testPortal(), intent, agentapi.Message{
+		ID: "mms:1:534", ThreadID: 12, Body: "caption survives",
+		Attachments: []agentapi.Attachment{
+			{PartID: 901, ContentType: "image/jpeg", FileName: "one.jpg", Base64: base64.StdEncoding.EncodeToString([]byte("jpeg"))},
+			{PartID: 902, ContentType: "image/png", FileName: "two.png", Base64: "!!not-base64!!"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("buildConvertedMessage() error: %v", err)
+	}
+	if len(converted.Parts) != 1 || converted.Parts[0].Content.Body != "caption survives" {
+		t.Fatalf("unexpected parts: %+v", converted.Parts)
+	}
+	if want := []string{"one.jpg|image/jpeg"}; !slices.Equal(intent.uploads, want) {
+		t.Fatalf("uploads = %v, want only the readable part", intent.uploads)
+	}
+	meta, _ := converted.Parts[0].DBMetadata.(*MessageMetadata)
+	if meta == nil || !meta.HasAttachment {
+		t.Fatalf("metadata after a skipped part = %+v", meta)
+	}
+}
+
+// TestBuildConvertedMessageAllPartsUnreadable covers an MMS whose bytes cannot
+// be obtained at all: the text fallback must still produce a usable event.
+func TestBuildConvertedMessageAllPartsUnreadable(t *testing.T) {
+	t.Parallel()
+	nc := newMediaTestClient(t, false)
+	converted, err := nc.buildConvertedMessage(context.Background(), testPortal(), &fakeMediaIntent{}, agentapi.Message{
+		ID: "mms:1:534", ThreadID: 12,
+		Attachments: []agentapi.Attachment{
+			{PartID: 901, ContentType: "image/jpeg", FileName: "one.jpg", Base64: "!!bad!!"},
+			{PartID: 902, ContentType: "image/png", FileName: "two.png", Base64: "!!bad!!"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("buildConvertedMessage() error: %v", err)
+	}
+	if len(converted.Parts) != 1 || converted.Parts[0].Content.MsgType != event.MsgText {
+		t.Fatalf("expected a text fallback, got %+v", converted.Parts)
+	}
+	if converted.Parts[0].Content.Body != "[MMS attachment could not be downloaded]" {
+		t.Fatalf("fallback body = %q", converted.Parts[0].Content.Body)
+	}
+}
+
+func TestBuildConvertedMessageNoContentErrors(t *testing.T) {
+	t.Parallel()
+	nc := newMediaTestClient(t, false)
+	if _, err := nc.buildConvertedMessage(context.Background(), testPortal(), &fakeMediaIntent{}, agentapi.Message{
+		ID: "sms:1:99", ThreadID: 12,
+	}); err == nil {
+		t.Fatal("expected an error for a message without content")
+	}
+}
+
+func TestExtensionForContentType(t *testing.T) {
+	t.Parallel()
+	tests := map[string]string{
+		"image/jpeg":                      ".jpg",
+		"IMAGE/JPEG; charset=binary":      ".jpg",
+		"image/jpg":                       ".jpg",
+		"image/png":                       ".png",
+		"image/gif":                       ".gif",
+		"image/webp":                      ".webp",
+		"video/mp4":                       ".mp4",
+		"video/3gpp":                      ".3gp",
+		"audio/mpeg":                      ".mp3",
+		"audio/amr":                       ".amr",
+		"audio/ogg":                       ".ogg",
+		"text/plain":                      ".txt",
+		"application/pdf":                 ".pdf",
+		"application/pdf; charset=binary": ".pdf",
+		"":                                "",
+	}
+	for contentType, want := range tests {
+		if got := extensionForContentType(contentType); got != want {
+			t.Errorf("extensionForContentType(%q) = %q, want %q", contentType, got, want)
+		}
+	}
+}
+
+// TestUploadAttachmentData covers the metadata attached to uploaded MMS
+// parts: the mxc URI, the file info (mime type and size) and the defaults for
+// missing content type / file name.
+func TestUploadAttachmentData(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	if _, _, _, err := uploadAttachmentData(ctx, nil, "!room:example.com", []byte("x"), "f.jpg", "image/jpeg"); !errors.Is(err, errNoIntent) {
+		t.Fatalf("uploadAttachmentData(nil intent) error = %v, want errNoIntent", err)
+	}
+
+	intent := &fakeMediaIntent{}
+	mxc, enc, info, err := uploadAttachmentData(ctx, intent, "!room:example.com", []byte("abc"), "photo.jpg", "image/jpeg")
+	if err != nil {
+		t.Fatalf("uploadAttachmentData() error: %v", err)
+	}
+	if mxc != "mxc://example.com/photo.jpg" || enc != nil {
+		t.Fatalf("uploadAttachmentData() = (%q, %v)", mxc, enc)
+	}
+	if info == nil || info.MimeType != "image/jpeg" || info.Size != 3 {
+		t.Fatalf("file info = %+v, want image/jpeg with size 3", info)
+	}
+
+	// Missing content type and file name fall back to octet-stream and a
+	// generated "attachment" name.
+	_, _, info, err = uploadAttachmentData(ctx, intent, "", []byte("ab"), "", "")
+	if err != nil {
+		t.Fatalf("uploadAttachmentData(defaults) error: %v", err)
+	}
+	if info.MimeType != "application/octet-stream" || info.Size != 2 {
+		t.Fatalf("default file info = %+v", info)
+	}
+	if last := intent.uploads[len(intent.uploads)-1]; !strings.HasPrefix(last, "attachment") {
+		t.Fatalf("default file name = %q, want an attachment name", last)
 	}
 }
 

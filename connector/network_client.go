@@ -222,9 +222,26 @@ func (nc *MyNetworkClient) eventLoop(ctx context.Context, stopCh <-chan struct{}
 		}
 
 		if page.Reset {
-			log.Warn().Msg("Remote event log was reset; re-scanning recent messages")
-			nc.setCursor(0)
-			nc.rescanRecentMessages(ctx)
+			target, advanced := cursorAfterReset(page.Cursor, nc.getCursor())
+			if nc.device != nil {
+				log.Warn().Int64("cursor", target).Msg("Remote event log was reset; skipping to the retained window (app transport has no history endpoint)")
+			} else {
+				log.Warn().Int64("cursor", target).Msg("Remote event log was reset; re-scanning recent messages")
+			}
+			if !advanced {
+				// The server did not offer a usable cursor; pace the loop so a
+				// persistent reset cannot spin the CPU.
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(time.Second):
+				}
+				continue
+			}
+			nc.setCursor(target)
+			if nc.device == nil {
+				nc.rescanRecentMessages(ctx)
+			}
 			continue
 		}
 		nc.setCursor(page.Cursor)
@@ -1035,6 +1052,17 @@ func (nc *MyNetworkClient) setCursor(cursor int64) {
 	nc.cursorMu.Lock()
 	nc.cursor = cursor
 	nc.cursorMu.Unlock()
+}
+
+// cursorAfterReset picks the cursor to continue from after the server reports
+// that its retained event window no longer covers the requested cursor. The
+// page carries the edge of the retained window; returning to cursor zero would
+// stay below that window and reset forever on transports that cannot rescan.
+func cursorAfterReset(pageCursor, current int64) (int64, bool) {
+	if pageCursor > current {
+		return pageCursor, true
+	}
+	return current, false
 }
 
 // Health returns a (possibly cached) phone health snapshot. Callers that need

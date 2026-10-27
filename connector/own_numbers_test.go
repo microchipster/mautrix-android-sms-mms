@@ -5,11 +5,13 @@
 package connector
 
 import (
+	"context"
 	"slices"
 	"testing"
 
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
+	"maunium.net/go/mautrix/bridgev2/networkid"
 
 	agentapi "mautrix-android-sms-mms/internal/agent"
 )
@@ -81,5 +83,113 @@ func TestThreadRecipientsSelfThread(t *testing.T) {
 	mixed := client.threadRecipients(agentapi.Thread{Recipients: []string{"+15550100100", "+15551112222"}})
 	if !slices.Equal(mixed, []string{"+15551112222"}) {
 		t.Fatalf("threadRecipients(mixed) = %v, want [+15551112222]", mixed)
+	}
+}
+
+// TestOwnNumbersStableSubscriptionOrder covers ownUserID stability:
+// Subscriptions is a map, so iteration order is random, but the own numbers
+// (and therefore the outgoing sender ghost) must be stable across restarts.
+func TestOwnNumbersStableSubscriptionOrder(t *testing.T) {
+	t.Parallel()
+	client := &MyNetworkClient{login: &bridgev2.UserLogin{UserLogin: &database.UserLogin{Metadata: &LoginMetadata{
+		Subscriptions: map[int]SubscriptionInfo{
+			2: {SubID: 2, PhoneNumber: "+15550002222"},
+			1: {SubID: 1, PhoneNumber: "+15550001111"},
+		},
+	}}}}
+
+	want := []string{"+15550001111", "+15550002222"}
+	for i := 0; i < 5; i++ {
+		if got := client.ownNumbers(); !slices.Equal(got, want) {
+			t.Fatalf("ownNumbers() = %v, want %v (sub ID order)", got, want)
+		}
+	}
+	if got := client.ownUserID(); got != MakeUserID("+15550001111") {
+		t.Fatalf("ownUserID() = %q, want the lowest sub ID number", got)
+	}
+}
+
+// TestOwnNumbersIgnoreEmptySubscriptionNumbers covers SIM slots the app
+// reports without a number (or with a placeholder): they must not become the
+// sender ghost, and ownUserID must fall through to a real number.
+func TestOwnNumbersIgnoreEmptySubscriptionNumbers(t *testing.T) {
+	t.Parallel()
+	client := &MyNetworkClient{login: &bridgev2.UserLogin{UserLogin: &database.UserLogin{Metadata: &LoginMetadata{
+		Subscriptions: map[int]SubscriptionInfo{
+			1: {SubID: 1, PhoneNumber: ""},
+			2: {SubID: 2, PhoneNumber: "+15550002222"},
+		},
+	}}}}
+
+	if got := client.ownNumbers(); !slices.Equal(got, []string{"+15550002222"}) {
+		t.Fatalf("ownNumbers() = %v, want only the reported number", got)
+	}
+	if got := client.ownUserID(); got != MakeUserID("+15550002222") {
+		t.Fatalf("ownUserID() = %q, want the reported number's ghost", got)
+	}
+	ctx := context.Background()
+	if !client.IsThisUser(ctx, MakeUserID("+15550002222")) {
+		t.Error("IsThisUser(own number) = false")
+	}
+	if client.IsThisUser(ctx, MakeUserID("+15551112222")) {
+		t.Error("IsThisUser(other number) = true")
+	}
+	if client.IsThisUser(ctx, networkid.UserID("")) {
+		t.Error("IsThisUser(empty) = true")
+	}
+}
+
+// TestSelfThreadStaysSendableAfterPortalMapping covers the portal metadata of
+// a self-thread: the own number must survive as the only recipient (and as
+// OtherUserID), otherwise Matrix-to-phone sends fail with "no recipients
+// known for this phone thread".
+func TestSelfThreadStaysSendableAfterPortalMapping(t *testing.T) {
+	t.Parallel()
+	client := &MyNetworkClient{
+		connector: &MyConnector{config: &SimpleConfig{OwnNumbers: []string{groupTestOwn}}},
+		login: &bridgev2.UserLogin{UserLogin: &database.UserLogin{Metadata: &LoginMetadata{
+			DeviceSerial: "ABC123",
+		}}},
+	}
+	portal := groupTestPortal("thread-" + DeviceScope("ABC123") + "-1-44")
+
+	if !client.applyPortalThread(portal, agentapi.Thread{ID: 44, SubID: 1, Recipients: []string{"15550100100"}}) {
+		t.Fatal("applyPortalThread(self-thread) reported no change")
+	}
+	meta := portal.Metadata.(*PortalMetadata)
+	if !slices.Equal(meta.Recipients, []string{groupTestOwn}) {
+		t.Fatalf("self-thread Recipients = %v, want the own number", meta.Recipients)
+	}
+	if meta.OtherUserID != MakeUserID(groupTestOwn) || meta.IsGroup {
+		t.Fatalf("self-thread metadata = %+v, want a DM with the own-number ghost", meta)
+	}
+	// HandleMatrixMessage takes meta.Recipients (or OtherUserID as fallback),
+	// so at least one of them must hold the own number.
+	if len(meta.Recipients) == 0 && meta.OtherUserID == "" {
+		t.Fatal("self-thread has no send target")
+	}
+}
+
+// TestOwnNumberNeverBecomesGroupMember covers the membership side of the
+// own-number filter: even when the phone leaks its own number into a group
+// participant list, no own-number ghost is added to the room.
+func TestOwnNumberNeverBecomesGroupMember(t *testing.T) {
+	t.Parallel()
+	client := &MyNetworkClient{
+		connector: &MyConnector{config: &SimpleConfig{OwnNumbers: []string{groupTestOwn}}},
+	}
+
+	info := client.chatInfoForThread(context.Background(), agentapi.Thread{
+		ID: 45, SubID: 1,
+		Recipients: []string{groupTestOwn, groupTestAlice, groupTestBob},
+	})
+	ownGhost := MakeUserID(groupTestOwn)
+	for _, member := range info.Members.Members {
+		if member.Sender == ownGhost {
+			t.Fatalf("own number became a room member: %+v", member)
+		}
+	}
+	if info.Type == nil || *info.Type != database.RoomTypeDefault {
+		t.Fatalf("room type = %v, want a group room after dropping the own number", info.Type)
 	}
 }
