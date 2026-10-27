@@ -491,6 +491,18 @@ func TestCdnConfigValidation(t *testing.T) {
 	if service, err := NewCdnService(zerolog.Nop(), base, nil); err != nil || service != nil {
 		t.Fatalf("disabled configuration created a service: (%v, %v)", service, err)
 	}
+	if base.MaxFileBytes != 512<<20 || base.PerUserCapBytes != 10<<30 {
+		t.Fatalf("default size caps = %d bytes per file / %d bytes per user, want 512 MiB / 10 GiB",
+			base.MaxFileBytes, base.PerUserCapBytes)
+	}
+	if base.MaxAlbumItems != 20 || base.MaxAlbumBytes != 500<<20 {
+		t.Fatalf("default album caps = %d item(s) / %d bytes, want 20 / 500 MiB",
+			base.MaxAlbumItems, base.MaxAlbumBytes)
+	}
+	if base.DefaultExpiry.Duration() != 30*24*time.Hour || base.MaxExpiry.Duration() != 365*24*time.Hour {
+		t.Fatalf("default expiries = %s / %s, want 30d / 365d",
+			formatTTLDuration(base.DefaultExpiry.Duration()), formatTTLDuration(base.MaxExpiry.Duration()))
+	}
 
 	noDomain := DefaultCdnConfig()
 	noDomain.Enabled = true

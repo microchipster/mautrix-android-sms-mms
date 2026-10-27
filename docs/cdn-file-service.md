@@ -238,8 +238,8 @@ network:
     # Ciphertext + metadata directory (inside the container).
     data_dir: /data/cdn
 
-    # One encrypted upload in bytes (default 100 MiB).
-    max_file_bytes: 104857600
+    # One encrypted upload in bytes (default 512 MiB).
+    max_file_bytes: 536870912
 
     # One album: item count (default 20, maximum 255) and total item+manifest
     # ciphertext in bytes (default 500 MiB). Albums also count against
@@ -247,9 +247,9 @@ network:
     max_album_items: 20
     max_album_bytes: 524288000
 
-    # Stored ciphertext per user in bytes (default 1 GiB). Oldest files are
+    # Stored ciphertext per user in bytes (default 10 GiB). Oldest files are
     # pruned first once the cap is exceeded.
-    per_user_cap_bytes: 1073741824
+    per_user_cap_bytes: 10737418240
 
     # Default link lifetime (default 30d) and the longest one an upload may
     # request (hard-capped at 365d).
@@ -301,7 +301,7 @@ Upload details:
 ```
 !sms cdn list                  # your active links and albums: id, size, expiry
 !sms cdn revoke <id>           # kill one of your links (a file or a whole album)
-!sms cdn stats                 # global numbers for admins, your usage otherwise
+!sms cdn stats                 # numbers + effective limits (global for admins, yours otherwise)
 !sms cdn gc                    # run expiry cleanup now (admins only)
 ```
 
@@ -334,8 +334,8 @@ Added to
 matrix_bridge_mautrix_android_sms_mms_cdn_enabled: false
 matrix_bridge_mautrix_android_sms_mms_cdn_domain: "cdn.{{ matrix_bridge_mautrix_android_sms_mms_homeserver_domain }}"
 matrix_bridge_mautrix_android_sms_mms_cdn_data_dir: "/data/cdn"
-matrix_bridge_mautrix_android_sms_mms_cdn_max_file_bytes: 104857600
-matrix_bridge_mautrix_android_sms_mms_cdn_per_user_cap_bytes: 1073741824
+matrix_bridge_mautrix_android_sms_mms_cdn_max_file_bytes: 536870912
+matrix_bridge_mautrix_android_sms_mms_cdn_per_user_cap_bytes: 10737418240
 matrix_bridge_mautrix_android_sms_mms_cdn_default_expiry: "30d"
 matrix_bridge_mautrix_android_sms_mms_cdn_max_expiry: "365d"
 matrix_bridge_mautrix_android_sms_mms_cdn_gc_interval: "1h"

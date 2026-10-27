@@ -49,11 +49,11 @@ const (
 	cdnMinIDLen = 22
 	cdnMaxIDLen = 64
 
-	// cdnDefaultMaxFileBytes caps one ciphertext upload (100 MiB).
-	cdnDefaultMaxFileBytes = int64(100) << 20
-	// cdnDefaultPerUserCapBytes caps the storage per user (1 GiB). Files
+	// cdnDefaultMaxFileBytes caps one ciphertext upload (512 MiB).
+	cdnDefaultMaxFileBytes = int64(512) << 20
+	// cdnDefaultPerUserCapBytes caps the storage per user (10 GiB). Files
 	// beyond the cap are removed oldest-first.
-	cdnDefaultPerUserCapBytes = int64(1) << 30
+	cdnDefaultPerUserCapBytes = int64(10) << 30
 	// cdnDefaultExpiry is the default link lifetime (1 month).
 	cdnDefaultExpiry = 30 * 24 * time.Hour
 	// cdnMaxExpiry is the hard lifetime cap (1 year). Uploads asking for
@@ -164,8 +164,8 @@ type CdnConfig struct {
 	GCInterval cdnDuration `yaml:"gc_interval,omitempty"`
 }
 
-// DefaultCdnConfig returns the file service defaults: disabled, 100 MiB per
-// file, 20 items and 500 MiB per album, 1 GiB per user, one month links,
+// DefaultCdnConfig returns the file service defaults: disabled, 512 MiB per
+// file, 20 items and 500 MiB per album, 10 GiB per user, one month links,
 // cleanup hourly.
 func DefaultCdnConfig() CdnConfig {
 	return CdnConfig{
@@ -1321,6 +1321,7 @@ func NewCdnCommand(service *CdnService) *commands.FullHandler {
 					lines := []string{fmt.Sprintf(
 						"File service: %d active file(s), %d active album(s), %s across %d user(s), %d expired awaiting cleanup. Last cleanup: %s.",
 						stats.Files, stats.Albums, formatCdnBytes(stats.Bytes), stats.Owners, stats.Expired, lastGC)}
+					lines = append(lines, cdnLimitsText(service.cfg))
 					if stats.GCError != "" {
 						lines = append(lines, "Last cleanup error: "+stats.GCError)
 					}
@@ -1335,8 +1336,8 @@ func NewCdnCommand(service *CdnService) *commands.FullHandler {
 					ce.Reply("Failed to read your file service usage: %v", err)
 					return
 				}
-				ce.Reply("Your file links and albums: %d active, %s used of %s.",
-					len(entries), formatCdnBytes(used), formatCdnBytes(service.cfg.PerUserCapBytes))
+				ce.Reply("Your file links and albums: %d active, %s used.\n%s",
+					len(entries), formatCdnBytes(used), cdnLimitsText(service.cfg))
 			case "gc":
 				if !ce.User.Permissions.Admin {
 					ce.Reply("Only bridge administrators can run the file service cleanup.")
@@ -1369,6 +1370,14 @@ func cdnCommandHelpText() string {
 		"- revoke <id>: delete one of your file links or albums\n" +
 		"- stats: show storage usage (global for admins, yours otherwise)\n" +
 		"- gc: run expiry cleanup now (admins only)"
+}
+
+// cdnLimitsText renders the effective size caps of the file service for the
+// management room.
+func cdnLimitsText(cfg CdnConfig) string {
+	return fmt.Sprintf("Limits: %s per upload, %s stored per user, %d item(s) and %s per album.",
+		formatCdnBytes(cfg.MaxFileBytes), formatCdnBytes(cfg.PerUserCapBytes),
+		cfg.MaxAlbumItems, formatCdnBytes(cfg.MaxAlbumBytes))
 }
 
 // formatCdnBytes renders a byte count for the management room.
