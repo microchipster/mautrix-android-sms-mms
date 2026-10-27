@@ -110,6 +110,9 @@ type SimpleConfig struct {
 	NewContactNotice bool `yaml:"new_contact_notice,omitempty"`
 	// HistoryTTL configures the Matrix-history retention cleanup.
 	HistoryTTL HistoryTTLConfig `yaml:"history_ttl,omitempty"`
+	// AntiSpam configures the local-only inbound anti-spam gate
+	// (see docs/anti-spam.md). Disabled unless enabled: true.
+	AntiSpam AntiSpamConfig `yaml:"anti_spam,omitempty"`
 	// Pairing configures the public app pairing API.
 	Pairing PairingConfig `yaml:"pairing,omitempty"`
 	// CDN configures the bridge-hosted encrypted file service.
@@ -165,6 +168,7 @@ func NewSimpleConfig() *SimpleConfig {
 		MaxAttachmentSizeMB:  defaultMaxAttachmentSizeMB,
 		AutoLabelNewContacts: true,
 		HistoryTTL:           DefaultHistoryTTLConfig(),
+		AntiSpam:             DefaultAntiSpamConfig(),
 		Pairing:              DefaultPairingConfig(),
 		CDN:                  DefaultCdnConfig(),
 	}

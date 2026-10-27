@@ -33,6 +33,13 @@ type MyConnector struct {
 	ttlMu     sync.Mutex
 	ttlCancel context.CancelFunc
 	ttlState  ttlState
+
+	spamMu       sync.Mutex
+	spamRate     *spamRateLimiter
+	spamDupes    *spamDuplicateTracker
+	spamRecent   []spamRecord
+	spamCounters spamCounters
+	spamLast     time.Time
 }
 
 // NewMyConnector creates a new instance of MyConnector.
@@ -105,6 +112,7 @@ func (c *MyConnector) Init(br *bridgev2.Bridge) {
 		proc.AddHandler(CommandLabel)
 		proc.AddHandler(CommandLabels)
 		proc.AddHandler(CommandTTL)
+		proc.AddHandler(CommandSpam)
 		proc.AddHandler(CommandMerge)
 		proc.AddHandler(CommandMerges)
 		proc.AddHandler(CommandUnmerge)

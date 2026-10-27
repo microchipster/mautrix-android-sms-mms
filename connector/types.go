@@ -151,6 +151,13 @@ func (m *PortalMetadata) New() any {
 type MessageMetadata struct {
 	Body          string `json:"body,omitempty"`
 	HasAttachment bool   `json:"has_attachment,omitempty"`
+	// SpamAction, SpamScore and SpamReasons record the anti-spam verdict for
+	// the message (empty SpamAction means no verdict was recorded). They carry
+	// no message content, only ids/pattern names for `spam recent` and
+	// ad-hoc SQL.
+	SpamAction  string   `json:"spam_action,omitempty"`
+	SpamScore   int      `json:"spam_score,omitempty"`
+	SpamReasons []string `json:"spam_reasons,omitempty"`
 }
 
 // New creates a new instance for database registration.

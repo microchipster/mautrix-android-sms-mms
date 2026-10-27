@@ -718,6 +718,7 @@ func managementRoomHelpText() string {
 		"- stats [24h|7d|30d|all]\n" +
 		"- label <phone> <label|--clear>\n" +
 		"- labels\n" +
+		"- spam status | spam recent [count]\n" +
 		"- ttl status | ttl run [--dry-run|--apply]\n" +
 		"- merge <room-id> <room-id> [<room-id> ...] [--into <room-id>] [--yes]\n" +
 		"- merges\n" +

@@ -792,13 +792,26 @@ func (nc *MyNetworkClient) bridgeAgentMessage(ctx context.Context, msg agentapi.
 	// only the portal (and the participant union) changes.
 	homeKey, targetMeta, routed := nc.mergeRoute(ctx, portalKey)
 
-	// Inbound anti-spam gate: drop messages from blocked contacts and tag the
-	// sender of a first-contact message before the portal is created.
+	// Inbound gates: drop messages from blocked contacts and tag the sender of
+	// a first-contact message before the portal is created.
 	if !fromMe {
 		if nc.dropBlockedInbound(ctx, portalKey, msg.Sender) {
 			return
 		}
 		if routed && nc.dropBlockedInbound(ctx, homeKey, msg.Sender) {
+			return
+		}
+	}
+
+	timestamp := agentMessageTimestamp(msg)
+	spam := spamDecision{Action: spamActionAllow}
+	if !fromMe {
+		// The anti-spam gate runs after the block gate and before anything is
+		// queued for Matrix. "hold"/"block" decisions drop the message;
+		// "label"/"flag" decisions still bridge it.
+		var drop bool
+		spam, drop = nc.spamGate(ctx, homeKey, msg.Sender, msg.ID, msg.Body, timestamp, nc.messageIsGroup(msg))
+		if drop {
 			return
 		}
 	}
@@ -831,7 +844,6 @@ func (nc *MyNetworkClient) bridgeAgentMessage(ctx context.Context, msg agentapi.
 	chatInfo := nc.chatInfoForThread(ctx, thread)
 	nc.ensurePortal(ctx, homeKey, chatInfo, thread)
 
-	timestamp := agentMessageTimestamp(msg)
 	evt := &simplevent.Message[agentapi.Message]{
 		EventMeta: simplevent.EventMeta{
 			Type:      bridgev2.RemoteEventMessage,
@@ -845,7 +857,12 @@ func (nc *MyNetworkClient) bridgeAgentMessage(ctx context.Context, msg agentapi.
 		Data: msg,
 		ID:   networkid.MessageID(msg.ID),
 		ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data agentapi.Message) (*bridgev2.ConvertedMessage, error) {
-			return nc.buildConvertedMessage(ctx, portal, intent, data)
+			converted, err := nc.buildConvertedMessage(ctx, portal, intent, data)
+			if err != nil {
+				return converted, err
+			}
+			applySpamMessageMetadata(converted, spam)
+			return converted, nil
 		},
 	}
 	nc.bridge.QueueRemoteEvent(nc.login, evt)
@@ -1077,6 +1094,20 @@ func (nc *MyNetworkClient) dmDisplayName(ctx context.Context, address string) st
 		}
 	}
 	return CanonicalAddress(address)
+}
+
+// messageIsGroup reports whether a message belongs to a multi-participant
+// thread, using the same recipient normalization as room membership.
+func (nc *MyNetworkClient) messageIsGroup(msg agentapi.Message) bool {
+	recipients := append([]string{}, msg.Recipients...)
+	if msg.Sender != "" {
+		recipients = append(recipients, msg.Sender)
+	}
+	return len(nc.threadRecipients(agentapi.Thread{
+		ID:         msg.ThreadID,
+		SubID:      msg.SubID,
+		Recipients: recipients,
+	})) > 1
 }
 
 // threadForMessage returns the cached thread, refreshing the cache when the
