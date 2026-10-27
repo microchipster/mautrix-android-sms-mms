@@ -135,6 +135,7 @@ func (sl *SimpleLogin) SubmitUserInput(ctx context.Context, input map[string]str
 			SubID:        sub.SubID,
 			PhoneNumber:  sub.Number,
 			DisplayName:  sub.DisplayName,
+			Carrier:      sub.Carrier,
 			IsDefaultSMS: sub.DefaultSMS,
 		}
 		if profile.Phone == "" && sub.Number != "" {

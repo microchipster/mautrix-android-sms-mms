@@ -101,6 +101,15 @@ type SimpleConfig struct {
 	// filters own numbers itself; app-paired logins normally learn them from
 	// the app's heartbeat, and this list is the fallback for when that fails.
 	OwnNumbers []string `yaml:"own_numbers,omitempty"`
+	// AutoLabelNewContacts tags the ghost of a sender with the "new contact"
+	// label when their first inbound message creates a portal. Labels are
+	// metadata-only and can be managed with the `label`/`labels` commands.
+	AutoLabelNewContacts bool `yaml:"auto_label_new_contacts"`
+	// NewContactNotice posts a management-room notice (address only, never the
+	// message body) when a new contact is auto-labeled.
+	NewContactNotice bool `yaml:"new_contact_notice,omitempty"`
+	// HistoryTTL configures the Matrix-history retention cleanup.
+	HistoryTTL HistoryTTLConfig `yaml:"history_ttl,omitempty"`
 	// Pairing configures the public app pairing API.
 	Pairing PairingConfig `yaml:"pairing,omitempty"`
 }
@@ -149,10 +158,12 @@ func (c *SimpleConfig) UnmarshalYAML(unmarshal func(any) error) error {
 // NewSimpleConfig returns the configuration with all defaults filled in.
 func NewSimpleConfig() *SimpleConfig {
 	return &SimpleConfig{
-		DefaultAgentURL:     defaultAgentURL,
-		HistoryDefaultDays:  defaultHistoryDefaultDays,
-		MaxAttachmentSizeMB: defaultMaxAttachmentSizeMB,
-		Pairing:             DefaultPairingConfig(),
+		DefaultAgentURL:      defaultAgentURL,
+		HistoryDefaultDays:   defaultHistoryDefaultDays,
+		MaxAttachmentSizeMB:  defaultMaxAttachmentSizeMB,
+		AutoLabelNewContacts: true,
+		HistoryTTL:           DefaultHistoryTTLConfig(),
+		Pairing:              DefaultPairingConfig(),
 	}
 }
 
@@ -212,6 +223,28 @@ func (c *MyConnector) ownNumbers() []string {
 		}
 	}
 	return numbers
+}
+
+// autoLabelNewContacts reports whether first-contact auto-labeling is enabled.
+func (c *MyConnector) autoLabelNewContacts() bool {
+	if c == nil || c.config == nil {
+		return true
+	}
+	return c.config.AutoLabelNewContacts
+}
+
+// newContactNotice reports whether new-contact auto-labeling also posts a
+// management-room notice.
+func (c *MyConnector) newContactNotice() bool {
+	return c != nil && c.config != nil && c.config.NewContactNotice
+}
+
+// historyTTLConfig returns the configured history retention settings.
+func (c *MyConnector) historyTTLConfig() HistoryTTLConfig {
+	if c == nil || c.config == nil {
+		return DefaultHistoryTTLConfig()
+	}
+	return c.config.HistoryTTL
 }
 
 // pairingEnabled reports whether the public pairing API should run. Older

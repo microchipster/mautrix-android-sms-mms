@@ -68,6 +68,7 @@ type SubscriptionInfo struct {
 	SubID        int    `json:"sub_id"`
 	PhoneNumber  string `json:"phone_number,omitempty"`
 	DisplayName  string `json:"display_name,omitempty"`
+	Carrier      string `json:"carrier,omitempty"`
 	IsDefaultSMS bool   `json:"is_default_sms,omitempty"`
 }
 
@@ -83,6 +84,10 @@ type GhostMetadata struct {
 	RemoteName   string `json:"remote_name,omitempty"`    // contact name as known by the phone
 	AvatarURL    string `json:"avatar_url,omitempty"`
 	CustomName   string `json:"custom_name,omitempty"`
+	// Labels are free-form tags assigned with the `label` command (or the
+	// automatic "new contact" label). They are metadata-only and never sent
+	// to the phone.
+	Labels []string `json:"labels,omitempty"`
 }
 
 // New creates a new instance for database registration.

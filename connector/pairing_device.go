@@ -274,6 +274,7 @@ func (d *pairedDevice) applyHeartbeatSubscriptions(ctx context.Context, subs []a
 			SubID:        id,
 			PhoneNumber:  sub.Number,
 			DisplayName:  sub.DisplayName,
+			Carrier:      sub.Carrier,
 			IsDefaultSMS: sub.DefaultSMS,
 		}
 		if existing, ok := meta.Subscriptions[id]; ok && existing == info {

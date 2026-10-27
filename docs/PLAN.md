@@ -372,6 +372,19 @@ membership changes, attachments both ways, tapback round trip) on hardware, auto
 attachment pipeline, delivery states, GrapheneOS non-root acceptance run, release tagging
 per version.
 
+**Phase 6 — Bridge-side management: stats, labels, retention. ✅ Done.**
+`!sms stats [24h|7d|30d|all]` aggregates existing `message` rows by direction, SMS/MMS and
+SIM subscription (carrier + own number from the app heartbeat / agent health); carrier
+scope stays an aggregation over the existing tables — no second database (see
+`docs/carrier-scoped-stats.md`). First-time senders are auto-labeled
+(`auto_label_new_contacts`, optional `new_contact_notice` with address only),
+`label`/`labels` manage tags in ghost metadata, and the standard `block-user` command now
+drops inbound messages from blocked DM contacts bridge-side (`docs/caller-id-and-labels.md`
+also records the CNAM limitation). `history_ttl` redacts Matrix events and deletes bridge
+rows older than a global / per-room / per-contact retention, with the `otp`,
+`credit-card` and `ssn` pattern presets plus a `custom_patterns` extension map, a dry-run
+mode and `ttl status` / `ttl run` (`docs/history-ttl.md`).
+
 ## 9. Testing
 
 - Unit: phone canonicalization table tests; tapback parse cases (incl. smart quotes,

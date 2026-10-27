@@ -132,6 +132,10 @@ All commands live in the management room (default prefix `!sms`):
 | `!sms ping` | Check the phone connection. |
 | `!sms sync`, `!sms sync 30d`, `!sms sync full` | Backfill history. |
 | `!sms sync-status` | Show per-room sync progress. |
+| `!sms stats [24h\|7d\|30d\|all]` | Message counts by direction, SMS/MMS and carrier/SIM. |
+| `!sms label <phone> <label\|--clear>`, `!sms labels` | Tag contacts (auto-labels first-time senders) and list tags. |
+| `!sms block-user`, `!sms unblock-user` | In a DM room: drop inbound messages from that sender, bridge-side. |
+| `!sms ttl status`, `!sms ttl run [--dry-run\|--apply]` | Show or run the Matrix history retention cleanup. |
 | `!sms devices` | List paired devices and their state. |
 | `!sms unpair <device_id\|all>` | Revoke a device's token. |
 | `!sms rebind-room <thread\|address> <room_id>` | Attach a phone thread to an existing Matrix room. |
@@ -180,6 +184,9 @@ docker build -t mautrix-android-sms-mms .   # container image
 - [`docs/sms-bridge-handoff.md`](docs/sms-bridge-handoff.md) — full project handoff: state, runbooks, testing rig, next goals.
 - [`docs/PAIRING_PROTOCOL.md`](docs/PAIRING_PROTOCOL.md) — app pairing protocol (QR + manual, queue/events API).
 - [`docs/AGENT_API.md`](docs/AGENT_API.md) — HTTP API contract both transports implement.
+- [`docs/carrier-scoped-stats.md`](docs/carrier-scoped-stats.md) — `!sms stats`, carrier/SIM aggregation and ad-hoc SQL views.
+- [`docs/caller-id-and-labels.md`](docs/caller-id-and-labels.md) — what caller info SMS has, labels, new-contact tagging and anti-spam.
+- [`docs/history-ttl.md`](docs/history-ttl.md) — Matrix history retention: config schema, pattern presets and cleanup behavior.
 - [`docs/testing-e2e-local.md`](docs/testing-e2e-local.md) — local end-to-end test runbook.
 - [`docs/SIGNING.md`](docs/SIGNING.md) — how releases are signed.
 - [`docs/research-adb-reference.md`](docs/research-adb-reference.md), [`docs/research-app-base.md`](docs/research-app-base.md) — research notes.

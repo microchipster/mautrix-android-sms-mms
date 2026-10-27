@@ -7,6 +7,7 @@ package connector
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -27,6 +28,10 @@ type MyConnector struct {
 	bridge  *bridgev2.Bridge
 	config  *SimpleConfig
 	pairing *pairingServer
+
+	ttlMu     sync.Mutex
+	ttlCancel context.CancelFunc
+	ttlState  ttlState
 }
 
 // NewMyConnector creates a new instance of MyConnector.
@@ -86,6 +91,10 @@ func (c *MyConnector) Init(br *bridgev2.Bridge) {
 		proc.AddHandler(CommandRebindRoom)
 		proc.AddHandler(CommandDevices)
 		proc.AddHandler(CommandUnpair)
+		proc.AddHandler(CommandStats)
+		proc.AddHandler(CommandLabel)
+		proc.AddHandler(CommandLabels)
+		proc.AddHandler(CommandTTL)
 		c.log.Info().Msg("Registered custom commands")
 	} else {
 		c.log.Warn().Msg("Command processor not available for custom commands")
@@ -217,6 +226,7 @@ func (c *MyConnector) Start(ctx context.Context) error {
 	if len(userIDs) == 0 {
 		c.log.Warn().Msg("No stored Android SMS/MMS logins found; no agent event feed will be started")
 	}
+	c.startHistoryTTLLoop()
 	return nil
 }
 
@@ -224,6 +234,7 @@ func (c *MyConnector) Start(ctx context.Context) error {
 // alongside the rest of the bridge.
 func (c *MyConnector) Stop() {
 	c.log.Info().Msg("MyConnector Stop called")
+	c.stopHistoryTTLLoop()
 	if c.pairing == nil {
 		return
 	}

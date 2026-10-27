@@ -715,6 +715,10 @@ func managementRoomHelpText() string {
 		"- rebind-room <thread_key_or_address> <matrix_room_id>\n" +
 		"- list-logins\n" +
 		"- list-users\n" +
+		"- stats [24h|7d|30d|all]\n" +
+		"- label <phone> <label|--clear>\n" +
+		"- labels\n" +
+		"- ttl status | ttl run [--dry-run|--apply]\n" +
 		"- devices\n" +
 		"- unpair <device_id|all>\n" +
 		"- logout [login_id]\n" +

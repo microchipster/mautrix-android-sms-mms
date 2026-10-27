@@ -628,6 +628,14 @@ func (nc *MyNetworkClient) bridgeAgentMessage(ctx context.Context, msg agentapi.
 		return
 	}
 
+	// Inbound anti-spam gate: drop messages from blocked contacts and tag the
+	// sender of a first-contact message before the portal is created.
+	if !fromMe {
+		if nc.dropBlockedInbound(ctx, portalKey, msg.Sender) {
+			return
+		}
+	}
+
 	// iPhone tapbacks arrive as text; convert them to reactions when the
 	// referenced message can be found, otherwise fall through and forward the
 	// text unchanged. Outgoing text is never treated as a tapback: it is
