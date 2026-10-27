@@ -173,20 +173,30 @@ maximum I would consider, and only behind an explicit, per-query opt-in.
 
 ### Phase 1 - local-only (do this first; no external data)
 
-1. Unknown-sender quarantine + explicit allow (bridge room/folder, per-contact memory).
-2. First-contact rate limits and burst detection (per number + global cap per hour; alarm
-   in the management room).
-3. Explainable scoring engine reusing `ttlconfig` patterns (keywords + urgency/payment
-   heuristics), with `!sms spam why <number>` and dry-run mode.
-4. Link analysis (shorteners/IP-literal/punycode/rare-TLD + optional offline feeds) with
-   no automatic fetching.
-5. Duplicate/near-duplicate detection across recipients.
-6. Sender-class policy defaults (short code / toll-free / alphanumeric / international).
-7. Own-history reputation + per-contact policies integrated with labels.
-8. On-device filtering in the Fossify fork (pre-forward quarantine, word filters, mirror
-   bridge blocks into the platform blocked-number provider).
-9. Local reporting (`!sms report`) that stores data only, as the Phase 2 opt-in source.
-10. Management UX: policy editor, quarantine view, "why" explanations, per-label defaults.
+Implemented in the bridge (see [anti-spam.md](anti-spam.md)):
+
+1. **Done** - unknown-sender handling with explicit allow: `unknown_sender_policy`
+   (`bridge`/`label`/`hold`), allowlist labels, per-contact `spam policy` overrides.
+   The separate quarantine room/folder UI is still open (see 10).
+2. **Partially done** - per-number first-contact rate limit with a management-room
+   notice and persisted state; the per-hour *global* burst cap is not implemented.
+3. **Done** - explainable scoring engine (keyword patterns + urgency/payment
+   heuristics), `!sms spam why <number>` and dry-run mode.
+4. **Partially done** - offline lexical URL analysis (shorteners, suspicious TLDs) and
+   offline feed import (`feeds.paths` + `spam import`, never fetching). IP-literal and
+   punycode checks are still open.
+5. **Partially done** - cross-sender exact-body duplicate detection; near-duplicate
+   (fuzzy) matching is not implemented.
+6. **Done** - sender-class weights and `hold_classes`/`block_classes` hooks (short
+   code / toll-free / alphanumeric / international / home).
+7. **Done** - own-history reputation counters and persisted per-contact policies,
+   surfaced in `spam why` and `spam status`.
+8. **Deferred** - on-device filtering in the Fossify fork (pre-forward quarantine, word
+   filters, mirror bridge blocks into the platform blocked-number provider).
+9. **Deferred** - local reporting (`!sms report`) that stores data only, as the
+   Phase 2 opt-in source.
+10. **Partially done** - "why" explanations and policy persistence exist; the policy
+    editor, quarantine view and per-label defaults are still open.
 
 ### Phase 2 - self-hosted, opt-in sharing
 
@@ -231,23 +241,24 @@ day-one numbers.
 
 ## Recommended next implementation items (ranked)
 
-1. **Quarantine first contact from unknown senders** (hold first message per new number;
-   "Allow"/"Block" in the management room; reuse the `new contact` label as state).
-2. **First-contact rate limiting + burst detector** (per-number and global caps, alert
-   only, config-gated).
-3. **Scoring engine v1** reusing `ttlconfig` patterns (keyword/preset match + urgency and
-   payment heuristics), dry-run mode, `!sms spam why <number>` output.
-4. **Sender-class detection and default policies** (short code / toll-free / alphanumeric /
-   international vs E.164), with stricter defaults for spoofable classes.
-5. **Link analysis without fetching** (lexical checks: shorteners, IP hosts, punycode,
-   rare TLDs) + optional offline feed import (URLhaus/OpenPhish/DBL), disabled by default.
-6. **Duplicate detection** (same/near-same body to multiple recipients; repeated sends in
-   a window), advisory score only.
-7. **Per-contact policies + own-history reputation** (reply ratio, first-seen, prior
-   blocks; label-driven allow/hold rules).
-8. **Local reports** (`!sms report`, `!sms reports`) with TTL and no message bodies - the
+Done (see [anti-spam.md](anti-spam.md)): first-contact rate limiting (per number),
+scoring engine v1 with dry-run and `spam why`, sender classes/hooks, offline feed import,
+duplicate detection, per-contact policies and own-history reputation.
+
+Still open:
+
+1. **Quarantine UX for first contact** (hold first message per new number; "Allow"/"Block"
+   in the management room; reuse the `new contact` label as state).
+2. **Global burst detector** (bridge-wide message rate cap per hour, alert only).
+3. **Fuzzy near-duplicate detection** (normalized bodies plus simple token/character
+   distance, advisory score only).
+4. **More lexical URL checks** (IP hosts, punycode, mixed-script hostnames) on top of the
+   shortener/TLD/feed analysis.
+5. **Per-label default policies** (e.g. hold everything labeled `unknown sender`) and a
+   policy editor view in the management room.
+6. **Local reports** (`!sms report`, `!sms reports`) with TTL and no message bodies - the
    future opt-in input for Phase 2.
-9. **Fossify fork hooks** (pre-forward word-filter/quarantine toggle; mirror bridge blocks
+7. **Fossify fork hooks** (pre-forward word-filter/quarantine toggle; mirror bridge blocks
    into the Android blocked-number provider so the phone also stops them).
-10. **Phase 2 collector spec + prototype** only after 1-9 land: HMAC-pepper + k-anonymity +
-    OHTTP + aggregation/decay/appeals, off by default, self-hostable.
+8. **Phase 2 collector spec + prototype** only after 1-7 land: HMAC-pepper + k-anonymity +
+   OHTTP + aggregation/decay/appeals, off by default, self-hostable.
