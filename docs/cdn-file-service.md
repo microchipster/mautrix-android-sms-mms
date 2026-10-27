@@ -368,6 +368,14 @@ bridge is this exact patch set:
   Recipients with any browser can open the link, and clients that unfurl URLs
   must not fetch the fragment (they never do — fragments are not sent).
 
+## Validation
+
+`scripts/validate/t20_cdn.sh` runs this contract against a live base URL (see
+[validation.md](validation.md)): encrypted round trips for text/binary data,
+wrapper-page headers, wrong-key failure, 401/404 handling, expiry, quotas,
+revoke and cross-user isolation. `go test ./... -run Cdn -count=1` covers the
+same HTTP contract in-process, including the app's AES-256-GCM steps.
+
 ## Caveats
 
 - There is no per-file password beyond the fragment key; a leaked link is a

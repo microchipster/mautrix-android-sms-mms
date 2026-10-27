@@ -11,10 +11,13 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 | `cat.gif` | Tiny animated cat used by the attachment acceptance tests (`t05_attachments.sh`, `t16_gif_roundtrip.sh`): pushed to the phone, sent as an MMS and compared byte-exact by SHA-256. |
 | `make-cat-gif.sh` | Generator for `cat.gif` (ImageMagick drawing primitives). |
 | `paw.png` | Tiny second image for the multi-attachment MMS test (`t17_multi_attachment.sh`). |
-| `tiny.mp4` | 1 s 96x96 H.264 video for the media-variant test (`t18_media_variants.sh`). |
+| `tiny.mp4` | 1 s 96x96 H.264 video for the media-variant test (`t18_media_variants.sh`); also reused by the CDN matrix (`t20_cdn.sh`). |
 | `tiny.m4a` | 1 s 440 Hz mono AAC audio for the media-variant test (outbound and inbound). |
 | `tiny.ogg` | 1 s 440 Hz mono Opus audio for the media-variant test (inbound alternative). |
+| `tiny.png` | Deterministic 64x64 RGB PNG for the CDN round-trip test (`t20_cdn.sh`). |
+| `tiny.pdf` | Deterministic one-page PDF for the CDN round-trip/sniff test (`t20_cdn.sh`). |
 | `make-media-fixtures.sh` | Generator for `paw.png`, `tiny.mp4`, `tiny.m4a` and `tiny.ogg` (ImageMagick + ffmpeg lavfi). |
+| `make-cdn-fixtures.sh` | Generator for `tiny.png` and `tiny.pdf` (python3 stdlib only, deterministic). |
 
 ## Provenance
 
@@ -61,3 +64,19 @@ hash):
 | `tiny.mp4` | 1837 | `7cd5ae03249afb8adc0588b77311577a4dc9146874006ff60eee76fe397f1d71` |
 | `tiny.m4a` | 3940 | `7fc4a7ca8f0fe5f7c6be350f1f5bc480942725c180d7e7630b9497a589346163` |
 | `tiny.ogg` | 3209 | `b552d94313098de39f4d2cb530645876a230a84d87043714affa2457de265cf5` |
+
+```sh
+scripts/validate/fixtures/make-cdn-fixtures.sh
+# or, into a different directory:
+scripts/validate/fixtures/make-cdn-fixtures.sh /tmp/fixtures
+```
+
+Requires python3 only. Both outputs are written from python3 stdlib primitives
+(`struct`/`zlib`), so they reproduce byte-for-byte across machines unless Python's
+zlib encoder changes — no third-party artwork, text, fonts or metadata. Current sizes
+and hashes:
+
+| File | Bytes | SHA-256 |
+| --- | --- | --- |
+| `tiny.png` | 10362 | `515a9b17edac1e580fbd9f711659cb619b741ce7b5e5ba92d7ead150b004e23b` |
+| `tiny.pdf` | 596 | `410e8550fe57d67d7c2d26244743bf066da2e172801815ef195e05049772ffa6` |

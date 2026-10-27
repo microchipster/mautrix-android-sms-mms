@@ -36,11 +36,14 @@ bridge channel ids, room membership, timestamps, SHA-256 hashes).
 | `scripts/validate/t17_multi_attachment.sh` | one multi-attachment send → exactly one MMS with both image parts |
 | `scripts/validate/t18_media_variants.sh` | video (inbound) and audio (both directions) variants with degradation reporting |
 | `scripts/validate/t19_unknown_sender.sh` | unknown-number thread/portal creation, no duplicate threads |
+| `scripts/validate/t20_cdn.sh` | bridge CDN file-service contract: crypto round trips, wrapper headers, expiry, quotas, revoke, isolation |
 | `scripts/validate/fixtures/cat.gif` | tiny animated cat for the attachment tests (generated in-house) |
 | `scripts/validate/fixtures/paw.png` | second image for the multi-attachment test (generated in-house) |
 | `scripts/validate/fixtures/tiny.mp4` + `tiny.m4a` + `tiny.ogg` | synthetic video/audio fixtures (generated in-house) |
+| `scripts/validate/fixtures/tiny.png` + `tiny.pdf` | deterministic CDN round-trip fixtures (generated in-house) |
 | `scripts/validate/fixtures/make-cat-gif.sh` | fixture generator + regeneration docs |
 | `scripts/validate/fixtures/make-media-fixtures.sh` | generator for `paw.png`/`tiny.*` + regeneration docs |
+| `scripts/validate/fixtures/make-cdn-fixtures.sh` | generator for `tiny.png`/`tiny.pdf` + regeneration docs |
 
 ## Quick start
 
@@ -136,9 +139,63 @@ fails a run: it means the component, the environment or the opt-in live probe is
 | `NEW_SENDER_NUMBER` | `$SMS_TARGET_NUMBER` | number whose phone thread/portal t19 inspects. |
 | `MAX_DM_THREADS` | `20` | cap on 1:1 threads t19 walks for portal coverage. |
 | `MAX_GROUP_THREADS` / `MAX_CANDIDATE_ROOMS` | `3` / `6` | caps for slow iamb/portal scans. |
+| `CDN_BASE_URL` | empty | live CDN file-service base URL, e.g. `https://cdn.example.com` (t20); without it the whole matrix SKIPs. |
+| `CDN_TOKEN` | empty | uploader's paired-device bearer token (t20; never logged). |
+| `CDN_TOKEN_2` | empty | second user's token for the cross-user isolation check (t20; that check SKIPs without it). |
+| `CDN_EXPIRES` | `12h` | expiry sent with the round-trip uploads (t20; must not exceed `cdn.max_expiry`). |
+| `CDN_SHORT_EXPIRES` | `60s` | short expiry proven end-to-end, then asserted as 404 on read (t20). |
+| `CDN_EXPIRY_WAIT` | `5` | extra seconds to wait past `CDN_SHORT_EXPIRES` (t20). |
+| `CDN_MAX_FILE_BYTES` | empty | configured `cdn.max_file_bytes`; enables the oversized-upload 413 probe (t20). |
+| `CDN_PER_USER_CAP_BYTES` | empty | configured `cdn.per_user_cap_bytes`; enables the FIFO-pruning probe (t20). |
+| `CDN_MAX_UPLOAD_BYTES` | `8388608` | probe guard: caps above it SKIP with a note (t20). |
+| `CDN_CHECK_DISCOVERY` | `1` | `1` asserts bridge `_smsmms/v1/info` advertises a matching `cdn_base_url` (t20). |
+| `CDN_INSECURE` / `CDN_NODE_TLS_INSECURE` | `0` | `1` lets curl / Node accept self-signed staging certificates (t20). |
+| `CDN_PYTHON` / `CDN_NODE` | `python3` / `node` | interpreter overrides for the crypto helpers (t20). |
 
 Tokens never belong in committed files; pass them via the environment (or a local,
 gitignored `.env` sourced by your shell).
+
+## Bridge CDN matrix (`t20_cdn.sh`)
+
+`t20_cdn.sh` exercises the bridge-hosted encrypted file service
+([cdn-file-service.md](cdn-file-service.md)) the way the app does: client-side
+AES-256-GCM encryption (`nonce||ct||tag`, 32-byte key in the URL fragment), a
+bearer `POST /f`, an anonymous `GET /f/<id>/raw` + `GET /f/<id>` fetch, a local
+decrypt, wrapper-page headers, expiry, quotas, revoke and cross-user isolation.
+`CDN_TOKEN` is the **paired device's bearer token** (the same one the app
+uses for `/_smsmms/` pairing flows); it is never printed. The script SKIPs
+cleanly when `CDN_BASE_URL`/`CDN_TOKEN` are unset, and every other component
+SKIPs with a documented reason when it cannot be probed.
+
+Live invocation (the `cdn.example.com` case):
+
+```sh
+export CDN_BASE_URL=https://cdn.example.com
+export CDN_TOKEN="$(cat /path/to/pairing-device-token)"    # never commit
+export CDN_TOKEN_2="$(cat /path/to/second-device-token)"   # isolation checks
+BRIDGE_URL=https://<homeserver> ./scripts/validate/t20_cdn.sh
+```
+
+Feature-gated notes:
+
+- The 413 size probe and the FIFO per-user-cap probe need the *actual* caps of
+  the deployment you point at: pass `CDN_MAX_FILE_BYTES`/`CDN_PER_USER_CAP_BYTES`
+  when they are small enough to probe over the network (≤ `CDN_MAX_UPLOAD_BYTES`,
+  default 8 MiB), e.g. a staging deploy with a 1 MiB file cap. On the production
+  defaults (100 MiB / 1 GiB) both checks SKIP with the observed `cap_bytes`.
+- The post-expiry check uses `CDN_SHORT_EXPIRES` (default 60s) and asserts the
+  read path 404s; the hourly `cdn gc` that frees the bytes is admin-only and is
+  not triggered over HTTP.
+- The discovery check asserts `GET <BRIDGE_URL>/_smsmms/v1/info` advertises a
+  `cdn_base_url` equal to `CDN_BASE_URL` (`CDN_CHECK_DISCOVERY=0` to skip).
+- Self-signed staging deployments: `CDN_INSECURE=1` (curl) and
+  `CDN_NODE_TLS_INSECURE=1` (Node WebCrypto re-check).
+- When `node` is unavailable, the WebCrypto re-check SKIPs and the structural
+  wrapper checks (headers, data-only id, no key/plaintext) still run.
+
+Local, without a deployment: `go test ./... -run Cdn -count=1` covers the same
+HTTP contract in-process, including the app's AES-256-GCM steps
+(`connector/cdn_appcontract_test.go`).
 
 ## Pointing at the local rig vs a deployment
 
@@ -213,6 +270,11 @@ SHA-256), and assert it fits `MMS_SIZE_LIMIT_BYTES`.
 from ImageMagick drawing primitives and ffmpeg `lavfi` sources, no third-party content.
 `fixtures/README.md` documents provenance, sizes, hashes and regeneration.
 
+`scripts/validate/fixtures/make-cdn-fixtures.sh` generates the deterministic
+`tiny.png` (64x64 RGB PNG) and `tiny.pdf` (one-page PDF) used by `t20_cdn.sh` for the
+binary round trips and PDF sniffing — python3 stdlib only (`struct`/`zlib`), no
+third-party content; the CDN matrix also reuses `tiny.mp4` from the media fixtures.
+
 ## Test map (acceptance matrix, `todo.md` §3)
 
 | # | Acceptance step | Test | Live probe (opt-in) |
@@ -235,6 +297,7 @@ from ImageMagick drawing primitives and ffmpeg `lavfi` sources, no third-party c
 | 16 | Multi-attachment send → one MMS, all parts | `t17_multi_attachment.sh` | `MEDIA_TARGET_NUMBER`, `APP_HTTP_ENABLE_TEMP` (or `APP_BRIDGE_URL`) |
 | 17 | Video/audio variants + degradation reporting | `t18_media_variants.sh` | `IAMB_PHONE_ROOM`, `MEDIA_TARGET_NUMBER` |
 | 18 | Unknown-number thread/portal creation | `t19_unknown_sender.sh` | `IAMB_NEW_SENDER_ROOM` (optional) |
+| 19 | Bridge CDN file service (crypto, links, expiry, quotas, revoke, isolation) | `t20_cdn.sh` | `CDN_BASE_URL` + `CDN_TOKEN` (env-gated) |
 
 ## Known gaps observed (2026-10-27 acceptance run)
 
