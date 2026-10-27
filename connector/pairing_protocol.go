@@ -53,6 +53,9 @@ const (
 	// pairingSendTimeout is how long HandleMatrixMessage waits for a
 	// send.result before falling back to the pending placeholders.
 	pairingSendTimeout = 30 * time.Second
+	// pairingPendingSendRetention bounds how long a dispatched send is
+	// remembered for echo suppression by send_id.
+	pairingPendingSendRetention = 30 * time.Minute
 	// pairingAttachmentMaxBase64 caps one base64 attachment payload.
 	pairingAttachmentMaxBase64 = 10485760
 	// pairingMaxBodyBytes caps request bodies of the pairing API.

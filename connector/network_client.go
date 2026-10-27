@@ -81,6 +81,13 @@ type MyNetworkClient struct {
 
 	syncMu            sync.Mutex
 	syncStartOverride map[networkid.PortalKey]time.Time
+
+	// echoHoldWait and echoHoldPollInterval bound how long a from-me message
+	// with no recipients waits for the pending send's send.result before it is
+	// treated as a phone-originated message after all. Zero means the default;
+	// tests shorten them.
+	echoHoldWait         time.Duration
+	echoHoldPollInterval time.Duration
 }
 
 // NewMyNetworkClient creates a client for one login. Start() must be called
@@ -384,20 +391,138 @@ func syntheticMessageFromEvent(ev remoteEvent) agentapi.Message {
 	return msg
 }
 
-// bridgeRemoteMessage bridges an app-pushed message, applying the send_id
-// echo suppression for sends that only got a pending placeholder.
+// outboundEchoDecision classifies an app-pushed message that may be the
+// phone's copy (echo) of a message this bridge sent itself.
+type outboundEchoDecision int
+
+const (
+	// bridgeEchoNotOurs: not a known echo; bridge the message normally.
+	bridgeEchoNotOurs outboundEchoDecision = iota
+	// bridgeEchoSuppressed: the message is our echo; drop it.
+	bridgeEchoSuppressed
+	// bridgeEchoHeld: the message may be our echo but its correlation has not
+	// arrived yet; re-evaluate it (bounded) before bridging.
+	bridgeEchoHeld
+)
+
+const (
+	// heldEchoWaitDefault bounds how long a from-me message without recipients
+	// waits for pending sends to resolve. Echoes and their send.result are
+	// produced milliseconds apart, so the wait only matters when the app
+	// cannot correlate the echo at all (older app version).
+	heldEchoWaitDefault = 5 * time.Second
+	// heldEchoPollDefault is the re-check interval of a held echo.
+	heldEchoPollDefault = 100 * time.Millisecond
+)
+
+// bridgeRemoteMessage bridges an app-pushed message, applying the echo
+// suppression for sends the bridge dispatched. The decision must not depend on
+// whether the app's message.new or the matching send.result arrives first: the
+// send id is tracked when the send is dispatched, the phone row id as soon as
+// the send.result is applied, and a from-me message without recipients is held
+// briefly while a send is still unresolved.
 func (nc *MyNetworkClient) bridgeRemoteMessage(ctx context.Context, msg agentapi.Message, sendID string) {
-	if sendID != "" && nc.device != nil && nc.device.consumePendingSend(sendID) {
-		if msg.ID != "" {
-			nc.markSentFromMatrix(networkid.MessageID(msg.ID))
-		}
+	switch nc.classifyOutboundEcho(msg, sendID) {
+	case bridgeEchoSuppressed:
 		nc.log.Debug().
 			Str("send_id", sendID).
 			Str("message_id", msg.ID).
-			Msg("Ignoring phone echo of a pending send from Matrix")
+			Msg("Ignoring phone echo of a message sent from Matrix")
 		return
+	case bridgeEchoHeld:
+		nc.log.Debug().
+			Str("send_id", sendID).
+			Str("message_id", msg.ID).
+			Msg("Holding a from-me message without recipients while an outbound send is unresolved")
+		nc.holdEchoCandidate(msg, sendID)
+		return
+	default:
+		nc.bridgeAgentMessage(ctx, msg)
 	}
-	nc.bridgeAgentMessage(ctx, msg)
+}
+
+// classifyOutboundEcho decides whether an app-pushed message is the phone's
+// copy of a message this bridge sent itself. Agent-transport sends resolve
+// synchronously and keep their suppression inside bridgeAgentMessage.
+func (nc *MyNetworkClient) classifyOutboundEcho(msg agentapi.Message, sendID string) outboundEchoDecision {
+	if nc.device == nil {
+		return bridgeEchoNotOurs
+	}
+	// The app's echo of a queue-command send carries the send id, which is
+	// known before the send.result is processed.
+	if sendID != "" && nc.device.consumePendingSend(sendID) {
+		if msg.ID != "" {
+			nc.markSentFromMatrix(networkid.MessageID(msg.ID))
+		}
+		return bridgeEchoSuppressed
+	}
+	// An older app version does not correlate the echo; the phone row id from
+	// the send.result is then the only link.
+	if msg.ID != "" && nc.consumeSentFromMatrix(networkid.MessageID(msg.ID)) {
+		return bridgeEchoSuppressed
+	}
+	// A from-me message without recipients is exactly what the app's echo
+	// looks like. If a dispatched send is still unresolved it may be the echo
+	// whose correlation has not arrived yet, so hold it instead of treating it
+	// as a phone-originated message (whose empty recipient list would wipe the
+	// room's members and name).
+	if msg.Sender == "" && len(msg.Recipients) == 0 && nc.device.hasPendingSends() {
+		return bridgeEchoHeld
+	}
+	return bridgeEchoNotOurs
+}
+
+// holdEchoCandidate re-evaluates a possible echo in the background: holding
+// must not block the event loop, so inbound messages keep flowing while the
+// bounded wait ends as soon as the pending sends resolve or the timeout passes.
+func (nc *MyNetworkClient) holdEchoCandidate(msg agentapi.Message, sendID string) {
+	go func() {
+		if nc.waitForEchoResolution(msg, sendID) {
+			return
+		}
+		// The wait is bounded and the message is bridged with the
+		// never-clear-on-empty guards in place, so a detached context is safe.
+		nc.bridgeAgentMessage(context.Background(), msg)
+	}()
+}
+
+// waitForEchoResolution reports whether a held message turned out to be the
+// echo of a send this bridge dispatched. It polls until the echo is matched,
+// no unresolved send is left, or the hold timeout passes.
+func (nc *MyNetworkClient) waitForEchoResolution(msg agentapi.Message, sendID string) bool {
+	if nc.device == nil {
+		return false
+	}
+	deadline := time.Now().Add(nc.echoHoldTimeout())
+	for {
+		if sendID != "" && nc.device.consumePendingSend(sendID) {
+			if msg.ID != "" {
+				nc.markSentFromMatrix(networkid.MessageID(msg.ID))
+			}
+			return true
+		}
+		if msg.ID != "" && nc.consumeSentFromMatrix(networkid.MessageID(msg.ID)) {
+			return true
+		}
+		if !nc.device.hasPendingSends() || !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(nc.echoHoldPoll())
+	}
+}
+
+func (nc *MyNetworkClient) echoHoldTimeout() time.Duration {
+	if nc.echoHoldWait > 0 {
+		return nc.echoHoldWait
+	}
+	return heldEchoWaitDefault
+}
+
+func (nc *MyNetworkClient) echoHoldPoll() time.Duration {
+	if nc.echoHoldPollInterval > 0 {
+		return nc.echoHoldPollInterval
+	}
+	return heldEchoPollDefault
 }
 
 // handleRemoteMessageUpdate refreshes the in-memory tapback index from the
@@ -458,6 +583,11 @@ func (nc *MyNetworkClient) rememberThreadRecipients(threadID int64, subID int, r
 
 // cacheThreadForMessage keeps the thread cache warm for app logins, which
 // have no /v1/threads endpoint to refresh from.
+//
+// An event without participant information (the from-me echo of a send, a
+// replayed message whose recipients were not carried) must never replace a
+// known list: an empty list would make the room reconciliation clear the
+// members and rename the room to "Unknown conversation".
 func (nc *MyNetworkClient) cacheThreadForMessage(msg agentapi.Message) {
 	if msg.ThreadID == 0 {
 		return
@@ -467,15 +597,20 @@ func (nc *MyNetworkClient) cacheThreadForMessage(msg agentapi.Message) {
 		recipients = append(recipients, msg.Sender)
 	}
 	nc.threadMu.Lock()
+	defer nc.threadMu.Unlock()
 	if nc.threads == nil {
 		nc.threads = make(map[int64]agentapi.Thread)
+	}
+	if len(recipients) == 0 {
+		if existing, ok := nc.threads[msg.ThreadID]; ok && len(existing.Recipients) > 0 {
+			return
+		}
 	}
 	nc.threads[msg.ThreadID] = agentapi.Thread{
 		ID:         msg.ThreadID,
 		SubID:      msg.SubID,
 		Recipients: recipients,
 	}
-	nc.threadMu.Unlock()
 }
 
 // handleAgentMessage fetches an agent message by ID and bridges it.
@@ -582,10 +717,22 @@ func (nc *MyNetworkClient) handleAgentThreadUpdate(ctx context.Context, ev remot
 		meta, _ := portal.Metadata.(*PortalMetadata)
 		thread = mergeAccumulateRecipients(meta, thread)
 	}
+	// Never reconcile membership from an empty participant list: fall back to
+	// the participants already stored for the portal.
+	thread = nc.withStoredRecipients(ctx, portalKey, thread)
 	chatInfo := nc.chatInfoForThread(ctx, thread)
 	if nc.applyPortalThread(portal, thread) {
 		if err := portal.Save(ctx); err != nil {
 			nc.log.Err(err).Str("portal_id", string(portal.ID)).Msg("Failed to save updated portal metadata")
+		}
+		if len(thread.Recipients) == 0 {
+			// The phone reported no participants; a full member list built
+			// from it would clear the room. Only reconcile when the event
+			// carries a usable list.
+			nc.log.Warn().
+				Str("portal_id", string(portal.ID)).
+				Msg("Thread update carried no participants; not queuing a chat info change")
+			return
 		}
 		nc.bridge.QueueRemoteEvent(nc.login, &simplevent.ChatInfoChange{
 			EventMeta: simplevent.EventMeta{
@@ -678,6 +825,9 @@ func (nc *MyNetworkClient) bridgeAgentMessage(ctx context.Context, msg agentapi.
 	} else {
 		thread = mergeAccumulateRecipients(targetMeta, thread)
 	}
+	// A from-me message without recipients must not clear the participants
+	// stored for the room; fall back to them instead.
+	thread = nc.withStoredRecipients(ctx, homeKey, thread)
 	chatInfo := nc.chatInfoForThread(ctx, thread)
 	nc.ensurePortal(ctx, homeKey, chatInfo, thread)
 
@@ -741,16 +891,26 @@ func (nc *MyNetworkClient) ensurePortal(ctx context.Context, portalKey networkid
 		})
 		return
 	}
-	if changed {
-		nc.bridge.QueueRemoteEvent(nc.login, &simplevent.ChatInfoChange{
-			EventMeta: simplevent.EventMeta{
-				Type:      bridgev2.RemoteEventChatInfoChange,
-				PortalKey: portalKey,
-				Timestamp: time.Now(),
-			},
-			ChatInfoChange: &bridgev2.ChatInfoChange{ChatInfo: chatInfo},
-		})
+	if !changed {
+		return
 	}
+	if len(thread.Recipients) == 0 {
+		// Never emit a membership reconciliation built from an empty
+		// participant list: a full member list with just the bridge user would
+		// clear the room's members and rename it to "Unknown conversation".
+		nc.log.Warn().
+			Str("portal_id", string(portal.ID)).
+			Msg("No participants known for the thread; not queuing a chat info change")
+		return
+	}
+	nc.bridge.QueueRemoteEvent(nc.login, &simplevent.ChatInfoChange{
+		EventMeta: simplevent.EventMeta{
+			Type:      bridgev2.RemoteEventChatInfoChange,
+			PortalKey: portalKey,
+			Timestamp: time.Now(),
+		},
+		ChatInfoChange: &bridgev2.ChatInfoChange{ChatInfo: chatInfo},
+	})
 }
 
 // portalThreadSnapshot returns the thread identity stored in a portal's
@@ -788,6 +948,27 @@ func (nc *MyNetworkClient) threadRecipients(thread agentapi.Thread) []string {
 	return filterOwnNumbers(thread.Recipients, nil)
 }
 
+// withStoredRecipients backfills a thread's participant list from the portal's
+// stored metadata when the event carries none. The stored participants stay
+// the truth until the phone reports a new list: an event without recipients
+// (the echo of a send, a replayed message) must never be turned into a full
+// membership reconciliation that clears the room's members and name.
+func (nc *MyNetworkClient) withStoredRecipients(ctx context.Context, key networkid.PortalKey, thread agentapi.Thread) agentapi.Thread {
+	if len(thread.Recipients) > 0 || key.ID == "" || nc.bridge == nil {
+		return thread
+	}
+	portal, err := nc.bridge.GetExistingPortalByKey(ctx, key)
+	if err != nil || portal == nil {
+		return thread
+	}
+	meta, _ := portal.Metadata.(*PortalMetadata)
+	if meta == nil || len(meta.Recipients) == 0 {
+		return thread
+	}
+	thread.Recipients = append([]string{}, meta.Recipients...)
+	return thread
+}
+
 // applyPortalThread stores the thread identity and participant set in the
 // portal metadata. It reports whether anything changed.
 func (nc *MyNetworkClient) applyPortalThread(portal *bridgev2.Portal, thread agentapi.Thread) bool {
@@ -800,6 +981,12 @@ func (nc *MyNetworkClient) applyPortalThread(portal *bridgev2.Portal, thread age
 	}
 	changed := false
 	recipients := nc.threadRecipients(thread)
+	if len(recipients) == 0 && len(meta.Recipients) > 0 {
+		// An event without participant information (e.g. the from-me echo of
+		// a send that raced its send.result) must never clear the stored
+		// members: that is what turned rooms into "Unknown conversation".
+		recipients = append([]string{}, meta.Recipients...)
+	}
 	if !stringSlicesEqual(meta.Recipients, recipients) {
 		meta.Recipients = recipients
 		changed = true

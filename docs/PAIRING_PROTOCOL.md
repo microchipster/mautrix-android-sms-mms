@@ -218,6 +218,13 @@ never becomes a ghost user in group rooms.
 - The bridge treats an app-paired login exactly like an adb-agent login at the connector
   layer: same `Message`/`Event` JSON, same portal IDs (`MakePortalID(deviceScope,
   subID, threadID)`), same echo suppression (by `send_id`).
+- The `message.new` echo of a queue-command send carries the command's `send_id` (and its
+  `message_id` once the provider row is known, `""` while `send.result` reports `pending:
+  true`). The bridge tracks the `send_id` when it dispatches the send, so the echo is
+  suppressed whether it or the `send.result` is processed first; a from-me `message.new`
+  without recipients is held briefly while an outbound send is unresolved. An echo (or any
+  event without a usable participant list) never reconciles room membership: the bridge only
+  updates members/name from a non-empty list, so an empty list can never clear a room.
 - `send.result` is authoritative for the send: the app must report `pending: true` when the
   provider row has not been resolved yet (bridge then waits for the matching
   `message.new`).

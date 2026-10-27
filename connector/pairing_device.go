@@ -744,10 +744,13 @@ func (d *pairedDevice) resolveSend(result pairSendResult) bool {
 	return false
 }
 
-// trackPendingSend remembers a send whose phone row has not been resolved
-// yet, so the eventual message.new echo can be suppressed by send_id.
+// trackPendingSend remembers a send the bridge dispatched to the phone, so the
+// app's message.new echo can be suppressed by send_id. The entry is registered
+// when the command is enqueued (not when its send.result arrives), so
+// suppression does not depend on whether the echo or the send.result is
+// processed first.
 func (d *pairedDevice) trackPendingSend(sendID string) {
-	if sendID == "" {
+	if d == nil || sendID == "" {
 		return
 	}
 	d.mu.Lock()
@@ -757,17 +760,37 @@ func (d *pairedDevice) trackPendingSend(sendID string) {
 		d.pendingSends = make(map[string]time.Time)
 	}
 	d.pendingSends[sendID] = now
-	for id, at := range d.pendingSends {
-		if now.Sub(at) > 30*time.Minute {
-			delete(d.pendingSends, id)
-		}
+	d.prunePendingSendsLocked(now)
+}
+
+// hasPendingSend reports whether the send id is still tracked, i.e. its
+// send.result (or the echo that consumes the entry) has not been seen yet.
+func (d *pairedDevice) hasPendingSend(sendID string) bool {
+	if d == nil || sendID == "" {
+		return false
 	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	_, ok := d.pendingSends[sendID]
+	return ok
+}
+
+// hasPendingSends reports whether any dispatched send is still unresolved. A
+// from-me message without recipients can only be the echo of one of those.
+func (d *pairedDevice) hasPendingSends() bool {
+	if d == nil {
+		return false
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.prunePendingSendsLocked(time.Now())
+	return len(d.pendingSends) > 0
 }
 
 // consumePendingSend reports whether the given send_id belongs to a pending
 // outgoing send and removes it from the set.
 func (d *pairedDevice) consumePendingSend(sendID string) bool {
-	if sendID == "" {
+	if d == nil || sendID == "" {
 		return false
 	}
 	d.mu.Lock()
@@ -777,4 +800,14 @@ func (d *pairedDevice) consumePendingSend(sendID string) bool {
 	}
 	delete(d.pendingSends, sendID)
 	return true
+}
+
+// prunePendingSendsLocked drops send ids older than the retention window. The
+// caller must hold the device lock.
+func (d *pairedDevice) prunePendingSendsLocked(now time.Time) {
+	for id, at := range d.pendingSends {
+		if now.Sub(at) > pairingPendingSendRetention {
+			delete(d.pendingSends, id)
+		}
+	}
 }

@@ -100,6 +100,11 @@ func (nc *MyNetworkClient) HandleMatrixMessage(ctx context.Context, msg *bridgev
 	if sendID == "" {
 		sendID = random.String(16)
 	}
+	// Remember the send as soon as it is dispatched: the app's message.new
+	// echo can reach the event loop before the matching send.result is
+	// processed, so the echo suppression must not depend on which of the two
+	// arrives first.
+	nc.trackOutboundSend(sendID)
 	req := SendRequest{
 		SendID:      sendID,
 		ThreadID:    meta.ThreadID,
@@ -197,6 +202,17 @@ func (nc *MyNetworkClient) sendViaDevice(ctx context.Context, req SendRequest) (
 	}, nil
 }
 
+// trackOutboundSend registers a send this bridge is dispatching to the phone,
+// so the app's message.new echo is recognized by send_id no matter whether the
+// echo or the send.result is processed first. Agent-transport sends resolve
+// synchronously and need no such tracking.
+func (nc *MyNetworkClient) trackOutboundSend(sendID string) {
+	if nc.device == nil || sendID == "" {
+		return
+	}
+	nc.device.trackPendingSend(sendID)
+}
+
 // recordOutgoingSend stores the echo-suppression state for a send the phone
 // accepted and returns the message ID the bridge stores in its database.
 func (nc *MyNetworkClient) recordOutgoingSend(resp SendResponse, sendID string) networkid.MessageID {
@@ -205,9 +221,7 @@ func (nc *MyNetworkClient) recordOutgoingSend(resp SendResponse, sendID string) 
 		// The phone row hasn't appeared yet; keep a stable placeholder ID so
 		// the Matrix event can be stored and later deduplicated by send_id.
 		messageID = "pending-" + sendID
-		if nc.device != nil && sendID != "" {
-			nc.device.trackPendingSend(sendID)
-		}
+		nc.trackOutboundSend(sendID)
 	}
 	nc.markSentFromMatrix(networkid.MessageID(resp.MessageID), networkid.MessageID(messageID))
 	return networkid.MessageID(messageID)
@@ -357,6 +371,7 @@ func (nc *MyNetworkClient) sendReactionAsText(ctx context.Context, msg *bridgev2
 		text = fmt.Sprintf("Reacted %s", emoji)
 	}
 	sendID := "reaction-" + random.String(12)
+	nc.trackOutboundSend(sendID)
 	resp, err := nc.sendToPhone(ctx, SendRequest{
 		SendID:     sendID,
 		ThreadID:   meta.ThreadID,
