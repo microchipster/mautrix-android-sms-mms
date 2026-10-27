@@ -56,7 +56,20 @@ type pairedDevice struct {
 	lateResults  map[string]time.Time
 	pendingSends map[string]time.Time
 
+	// Payload fetches requested from the app for events that arrived without
+	// their full message payload (see requestPayload).
+	payloadRequests map[string]*payloadRequest
+
 	runtime *MyNetworkClient
+}
+
+// payloadRequest is one outstanding fetch_message request: the original event,
+// used to mirror the message without media when the app cannot provide the
+// payload, and whether the app already reported that failure.
+type payloadRequest struct {
+	event       remoteEvent
+	requestedAt time.Time
+	unavailable bool
 }
 
 func newPairedDevice(server *pairingServer, deviceID string) *pairedDevice {
@@ -341,6 +354,12 @@ func (d *pairedDevice) healthSnapshot() agentapi.Health {
 func (d *pairedDevice) enqueue(cmd pairCommand) pairCommand {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	return d.enqueueLocked(cmd)
+}
+
+// enqueueLocked appends a command to the queue. The caller must hold the
+// device lock.
+func (d *pairedDevice) enqueueLocked(cmd pairCommand) pairCommand {
 	now := time.Now()
 	d.pruneCommandsLocked(now)
 	d.nextSeq++
@@ -466,6 +485,117 @@ func (d *pairedDevice) waitQueue(ctx context.Context, since int64, deadline time
 			return pairQueueResponse{}, ctx.Err()
 		case <-wake:
 		case <-time.After(remaining):
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Missing message payloads (replayed app events)
+
+// payloadRequestState is the outcome of asking the paired app for the full
+// payload of an event that arrived without one.
+type payloadRequestState int
+
+const (
+	// payloadRequested: a fetch_message command was enqueued now; the app will
+	// push the message with inline parts, so the event must not be mirrored.
+	payloadRequested payloadRequestState = iota
+	// payloadInFlight: the same message was requested before and the app has
+	// not answered yet.
+	payloadInFlight
+	// payloadUnavailable: the app reported that it cannot provide the payload;
+	// the event is mirrored without media (once).
+	payloadUnavailable
+)
+
+// requestPayload enqueues a fetch_message command for a message the app pushed
+// without its payload. It reports whether the request was sent now, is already
+// in flight, or is known to be impossible, so the caller can decide between
+// waiting and mirroring the event without media. The request is remembered per
+// message: it is retried when a replayed event arrives after the answer
+// window (a queue reset or pruning can swallow the command) and forgotten
+// after the retention window.
+func (d *pairedDevice) requestPayload(ev remoteEvent) payloadRequestState {
+	if ev.MessageID == "" {
+		return payloadUnavailable
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	now := time.Now()
+	if d.payloadRequests == nil {
+		d.payloadRequests = make(map[string]*payloadRequest)
+	}
+	d.prunePayloadRequestsLocked(now)
+	request, ok := d.payloadRequests[ev.MessageID]
+	switch {
+	case !ok:
+		d.payloadRequests[ev.MessageID] = &payloadRequest{event: ev, requestedAt: now}
+	case request.unavailable:
+		return payloadUnavailable
+	case now.Sub(request.requestedAt) < pairingPayloadRetryAfter:
+		return payloadInFlight
+	default:
+		request.requestedAt = now
+	}
+	d.enqueueLocked(pairCommand{Type: pairCommandFetchMessage, MessageID: ev.MessageID})
+	return payloadRequested
+}
+
+// failPayload resolves a fetch_message request the app could not satisfy. It
+// returns the original event and whether the fallback still has to be mirrored
+// (false for later failures of the same message).
+func (d *pairedDevice) failPayload(messageID string) (remoteEvent, bool) {
+	if messageID == "" {
+		return remoteEvent{}, false
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.prunePayloadRequestsLocked(time.Now())
+	request := d.payloadRequests[messageID]
+	if request == nil {
+		return remoteEvent{}, false
+	}
+	request.requestedAt = time.Now()
+	if request.unavailable {
+		return remoteEvent{}, false
+	}
+	request.unavailable = true
+	return request.event, true
+}
+
+// clearPayload forgets a fetch_message request whose payload arrived.
+func (d *pairedDevice) clearPayload(messageID string) {
+	if messageID == "" {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.payloadRequests, messageID)
+}
+
+// messageIDForCommandSeq returns the message id of a queued command, so a
+// fetch_message request can still be identified when the app does not echo the
+// message id on its ack (older app versions).
+func (d *pairedDevice) messageIDForCommandSeq(seq int64) string {
+	if seq <= 0 {
+		return ""
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, cmd := range d.commands {
+		if cmd.Seq == seq {
+			return cmd.MessageID
+		}
+	}
+	return ""
+}
+
+// prunePayloadRequestsLocked drops requests older than the retention window.
+// The caller must hold the device lock.
+func (d *pairedDevice) prunePayloadRequestsLocked(now time.Time) {
+	for messageID, request := range d.payloadRequests {
+		if now.Sub(request.requestedAt) > pairingPayloadRequestRetention {
+			delete(d.payloadRequests, messageID)
 		}
 	}
 }

@@ -159,6 +159,34 @@ func bodyFromFileName(fileName string) string {
 	return fileName
 }
 
+// missingMediaMarker names media whose bytes the bridge could not obtain.
+const missingMediaMarker = "[MMS media could not be downloaded"
+
+// noContentBody is the body of a mirrored message that carries neither text
+// nor media. Mirroring such a message instead of failing the conversion keeps
+// a message row, which is what makes later replays deduplicate instead of
+// repeating an error.
+const noContentBody = "[message has no content]"
+
+// missingMediaBody renders the body of a mirrored MMS whose media bytes are
+// unavailable (replayed events without inline parts, unreadable provider rows,
+// oversized parts). The phone's caption is kept and one clear marker names the
+// media that is missing, instead of bridgev2's generic "processing error"
+// notice, which repeats on every replay because a failed conversion stores no
+// message row to deduplicate against.
+func missingMediaBody(caption string, names []string) string {
+	marker := missingMediaMarker
+	if len(names) > 0 {
+		marker += ": " + strings.Join(names, ", ")
+	}
+	marker += "]"
+	caption = strings.TrimSpace(caption)
+	if caption == "" {
+		return marker
+	}
+	return caption + "\n\n" + marker
+}
+
 // attachmentDataURIless base64-encodes attachment bytes for the agent send
 // request, which expects the raw base64 payload without a data: URI prefix.
 func attachmentDataURIless(data []byte) string {

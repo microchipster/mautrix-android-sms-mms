@@ -58,6 +58,20 @@ const (
 	// pairingMaxBodyBytes caps request bodies of the pairing API.
 	pairingMaxBodyBytes = 4 << 20
 
+	// pairCommandFetchMessage asks the app to push a message again with its
+	// full payload (inline MMS part bytes). The bridge sends it when an event
+	// arrives without the payload — for example a replayed state snapshot —
+	// because it cannot fetch parts from a NATed phone itself.
+	pairCommandFetchMessage = "fetch_message"
+	// pairingPayloadRetryAfter is how long a fetch_message waits for an answer
+	// before a replayed event asks again (the command can be skipped by a queue
+	// reset or pruned while the phone is offline).
+	pairingPayloadRetryAfter = 5 * time.Minute
+	// pairingPayloadRequestRetention bounds how long a fetch_message request is
+	// remembered, so replays of the same event do not request (or mirror) it
+	// again in a loop.
+	pairingPayloadRequestRetention = 30 * time.Minute
+
 	// pairingRateLimitMax / pairingRateLimitWindow throttle pairing attempts
 	// per source IP (brute force protection for the 8 character code).
 	pairingRateLimitMax    = 10
@@ -279,8 +293,9 @@ type pairInfoResponse struct {
 // mirror the agent's POST /v1/send body.
 type pairCommand struct {
 	Seq         int64            `json:"seq"`
-	Type        string           `json:"type"` // send_sms, send_mms, mark_read, ping
+	Type        string           `json:"type"` // send_sms, send_mms, mark_read, ping, fetch_message
 	SendID      string           `json:"send_id,omitempty"`
+	MessageID   string           `json:"message_id,omitempty"` // fetch_message only
 	ThreadID    int64            `json:"thread_id,omitempty"`
 	SubID       int              `json:"sub_id,omitempty"`
 	Recipients  []string         `json:"recipients,omitempty"`

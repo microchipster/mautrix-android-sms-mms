@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strconv"
 	"testing"
 	"time"
 
@@ -505,5 +506,155 @@ func TestPairingAckPrunesQueuedCommands(t *testing.T) {
 	}
 	if got := queued(); len(got) != 0 {
 		t.Fatalf("all acked commands should be pruned, got %+v", got)
+	}
+}
+
+// TestPairingFetchMessageCommandOnWire covers the replay repair command: when
+// the app pushes an event without the message payload, the bridge asks for the
+// message again, and the request carries the message id on the wire.
+func TestPairingFetchMessageCommandOnWire(t *testing.T) {
+	server, httpServer := newTestPairingServerHTTP(t)
+	device := newTestPairedDevice(t, server, "android-fetch", "fetch-token")
+
+	state := device.requestPayload(remoteEvent{
+		Event: agentapi.Event{
+			Type: "message.new", MessageID: "mms:1:534", ThreadID: 12, SubID: 1,
+			IsMMS: true, HasAttachment: true, Preview: "look",
+		},
+	})
+	if state != payloadRequested {
+		t.Fatalf("requestPayload() = %v, want payloadRequested", state)
+	}
+
+	req := pairAuthorizedRequest(t, http.MethodGet, httpServer.URL+"/_smsmms/v1/queue?since=0&wait_ms=0", "fetch-token", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("queue request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	var raw struct {
+		Commands []map[string]any `json:"commands"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		t.Fatalf("failed to decode queue response: %v", err)
+	}
+	if len(raw.Commands) != 1 {
+		t.Fatalf("expected one command, got %+v", raw.Commands)
+	}
+	command := raw.Commands[0]
+	if command["type"] != "fetch_message" || command["message_id"] != "mms:1:534" {
+		t.Fatalf("unexpected wire command: %+v", command)
+	}
+	if _, hasSeq := command["seq"]; !hasSeq {
+		t.Fatalf("wire command without a sequence: %+v", command)
+	}
+	if _, hasThread := command["thread_id"]; hasThread {
+		t.Fatalf("fetch_message must stay lean, got %+v", command)
+	}
+}
+
+// TestPairingFetchMessageFailureMarksPayloadUnavailable covers the fallback
+// path of a failed fetch_message: the ack error (with the message id) resolves
+// the request so the bridge mirrors the event without media exactly once.
+func TestPairingFetchMessageFailureMarksPayloadUnavailable(t *testing.T) {
+	server, httpServer := newTestPairingServerHTTP(t)
+	device := newTestPairedDevice(t, server, "android-fetch-fail", "fetch-fail-token")
+
+	original := remoteEvent{
+		Event: agentapi.Event{
+			Type: "message.new", MessageID: "mms:1:534", ThreadID: 12, SubID: 1,
+			IsMMS: true, HasAttachment: true, Preview: "look",
+		},
+	}
+	if state := device.requestPayload(original); state != payloadRequested {
+		t.Fatalf("requestPayload() = %v, want payloadRequested", state)
+	}
+
+	body := pairEventsRequest{
+		DeviceID: "android-fetch-fail",
+		Events: []remoteEvent{{
+			Event: agentapi.Event{Type: "ack", MessageID: "mms:1:534", SendID: "ack-1", ThreadID: 12, SubID: 1},
+			Error: &remoteEventError{Code: "not_found", Message: "message mms:1:534 is not available"},
+		}},
+	}
+	status, data := pairPostJSONAuth(t, httpServer.URL+"/_smsmms/v1/events", "fetch-fail-token", body)
+	if status != http.StatusOK {
+		t.Fatalf("fetch failure ack status = %d (%s)", status, data)
+	}
+
+	// The ack error resolved the request, so the runtime mirrors the fallback
+	// once and later replays see the message as unavailable.
+	event, first := device.failPayload("mms:1:534")
+	if first {
+		t.Fatal("the failure ack should already have resolved the payload request")
+	}
+	if event.MessageID != "" {
+		t.Fatalf("resolved request returned an event again: %+v", event)
+	}
+
+	// A message payload arriving for a requested message clears the request.
+	if state := device.requestPayload(remoteEvent{
+		Event: agentapi.Event{Type: "message.new", MessageID: "mms:1:535", ThreadID: 12, SubID: 1, HasAttachment: true},
+	}); state != payloadRequested {
+		t.Fatalf("requestPayload() = %v, want payloadRequested", state)
+	}
+	message := agentapi.Message{ID: "mms:1:535", ThreadID: 12, SubID: 1, TimestampMS: 1792749554448, Sender: "+15551234567", IsMMS: true}
+	status, data = pairPostJSONAuth(t, httpServer.URL+"/_smsmms/v1/events", "fetch-fail-token", pairEventsRequest{
+		DeviceID: "android-fetch-fail",
+		Events: []remoteEvent{{
+			Event:   agentapi.Event{Seq: 2, Type: "message.new", MessageID: "mms:1:535", ThreadID: 12, SubID: 1},
+			Message: &message,
+		}},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("payload events status = %d (%s)", status, data)
+	}
+	device.mu.Lock()
+	_, stillTracked := device.payloadRequests["mms:1:535"]
+	device.mu.Unlock()
+	if stillTracked {
+		t.Fatal("a delivered message payload should clear its fetch_message request")
+	}
+}
+
+// TestPairingFetchMessageFailureWithoutMessageIDResolves covers an app version
+// that predates fetch_message: it rejects the unknown command without echoing
+// the message id, so the bridge must recover the request from the acknowledged
+// command sequence and mirror the event without media instead of losing it.
+func TestPairingFetchMessageFailureWithoutMessageIDResolves(t *testing.T) {
+	server, httpServer := newTestPairingServerHTTP(t)
+	device := newTestPairedDevice(t, server, "android-fetch-old", "fetch-old-token")
+
+	if state := device.requestPayload(remoteEvent{
+		Event: agentapi.Event{Type: "message.new", MessageID: "mms:1:534", ThreadID: 12, SubID: 1, HasAttachment: true},
+	}); state != payloadRequested {
+		t.Fatalf("requestPayload() = %v, want payloadRequested", state)
+	}
+	device.mu.Lock()
+	commandSeq := device.commands[0].Seq
+	device.mu.Unlock()
+
+	body := pairEventsRequest{
+		DeviceID: "android-fetch-old",
+		Events: []remoteEvent{{
+			Event: agentapi.Event{
+				Type:     "ack",
+				SendID:   "ack-" + strconv.FormatInt(commandSeq, 10),
+				ThreadID: 12,
+				SubID:    1,
+			},
+			CommandSeq: commandSeq,
+			Error:      &remoteEventError{Code: "unsupported", Message: "unknown command type 'fetch_message'"},
+		}},
+	}
+	status, data := pairPostJSONAuth(t, httpServer.URL+"/_smsmms/v1/events", "fetch-old-token", body)
+	if status != http.StatusOK {
+		t.Fatalf("old app ack status = %d (%s)", status, data)
+	}
+	if _, first := device.failPayload("mms:1:534"); first {
+		t.Fatal("the rejected fetch request should be resolved without a message id")
+	}
+	if got := device.messageIDForCommandSeq(commandSeq); got != "" {
+		t.Fatalf("the acknowledged command should be pruned, got %q", got)
 	}
 }

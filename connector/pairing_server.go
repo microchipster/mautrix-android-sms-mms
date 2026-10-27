@@ -609,9 +609,9 @@ func (s *pairingServer) handleEvents(w http.ResponseWriter, r *http.Request) {
 		}
 		if ev.Type == "ack" {
 			// The app acknowledges commands whose result is not covered by
-			// send.result (mark_read, ping). Acks for commands without a
-			// send id carry `ack-<seq>`; prune both ways so acked commands
-			// cannot be re-delivered after a reconnect.
+			// send.result (mark_read, ping, fetch_message). Acks for commands
+			// without a send id carry `ack-<seq>`; prune both ways so acked
+			// commands cannot be re-delivered after a reconnect.
 			if ev.Error != nil {
 				s.log.Warn().
 					Str("device_id", device.deviceID).
@@ -619,12 +619,33 @@ func (s *pairingServer) handleEvents(w http.ResponseWriter, r *http.Request) {
 					Str("error", ev.Error.Code).
 					Str("message", ev.Error.Message).
 					Msg("Device reported a command failure")
+				// A failed fetch_message must not lose the message: mirror the
+				// original event without media, once. Apps that predate the
+				// command do not echo the message id, so fall back to the
+				// acknowledged command sequence.
+				messageID := ev.MessageID
+				if messageID == "" {
+					messageID = device.messageIDForCommandSeq(ev.CommandSeq)
+				}
+				if messageID == "" {
+					messageID = device.messageIDForCommandSeq(ackCommandSeq(ev.SendID))
+				}
+				if original, first := device.failPayload(messageID); first {
+					if runtime := device.runtimeHandler(); runtime != nil {
+						runtime.mirrorPayloadlessEvent(r.Context(), original)
+					}
+				}
 			}
 			device.removeCommand(ev.SendID)
 			device.removeCommandBySeq(ev.CommandSeq)
 			device.removeCommandBySeq(ackCommandSeq(ev.SendID))
 			accepted++
 			continue
+		}
+		if ev.Message != nil {
+			// A message payload arrived (possibly the answer to a
+			// fetch_message): it can be deduplicated normally from now on.
+			device.clearPayload(ev.MessageID)
 		}
 		if device.pushEvent(ev) {
 			accepted++

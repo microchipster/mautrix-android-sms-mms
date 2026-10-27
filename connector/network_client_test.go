@@ -263,8 +263,13 @@ func TestBuildConvertedMessageMissingPartFallsBackToText(t *testing.T) {
 	if len(converted.Parts) != 1 || converted.Parts[0].Content.MsgType != event.MsgText {
 		t.Fatalf("expected text fallback, got %+v", converted.Parts[0])
 	}
-	if converted.Parts[0].Content.Body != "text survives" {
-		t.Fatalf("fallback body = %q, want the original text", converted.Parts[0].Content.Body)
+	want := "text survives\n\n[MMS media could not be downloaded: photo.jpg]"
+	if converted.Parts[0].Content.Body != want {
+		t.Fatalf("fallback body = %q, want %q", converted.Parts[0].Content.Body, want)
+	}
+	meta, _ := converted.Parts[0].DBMetadata.(*MessageMetadata)
+	if meta == nil || meta.Body != want {
+		t.Fatalf("fallback metadata = %+v", meta)
 	}
 }
 
@@ -432,7 +437,9 @@ func TestBuildConvertedMessageSkipsUnreadablePart(t *testing.T) {
 }
 
 // TestBuildConvertedMessageAllPartsUnreadable covers an MMS whose bytes cannot
-// be obtained at all: the text fallback must still produce a usable event.
+// be obtained at all: the fallback must keep the message and name the missing
+// media, instead of failing the conversion (which would make bridgev2 post a
+// "processing error" notice again on every replay).
 func TestBuildConvertedMessageAllPartsUnreadable(t *testing.T) {
 	t.Parallel()
 	nc := newMediaTestClient(t, false)
@@ -449,18 +456,147 @@ func TestBuildConvertedMessageAllPartsUnreadable(t *testing.T) {
 	if len(converted.Parts) != 1 || converted.Parts[0].Content.MsgType != event.MsgText {
 		t.Fatalf("expected a text fallback, got %+v", converted.Parts)
 	}
-	if converted.Parts[0].Content.Body != "[MMS attachment could not be downloaded]" {
-		t.Fatalf("fallback body = %q", converted.Parts[0].Content.Body)
+	want := "[MMS media could not be downloaded: one.jpg, two.png]"
+	if converted.Parts[0].Content.Body != want {
+		t.Fatalf("fallback body = %q, want %q", converted.Parts[0].Content.Body, want)
 	}
 }
 
-func TestBuildConvertedMessageNoContentErrors(t *testing.T) {
+// TestBuildConvertedMessageNoContentMirrorsInsteadOfFailing is a regression test
+// for replayed media events: a message without text or media must still produce
+// a part, because a conversion error stores no message row and therefore makes
+// bridgev2 repeat its generic error notice on every replay.
+func TestBuildConvertedMessageNoContentMirrorsInsteadOfFailing(t *testing.T) {
 	t.Parallel()
 	nc := newMediaTestClient(t, false)
-	if _, err := nc.buildConvertedMessage(context.Background(), testPortal(), &fakeMediaIntent{}, agentapi.Message{
+	converted, err := nc.buildConvertedMessage(context.Background(), testPortal(), &fakeMediaIntent{}, agentapi.Message{
 		ID: "sms:1:99", ThreadID: 12,
-	}); err == nil {
-		t.Fatal("expected an error for a message without content")
+	})
+	if err != nil {
+		t.Fatalf("buildConvertedMessage() error: %v", err)
+	}
+	if len(converted.Parts) != 1 || converted.Parts[0].Content.MsgType != event.MsgText || converted.Parts[0].Content.Body != noContentBody {
+		t.Fatalf("unexpected fallback: %+v", converted.Parts[0].Content)
+	}
+	meta, _ := converted.Parts[0].DBMetadata.(*MessageMetadata)
+	if meta == nil || meta.Body != noContentBody {
+		t.Fatalf("unexpected metadata: %+v", meta)
+	}
+}
+
+// TestMissingMediaBody covers the single clear marker used when MMS media could
+// not be downloaded: the caption is kept, never replaced.
+func TestMissingMediaBody(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		caption string
+		names   []string
+		want    string
+	}{
+		{"caption and names", "look", []string{"one.jpg", "two.png"}, "look\n\n[MMS media could not be downloaded: one.jpg, two.png]"},
+		{"caption only", "look", nil, "look\n\n[MMS media could not be downloaded]"},
+		{"names only", "", []string{"one.jpg"}, "[MMS media could not be downloaded: one.jpg]"},
+		{"nothing known", "  ", nil, "[MMS media could not be downloaded]"},
+	}
+	for _, test := range tests {
+		if got := missingMediaBody(test.caption, test.names); got != test.want {
+			t.Errorf("%s: missingMediaBody(%q, %v) = %q, want %q", test.name, test.caption, test.names, got, test.want)
+		}
+	}
+}
+
+// TestSyntheticMessageFromEvent covers the fallback payload for app events that
+// arrive without their message: the preview is kept and a media marker is added
+// only when the phone reported an attachment the bridge did not receive.
+func TestSyntheticMessageFromEvent(t *testing.T) {
+	t.Parallel()
+	plain := syntheticMessageFromEvent(remoteEvent{
+		Event: agentapi.Event{Type: "message.new", MessageID: "sms:1:7", ThreadID: 3, SubID: 1, Sender: "+15551234567", Preview: "hi"},
+	})
+	if plain.Body != "hi" || plain.ID != "sms:1:7" || plain.Sender != "+15551234567" {
+		t.Fatalf("unexpected synthetic message: %+v", plain)
+	}
+
+	media := syntheticMessageFromEvent(remoteEvent{
+		Event: agentapi.Event{Type: "message.new", MessageID: "mms:1:534", ThreadID: 12, SubID: 1, IsMMS: true, HasAttachment: true, Preview: "look"},
+	})
+	if media.Body != "look\n\n[MMS media could not be downloaded]" {
+		t.Fatalf("synthetic media body = %q", media.Body)
+	}
+
+	mediaNoCaption := syntheticMessageFromEvent(remoteEvent{
+		Event: agentapi.Event{Type: "message.new", MessageID: "mms:1:535", ThreadID: 12, SubID: 1, IsMMS: true, HasAttachment: true},
+	})
+	if mediaNoCaption.Body != "[MMS media could not be downloaded]" {
+		t.Fatalf("synthetic media body without caption = %q", mediaNoCaption.Body)
+	}
+}
+
+// TestHandlePayloadlessEventRequestsPayload covers the replay path: an event
+// without a payload that reports media makes the bridge ask the app for the
+// message instead of mirroring a media-less copy. Repeated events do not queue
+// a second request while one is in flight, a request that was never answered is
+// retried later (a queue reset can swallow the command), and a request the app
+// rejected stays resolved.
+func TestHandlePayloadlessEventRequestsPayload(t *testing.T) {
+	t.Parallel()
+	device := newPairedDevice(nil, "android-payload")
+	nc := &MyNetworkClient{log: zerolog.Nop(), device: device}
+	ev := remoteEvent{
+		Event: agentapi.Event{
+			Type: "message.new", MessageID: "mms:1:534", ThreadID: 12, SubID: 1,
+			IsMMS: true, HasAttachment: true, Preview: "look",
+		},
+	}
+
+	nc.handlePayloadlessEvent(context.Background(), ev)
+
+	device.mu.Lock()
+	commands := append([]pairCommand(nil), device.commands...)
+	device.mu.Unlock()
+	if len(commands) != 1 || commands[0].Type != "fetch_message" || commands[0].MessageID != "mms:1:534" {
+		t.Fatalf("expected one fetch_message command, got %+v", commands)
+	}
+
+	// A replayed event for the same message must not queue another request.
+	nc.handlePayloadlessEvent(context.Background(), ev)
+	device.mu.Lock()
+	count := len(device.commands)
+	device.mu.Unlock()
+	if count != 1 {
+		t.Fatalf("duplicate replay queued another command: %d commands", count)
+	}
+
+	// A replay after the retry window asks again: a queue reset can swallow the
+	// pending command, so the request must not wait forever.
+	device.mu.Lock()
+	device.payloadRequests["mms:1:534"].requestedAt = time.Now().Add(-2 * pairingPayloadRetryAfter)
+	device.mu.Unlock()
+	if state := nc.device.requestPayload(ev); state != payloadRequested {
+		t.Fatalf("stale requestPayload() = %v, want payloadRequested", state)
+	}
+
+	// Once the app reports that it cannot provide the payload, the request is
+	// resolved as unavailable exactly once.
+	if _, first := device.failPayload("mms:1:534"); !first {
+		t.Fatal("first failPayload() call should return the event to mirror")
+	}
+	if _, first := device.failPayload("mms:1:534"); first {
+		t.Fatal("second failPayload() call should not mirror the event again")
+	}
+	if state := nc.device.requestPayload(ev); state != payloadUnavailable {
+		t.Fatalf("requestPayload() after a failure = %v, want payloadUnavailable", state)
+	}
+
+	// The message payload of an unrelated (or already answered) request is a
+	// no-op.
+	device.clearPayload("mms:1:534")
+	if _, first := device.failPayload("mms:1:534"); first {
+		t.Fatal("cleared payload request must not resurface")
+	}
+	if got := nc.device.requestPayload(remoteEvent{Event: agentapi.Event{MessageID: ""}}); got != payloadUnavailable {
+		t.Fatalf("requestPayload without a message id = %v, want payloadUnavailable", got)
 	}
 }
 

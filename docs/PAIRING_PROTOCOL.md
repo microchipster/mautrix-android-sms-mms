@@ -114,11 +114,17 @@ Long-poll for work. `wait_ms` capped at 30000. Response:
   {"seq": 42, "type": "send_mms", "send_id": "…", "sub_id": 1,
    "recipients": ["+15551234567", "+15557654321"], "text": "hi all",
    "attachments": [{"content_type": "image/jpeg", "file_name": "photo.jpg", "base64": "…"}]},
-  {"seq": 43, "type": "mark_read", "thread_id": 12, "up_to_ms": 1792753000000}
+  {"seq": 43, "type": "mark_read", "thread_id": 12, "up_to_ms": 1792753000000},
+  {"seq": 44, "type": "fetch_message", "message_id": "mms:1:534"}
 ]}
 ```
 Command types mirror the agent's send API: `send_sms`/`send_mms` (same fields as
 `POST /v1/send` in `docs/AGENT_API.md`), `mark_read` (same as `POST /v1/read`), `ping`.
+`fetch_message` asks the app to push the given message again as a `message.new` event
+with its full payload and inline parts (see below); it is sent when an event arrived
+without that payload. The app must tolerate the same message being requested more than
+once (the bridge retries when an answer does not arrive, for example after a queue reset
+swallowed the command).
 `reset: true` means the cursor is too old — the app must re-send its current state via
 `events` and continue from the returned cursor.
 
@@ -140,7 +146,8 @@ then matches the portal by thread id instead of rebuilding the device-scoped por
 Other events: `send.result` (outcome for a queue command: `{send_id, message_id, thread_id,
 parts_sent, pending}` or `{send_id, error: {code, message}}`) and `ack` (a non-send queue
 command was handled: `{seq, type: "ack", send_id: "ack-<command_seq>", command_seq, thread_id, sub_id,
-timestamp_ms}` plus an optional `error: {code, message}`; `command_seq` is optional and
+timestamp_ms}` plus an optional `error: {code, message}` and, for a failed `fetch_message`,
+the `message_id` of the command; `command_seq` is optional and
 carries the acknowledged command's queue sequence). An `ack` removes the matching
 queued command (`send_id`, the `ack-<seq>` suffix, or `command_seq` when present) so it is
 never redelivered;
@@ -157,6 +164,19 @@ does the opposite — it leaves `base64` empty and serves bytes via
 falls back to that endpoint otherwise. Keep inline data within the cap in §5 (`unsupported`
 beyond it); prefer to omit oversized attachments (text-only delivery) over failing the
 whole `events` batch.
+
+Replayed events (the state snapshot used for `reset: true` and startup catch-up) do **not**
+carry the message payload: re-sending every recent message with inline bytes would exceed
+the request size cap and waste phone bandwidth. When such an event says `has_attachment:
+true` and the bridge does not have the message yet, it asks the app for the payload with a
+`fetch_message` queue command instead of bridging a media-less copy. The app answers by
+pushing the message as a `message.new` event with the payload and inline parts, then an
+`ack` for the command. When the app cannot provide the payload (for example the message or
+part is gone), it must `ack` with an `error` and the `message_id` of the command: the bridge
+then mirrors the event once without media, keeping the caption/preview and adding a single
+`[MMS media could not be downloaded: …]` marker. The same marker replaces media that is
+unreadable or oversized, so a message is never mirrored twice and no repeated "processing
+error" notice is posted.
 
 ### `POST /_smsmms/v1/heartbeat` (Bearer)
 ```json
@@ -191,6 +211,10 @@ never becomes a ghost user in group rooms.
   rejects larger sends with `unsupported`). For incoming media on the app transport the same
   cap applies to `attachments[].base64` in `message.new`; oversized parts should be omitted
   rather than failing the batch.
+- Pairing API request bodies are capped at 4 MiB (`pairingMaxBodyBytes`). The app must split
+  an `events` batch that would exceed the cap into several requests; a `fetch_message` whose
+  payload cannot fit is answered with an `ack` error instead, and the bridge mirrors the
+  message without media.
 
 ## 6. Bridge-side storage
 

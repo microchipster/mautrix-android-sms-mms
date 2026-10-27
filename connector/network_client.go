@@ -283,7 +283,7 @@ func (nc *MyNetworkClient) handleRemoteEvent(ctx context.Context, ev remoteEvent
 		case ev.Message != nil:
 			nc.bridgeRemoteMessage(ctx, *ev.Message, ev.SendID)
 		case nc.device != nil:
-			nc.bridgeRemoteMessage(ctx, syntheticMessageFromEvent(ev), ev.SendID)
+			nc.handlePayloadlessEvent(ctx, ev)
 		default:
 			nc.handleAgentMessage(ctx, ev.MessageID)
 		}
@@ -305,9 +305,70 @@ func (nc *MyNetworkClient) handleRemoteEvent(ctx context.Context, ev remoteEvent
 	}
 }
 
+// handlePayloadlessEvent mirrors an app event that arrived without its full
+// message payload. App transports replay recent provider state without media
+// bytes (startup gap snapshots, `reset: true` re-syncs, ring-buffer overflows),
+// and the bridge cannot fetch MMS parts from a NATed phone. Media-bearing
+// messages are therefore fetched from the app (fetch_message) before they are
+// bridged: mirroring them text-only would drop the media for good, because the
+// text-only message row would deduplicate the later payload.
+func (nc *MyNetworkClient) handlePayloadlessEvent(ctx context.Context, ev remoteEvent) {
+	if ev.HasAttachment {
+		if nc.hasBridgedMessage(ctx, ev) {
+			nc.log.Debug().
+				Str("message_id", ev.MessageID).
+				Msg("Ignoring replayed event for a message that is already bridged")
+			return
+		}
+		switch nc.device.requestPayload(ev) {
+		case payloadRequested:
+			nc.log.Info().
+				Str("message_id", ev.MessageID).
+				Msg("Event arrived without its payload; asking the paired app for the message with inline parts")
+			return
+		case payloadInFlight:
+			nc.log.Debug().
+				Str("message_id", ev.MessageID).
+				Msg("Payload of the replayed event is still on its way from the paired app")
+			return
+		case payloadUnavailable:
+			// Fall through: mirror the event without media.
+		}
+	}
+	nc.mirrorPayloadlessEvent(ctx, ev)
+}
+
+// mirrorPayloadlessEvent bridges an app event whose media bytes are not
+// available, keeping the phone's caption/preview and naming the missing media.
+func (nc *MyNetworkClient) mirrorPayloadlessEvent(ctx context.Context, ev remoteEvent) {
+	nc.bridgeRemoteMessage(ctx, syntheticMessageFromEvent(ev), ev.SendID)
+}
+
+// hasBridgedMessage reports whether the bridge already stored this phone
+// message, so replayed events for it do not trigger another payload fetch.
+func (nc *MyNetworkClient) hasBridgedMessage(ctx context.Context, ev remoteEvent) bool {
+	if nc.bridge == nil || ev.MessageID == "" {
+		return false
+	}
+	// Portal keys carry no receiver in this bridge (split portals are off), so
+	// the receiver is the empty login ID bridgev2 itself deduplicates with.
+	receiver := nc.portalKeyFor(ev.ThreadID, ev.SubID).Receiver
+	parts, err := nc.bridge.DB.Message.GetAllPartsByID(ctx, receiver, networkid.MessageID(ev.MessageID))
+	if err != nil {
+		nc.log.Debug().Err(err).Str("message_id", ev.MessageID).Msg("Failed to check for an already bridged message")
+		return false
+	}
+	return len(parts) > 0
+}
+
 // syntheticMessageFromEvent builds a minimal Message when the app pushes an
-// event without the full message payload. The body falls back to the preview.
+// event without the full message payload. The body falls back to the preview,
+// plus a clear marker when the phone reported media the bridge did not get.
 func syntheticMessageFromEvent(ev remoteEvent) agentapi.Message {
+	body := ev.Preview
+	if ev.HasAttachment {
+		body = missingMediaBody(body, nil)
+	}
 	msg := agentapi.Message{
 		ID:          ev.MessageID,
 		ThreadID:    ev.ThreadID,
@@ -315,7 +376,7 @@ func syntheticMessageFromEvent(ev remoteEvent) agentapi.Message {
 		TimestampMS: ev.TimestampMS,
 		Sender:      ev.Sender,
 		IsMMS:       ev.IsMMS,
-		Body:        ev.Preview,
+		Body:        body,
 	}
 	if ev.Recipients != nil {
 		msg.Recipients = ev.Recipients
@@ -889,7 +950,12 @@ func (nc *MyNetworkClient) buildConvertedMessage(ctx context.Context, portal *br
 	dbMeta := &MessageMetadata{Body: body, HasAttachment: len(msg.Attachments) > 0}
 	if len(msg.Attachments) == 0 {
 		if body == "" {
-			return nil, fmt.Errorf("message %s has no content", msg.ID)
+			// Never fail the conversion for a content-less message: bridgev2
+			// answers a conversion error with a "processing error" notice, and
+			// because no message row is stored, every replay of the event
+			// posts that notice again.
+			body = noContentBody
+			dbMeta.Body = body
 		}
 		return &bridgev2.ConvertedMessage{Parts: []*bridgev2.ConvertedMessagePart{{
 			Type:       event.EventMessage,
@@ -901,6 +967,7 @@ func (nc *MyNetworkClient) buildConvertedMessage(ctx context.Context, portal *br
 	mmsID := mmsRowID(msg.ID)
 	parts := make([]*bridgev2.ConvertedMessagePart, 0, len(msg.Attachments))
 	attachmentNames := make([]string, 0, len(msg.Attachments))
+	missingNames := make([]string, 0, len(msg.Attachments))
 	bodyAssigned := false
 	for _, attachment := range msg.Attachments {
 		fileName := attachmentFileName(attachment)
@@ -910,9 +977,11 @@ func (nc *MyNetworkClient) buildConvertedMessage(ctx context.Context, portal *br
 				Str("message_id", msg.ID).
 				Int64("part_id", attachment.PartID).
 				Msg("Failed to obtain MMS attachment; skipping")
+			missingNames = append(missingNames, fileName)
 			continue
 		}
 		if len(data) == 0 {
+			missingNames = append(missingNames, fileName)
 			continue
 		}
 		attachmentNames = append(attachmentNames, fileName)
@@ -930,6 +999,7 @@ func (nc *MyNetworkClient) buildConvertedMessage(ctx context.Context, portal *br
 		mxc, encryptedFile, info, err := uploadAttachmentData(ctx, intent, portal.MXID, data, fileName, contentType)
 		if err != nil {
 			nc.log.Warn().Err(err).Str("message_id", msg.ID).Msg("Failed to upload MMS part to Matrix; skipping attachment")
+			missingNames = append(missingNames, fileName)
 			continue
 		}
 		part := &bridgev2.ConvertedMessagePart{
@@ -950,14 +1020,11 @@ func (nc *MyNetworkClient) buildConvertedMessage(ctx context.Context, portal *br
 	}
 
 	if len(parts) == 0 {
-		fallback := body
-		if fallback == "" {
-			if len(attachmentNames) > 0 {
-				fallback = strings.Join(attachmentNames, ", ")
-			} else {
-				fallback = "[MMS attachment could not be downloaded]"
-			}
-		}
+		// Nothing came through: mirror the phone's text (or the attachment
+		// names) with one clear marker for the missing media instead of
+		// failing, which would only produce a repeating error notice.
+		fallback := missingMediaBody(body, missingNames)
+		dbMeta.Body = fallback
 		return &bridgev2.ConvertedMessage{Parts: []*bridgev2.ConvertedMessagePart{{
 			Type:       event.EventMessage,
 			Content:    &event.MessageEventContent{MsgType: event.MsgText, Body: fallback},
