@@ -187,6 +187,7 @@ docker build -t mautrix-android-sms-mms .   # container image
 - [`docs/AGENT_API.md`](docs/AGENT_API.md) — HTTP API contract both transports implement.
 - [`docs/carrier-scoped-stats.md`](docs/carrier-scoped-stats.md) — `!sms stats`, carrier/SIM aggregation and ad-hoc SQL views.
 - [`docs/caller-id-and-labels.md`](docs/caller-id-and-labels.md) — what caller info SMS has, labels, new-contact tagging and anti-spam.
+- [`docs/anti-spam.md`](docs/anti-spam.md) — local anti-spam gate: unknown-sender policy, scoring, URL analysis, duplicates, `spam` commands.
 - [`docs/history-ttl.md`](docs/history-ttl.md) — Matrix history retention: config schema, pattern presets and cleanup behavior.
 - [`docs/merged-chats.md`](docs/merged-chats.md) — merging fractured conversations: registry, routing, tombstones and validation.
 - [`docs/testing-e2e-local.md`](docs/testing-e2e-local.md) — local end-to-end test runbook.
