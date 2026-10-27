@@ -88,6 +88,15 @@ while IFS='|' read -r thread_id _count; do
 	fi
 	mapfile -t numbers <"$WORK/participants"
 
+	# Exact resolution first: the bridge channel id ends in the telephony
+	# thread id, so it cannot be confused with another bridge's room that
+	# merely names the same numbers (e.g. a jmpchat portal).
+	mapfile -t channel_rooms < <(portal_rooms_for_thread_channel "$thread_id" "${numbers[@]}")
+	if [ "${#channel_rooms[@]}" -gt 1 ]; then
+		fail "thread $thread_id: channel id ending -$thread_id maps to several rooms: ${channel_rooms[*]}"
+	fi
+	channel_room="${channel_rooms[0]:-}"
+
 	: >"$WORK/candidates.tsv"
 	for n in "${numbers[@]}"; do
 		room_ids_matching_name "$n" >>"$WORK/candidates.tsv" 2>/dev/null || true
@@ -117,25 +126,31 @@ while IFS='|' read -r thread_id _count; do
 		pass "thread $thread_id: channel ids unique across $(wc -l <"$WORK/ch.tsv" | tr -d ' ') candidate(s)"
 	fi
 
-	# Participant coverage: strict=all, else at least one.
-	best_room=""
+	# Participant coverage: strict=all, else at least one. A channel match is
+	# authoritative; the name scan is the fallback for portals whose m.bridge
+	# event is not readable.
+	best_room="$channel_room"
 	best_covered=0
-	while IFS=$'\t' read -r room _chan disp name; do
-		[ -n "$room" ] || continue
-		covered=0
-		for n in "${numbers[@]}"; do
-			d="$(digits "$n")"
-			hay="$(digits "$disp$name")"
-			[[ "$hay" == *"$d"* ]] && covered=$((covered + 1))
-		done
-		if [ "$covered" -gt "$best_covered" ]; then
-			best_covered="$covered"
-			best_room="$room"
-		fi
-	done <"$WORK/ch.tsv"
+	if [ -z "$best_room" ]; then
+		while IFS=$'\t' read -r room _chan disp name; do
+			[ -n "$room" ] || continue
+			covered=0
+			for n in "${numbers[@]}"; do
+				d="$(digits "$n")"
+				hay="$(digits "$disp$name")"
+				[[ "$hay" == *"$d"* ]] && covered=$((covered + 1))
+			done
+			if [ "$covered" -gt "$best_covered" ]; then
+				best_covered="$covered"
+				best_room="$room"
+			fi
+		done <"$WORK/ch.tsv"
+	fi
 
 	want_all="${#numbers[@]}"
-	if [ "$best_covered" -ge "$want_all" ]; then
+	if [ -n "$channel_room" ]; then
+		pass "thread $thread_id: portal $channel_room is the channel match for thread $thread_id"
+	elif [ "$best_covered" -ge "$want_all" ]; then
 		pass "thread $thread_id: portal $best_room covers all $want_all participants"
 	elif [ "$PORTAL_STRICT_PARTICIPANTS" = "1" ]; then
 		fail "thread $thread_id: portal $best_room covers only $best_covered/$want_all participants (${numbers[*]})"

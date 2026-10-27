@@ -96,6 +96,19 @@ for size in 2 3 4; do
 			continue
 		fi
 		mapfile -t numbers <"$WORK/participants"
+
+		# Exact resolution first: the bridge channel id ends in the telephony
+		# thread id, so a combo cannot be mistaken for another bridge's room
+		# that merely names the same numbers.
+		mapfile -t channel_rooms < <(portal_rooms_for_thread_channel "$thread_id" "${numbers[@]}")
+		if [ "${#channel_rooms[@]}" -gt 1 ]; then
+			fail "combo thread $thread_id: channel id ending -$thread_id maps to several rooms: ${channel_rooms[*]}"
+		elif [ "${#channel_rooms[@]}" -eq 1 ]; then
+			saw_candidates=1
+			pass "combo thread $thread_id ($size participants): exactly one portal for the telephony thread (${channel_rooms[0]})"
+			continue
+		fi
+
 		: >"$WORK/candidates.tsv"
 		for n in "${numbers[@]}"; do
 			room_ids_matching_name "$n" >>"$WORK/candidates.tsv" 2>/dev/null || true

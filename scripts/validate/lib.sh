@@ -1133,19 +1133,96 @@ room_member_changes() {
 	iamb_cmd message "$room" 2>/dev/null | jq -c 'select(.type == "m.room.member") | {sender, state_key, membership: .content.membership, origin_server_ts}' 2>/dev/null | tail -n "$lines"
 }
 
+# iamb_session_path — remote path of the iamb profile's session.json (holds the
+# read-only client-server access token; used only inside the IAMB_SSH shell).
+# Override with IAMB_SESSION_FILE for non-default profiles.
+iamb_session_path() {
+	if [ -n "${IAMB_SESSION_FILE:-}" ]; then
+		printf '%s' "$IAMB_SESSION_FILE"
+	else
+		printf '%s' "\$HOME/.local/share/iamb/profiles/$IAMB_PROFILE/session.json"
+	fi
+}
+
+# portal_bridge_content ROOM — print the bridge state content JSON of a portal
+# room (m.bridge or uk.half-shot.bridge, any state key). Read through the
+# Matrix client-server API with the iamb profile's token, because `iamb
+# message` only renders a bounded recent window and drops the room-creation
+# state events once a portal has more timeline events than that window. The
+# token never leaves IAMB_SSH and is never printed. Returns RC_UNREACHABLE
+# when the session or the API is unavailable (callers fall back to iamb).
+portal_bridge_content() {
+	local room="$1" sess enc rc=0 out
+	require_env IAMB_SSH
+	case "$room" in
+	'!'*) ;;
+	*) return "$RC_MISBEHAVING" ;;
+	esac
+	sess="$(iamb_session_path)"
+	enc="$(printf '%s' "$room" | sed 's/!/%21/g')"
+	# The session path stays double-quoted in the remote command so its $HOME
+	# expands on IAMB_SSH; it is not user data (see iamb_session_path).
+	out="$(ssh -n "$IAMB_SSH" "set -e; TOKEN=\$(jq -r .access_token \"$sess\"); HS=\$(jq -r .homeserver \"$sess\"); HS=\${HS%/}; curl -fsS --max-time $CURL_TIMEOUT -H \"Authorization: Bearer \$TOKEN\" \"\$HS/_matrix/client/v3/rooms/$enc/state\"" 2>/dev/null)" || rc=$?
+	if [ "$rc" -ne 0 ]; then
+		return "$RC_UNREACHABLE"
+	fi
+	printf '%s' "$out" | jq -c '.[]? | select(.type == "m.bridge" or .type == "uk.half-shot.bridge") | .content' 2>/dev/null | tail -n 1
+}
+
 # portal_channel_id ROOM — the bridge portal key from the room's `m.bridge`
-# state event (e.g. `thread-<scope>-<sub>-<thread>`). Empty when the event is
-# not in the fetched window (busy rooms).
+# state event (e.g. `thread-<scope>-<sub>-<thread>`). Prefers the client-server
+# state API; falls back to the last `iamb message` window for rooms whose state
+# event is still visible there.
 portal_channel_id() {
-	local room="$1"
+	local room="$1" content
+	content="$(portal_bridge_content "$room" 2>/dev/null || true)"
+	if [ -n "$content" ]; then
+		printf '%s' "$content" | jq -r '.channel.id // empty' 2>/dev/null
+		return 0
+	fi
 	iamb_cmd message "$room" 2>/dev/null | jq -r 'select(.type == "m.bridge" or .type == "uk.half-shot.bridge") | .content.channel.id // empty' 2>/dev/null | tail -n 1
 }
 
 # portal_channel_displayname ROOM — the bridge channel display name (usually
-# the participant list) from `m.bridge`.
+# the participant list) from `m.bridge`. Same API-first strategy as
+# portal_channel_id.
 portal_channel_displayname() {
-	local room="$1"
+	local room="$1" content
+	content="$(portal_bridge_content "$room" 2>/dev/null || true)"
+	if [ -n "$content" ]; then
+		printf '%s' "$content" | jq -r '.channel.displayname // empty' 2>/dev/null
+		return 0
+	fi
 	iamb_cmd message "$room" 2>/dev/null | jq -r 'select(.type == "m.bridge" or .type == "uk.half-shot.bridge") | .content.channel.displayname // empty' 2>/dev/null | tail -n 1
+}
+
+# portal_rooms_for_thread_channel THREAD_ID NUMBER... — print the room id(s)
+# whose bridge channel id belongs to the telephony thread. The connector
+# encodes the thread in the last channel-id segment
+# (`thread-<deviceScope>-<subID>-<threadID>`), which is the exact thread→room
+# relation; name coverage is only a heuristic and can pick a room of another
+# bridge (e.g. a jmpchat portal naming the same numbers) or get truncated by
+# name-based candidate caps. Every room whose display name mentions one of the
+# numbers is inspected, without the plain-name cap, so the real portal cannot
+# be sorted out of the shortlist.
+portal_rooms_for_thread_channel() {
+	local thread_id="$1"
+	shift
+	require_int "THREAD_ID" "$thread_id"
+	local room chan n
+	local -A seen=()
+	for n in "$@"; do
+		while IFS=$'\t' read -r room _name; do
+			[ -n "$room" ] || continue
+			[ -n "${seen[$room]+set}" ] && continue
+			seen[$room]=1
+			chan="$(portal_channel_id "$room" 2>/dev/null || true)"
+			case "$chan" in
+			*-"$thread_id") printf '%s\n' "$room" ;;
+			esac
+		done < <(room_ids_matching_name "$n" 2>/dev/null || true)
+	done
+	return 0
 }
 
 # assert_no_own_number_ghost ROOM OWN_NUMBER — FAIL (RC_MISBEHAVING) when the

@@ -110,12 +110,21 @@ while IFS='|' read -r thread_id participants; do
 	mapfile -t numbers <"$WORK/participants"
 	log "thread $thread_id: ${#numbers[@]} participants: ${numbers[*]}"
 
+	# Exact resolution first: the bridge channel id ends in the telephony
+	# thread id, so it cannot be confused with another bridge's room that
+	# merely names the same numbers.
+	mapfile -t channel_rooms < <(portal_rooms_for_thread_channel "$thread_id" "${numbers[@]}")
+	if [ "${#channel_rooms[@]}" -gt 1 ]; then
+		fail "thread $thread_id: channel id ending -$thread_id maps to several rooms: ${channel_rooms[*]}"
+	fi
+	channel_room="${channel_rooms[0]:-}"
+
 	# Candidate rooms: match on each participant number, then keep the rooms
 	# whose bridge channel display name (or fallback: display name) covers the
 	# whole participant set.
 	: >"$WORK/ch.tsv"
 	candidates_for_numbers "${numbers[@]}" >"$WORK/cand.tsv"
-	best_room=""
+	best_room="$channel_room"
 	have_channel_info=0
 	while IFS=$'\t' read -r room name; do
 		[ -n "$room" ] || continue
@@ -125,6 +134,7 @@ while IFS='|' read -r thread_id participants; do
 		printf '%s\t%s\t%s\t%s\n' "$room" "${chan:-<unknown>}" "$disp" "$name" >>"$WORK/ch.tsv"
 		# Only real bridge portals (m.bridge channel id) count for coverage.
 		[ -n "$chan" ] || continue
+		[ -n "$best_room" ] && continue
 		covers=1
 		for n in "${numbers[@]}"; do
 			d="$(digits "$n")"
