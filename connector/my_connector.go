@@ -28,6 +28,7 @@ type MyConnector struct {
 	bridge  *bridgev2.Bridge
 	config  *SimpleConfig
 	pairing *pairingServer
+	cdn     *CdnService
 
 	ttlMu     sync.Mutex
 	ttlCancel context.CancelFunc
@@ -54,9 +55,10 @@ func (c *MyConnector) pairingServer() *pairingServer {
 }
 
 // StartPairingServer starts the public app pairing API unless it is disabled
-// in the config. Called from the bridge entrypoint after startup.
+// in the config. The listener also serves the CDN file service, so it is kept
+// running (and started) when either feature needs it.
 func (c *MyConnector) StartPairingServer() error {
-	if !c.pairingEnabled() {
+	if !c.pairingEnabled() && c.cdn == nil {
 		c.log.Info().Msg("App pairing API is disabled by configuration")
 		return nil
 	}
@@ -74,6 +76,14 @@ func (c *MyConnector) Init(br *bridgev2.Bridge) {
 	c.pairingServer().log = c.log.With().Str("component", "app-pairing").Logger()
 	if c.config == nil {
 		c.config = NewSimpleConfig()
+	}
+	if cfg := c.cdnConfig(); cfg.Active() {
+		service, err := NewCdnService(c.log, cfg, c.pairingServer().cdnAuthFunc(br))
+		if err != nil {
+			c.log.Error().Err(err).Msg("File service disabled: invalid cdn configuration")
+		} else {
+			c.cdn = service
+		}
 	}
 	c.log.Info().Msg("MyConnector Init called")
 	if !br.Config.PersonalFilteringSpaces {
@@ -98,6 +108,7 @@ func (c *MyConnector) Init(br *bridgev2.Bridge) {
 		proc.AddHandler(CommandMerge)
 		proc.AddHandler(CommandMerges)
 		proc.AddHandler(CommandUnmerge)
+		proc.AddHandler(NewCdnCommand(c.cdn))
 		c.log.Info().Msg("Registered custom commands")
 	} else {
 		c.log.Warn().Msg("Command processor not available for custom commands")
@@ -230,6 +241,9 @@ func (c *MyConnector) Start(ctx context.Context) error {
 		c.log.Warn().Msg("No stored Android SMS/MMS logins found; no agent event feed will be started")
 	}
 	c.startHistoryTTLLoop()
+	if c.cdn != nil {
+		c.cdn.StartGC()
+	}
 	return nil
 }
 
@@ -238,6 +252,9 @@ func (c *MyConnector) Start(ctx context.Context) error {
 func (c *MyConnector) Stop() {
 	c.log.Info().Msg("MyConnector Stop called")
 	c.stopHistoryTTLLoop()
+	if c.cdn != nil {
+		c.cdn.StopGC()
+	}
 	if c.pairing == nil {
 		return
 	}

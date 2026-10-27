@@ -727,6 +727,7 @@ func managementRoomHelpText() string {
 		"- logout [login_id]\n" +
 		"- logout [login_id] purge\n" +
 		"- delete-all-portals yes\n" +
+		"- cdn list | revoke <id> | stats | gc\n" +
 		"\n" +
 		"One Matrix room is maintained per phone thread; participant changes update the room " +
 		"instead of creating a new one. If a phone restore changes thread IDs, use rebind-room " +

@@ -112,6 +112,8 @@ type SimpleConfig struct {
 	HistoryTTL HistoryTTLConfig `yaml:"history_ttl,omitempty"`
 	// Pairing configures the public app pairing API.
 	Pairing PairingConfig `yaml:"pairing,omitempty"`
+	// CDN configures the bridge-hosted encrypted file service.
+	CDN CdnConfig `yaml:"cdn,omitempty"`
 }
 
 // UnmarshalYAML accepts both an inline mapping and a scalar path to a YAML
@@ -164,6 +166,7 @@ func NewSimpleConfig() *SimpleConfig {
 		AutoLabelNewContacts: true,
 		HistoryTTL:           DefaultHistoryTTLConfig(),
 		Pairing:              DefaultPairingConfig(),
+		CDN:                  DefaultCdnConfig(),
 	}
 }
 
@@ -283,6 +286,14 @@ func (c *MyConnector) pairingBridgeURL() string {
 		return public
 	}
 	return c.homeserverPublicURL()
+}
+
+// cdnConfig returns the file service configuration (never nil).
+func (c *MyConnector) cdnConfig() CdnConfig {
+	if c == nil || c.config == nil {
+		return DefaultCdnConfig()
+	}
+	return c.config.CDN
 }
 
 // homeserverPublicURL returns the homeserver address the app should use. The

@@ -301,6 +301,9 @@ type pairCompleteResponse struct {
 	HomeserverURL string         `json:"homeserver_url,omitempty"`
 	Bridge        pairBridgeInfo `json:"bridge"`
 	Queue         pairQueueInfo  `json:"queue"`
+	// CDNBaseURL advertises the bridge-hosted encrypted file service. The app
+	// only offers URL uploads when it is present.
+	CDNBaseURL string `json:"cdn_base_url,omitempty"`
 }
 
 // pairInfoResponse is the GET /_smsmms/v1/info response.
@@ -309,6 +312,7 @@ type pairInfoResponse struct {
 	BridgeName      string `json:"bridge_name"`
 	HomeserverURL   string `json:"homeserver_url,omitempty"`
 	PairingEnabled  bool   `json:"pairing_enabled"`
+	CDNBaseURL      string `json:"cdn_base_url,omitempty"`
 }
 
 // pairCommand is one work item in the bridge -> app queue. The send fields

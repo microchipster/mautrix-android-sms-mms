@@ -81,6 +81,26 @@ func (s *pairingServer) enabled() bool {
 	return s.connector.pairingEnabled()
 }
 
+// cdnAuthFunc maps a paired-device bearer token to its Matrix user, the
+// owner key of file-service requests.
+func (s *pairingServer) cdnAuthFunc(br *bridgev2.Bridge) CdnAuthFunc {
+	return func(r *http.Request) (string, bool) {
+		if br == nil {
+			return "", false
+		}
+		device, perr := s.authenticate(r)
+		if perr != nil {
+			return "", false
+		}
+		login, err := br.GetExistingUserLoginByID(r.Context(),
+			networkid.UserLoginID(stableLoginID(pairingDeviceIDPrefix+device.deviceID)))
+		if err != nil || login == nil || login.User == nil {
+			return "", false
+		}
+		return string(login.User.MXID), true
+	}
+}
+
 // Start binds the listener and serves the pairing API until Stop is called.
 func (s *pairingServer) Start() error {
 	s.lifecycleMu.Lock()
@@ -189,6 +209,9 @@ func (s *pairingServer) Handler() http.Handler {
 	mux.HandleFunc("GET "+pairingPathPrefix+"/queue", s.handleQueue)
 	mux.HandleFunc("POST "+pairingPathPrefix+"/events", s.handleEvents)
 	mux.HandleFunc("POST "+pairingPathPrefix+"/heartbeat", s.handleHeartbeat)
+	if s.connector != nil && s.connector.cdn != nil {
+		s.connector.cdn.Register(mux)
+	}
 	return mux
 }
 
@@ -358,14 +381,19 @@ func (s *pairingServer) devicesForUser(ctx context.Context, br *bridgev2.Bridge,
 
 func (s *pairingServer) handleInfo(w http.ResponseWriter, r *http.Request) {
 	homeserverURL := ""
+	cdnBaseURL := ""
 	if s.connector != nil {
 		homeserverURL = s.connector.homeserverPublicURL()
+		if s.connector.cdn != nil {
+			cdnBaseURL = s.connector.cdn.BaseURL()
+		}
 	}
 	writePairJSON(w, http.StatusOK, pairInfoResponse{
 		ProtocolVersion: pairingProtocolVersion,
 		BridgeName:      "mautrix-android-sms-mms",
 		HomeserverURL:   homeserverURL,
 		PairingEnabled:  s.enabled(),
+		CDNBaseURL:      cdnBaseURL,
 	})
 }
 
@@ -503,11 +531,15 @@ func (s *pairingServer) handlePairComplete(w http.ResponseWriter, r *http.Reques
 
 	bridgeURL := ""
 	homeserverURL := ""
+	cdnBaseURL := ""
 	if s.connector != nil {
 		bridgeURL = s.connector.pairingPublicURL()
 		homeserverURL = s.connector.homeserverPublicURL()
 		if bridgeURL == "" {
 			bridgeURL = homeserverURL
+		}
+		if s.connector.cdn != nil {
+			cdnBaseURL = s.connector.cdn.BaseURL()
 		}
 	}
 	s.log.Info().
@@ -527,7 +559,8 @@ func (s *pairingServer) handlePairComplete(w http.ResponseWriter, r *http.Reques
 			BaseURL:         bridgeURL,
 			ProtocolVersion: pairingProtocolVersion,
 		},
-		Queue: pairQueueInfo{WaitMaxMS: pairingWaitMaxMS},
+		Queue:      pairQueueInfo{WaitMaxMS: pairingWaitMaxMS},
+		CDNBaseURL: cdnBaseURL,
 	})
 }
 
