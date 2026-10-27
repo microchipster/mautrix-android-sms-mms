@@ -570,6 +570,18 @@ func (nc *MyNetworkClient) handleAgentThreadUpdate(ctx context.Context, ev remot
 		portal = fallbackPortal
 		portalKey = fallbackKey
 	}
+	// Merge routing: a thread update for a merged-away portal reconciles the
+	// participant union of the target instead of the tombstoned source room.
+	// For the target itself the union accumulates instead of being replaced.
+	targetPortal, homeKey, routed := nc.resolveMergedPortal(ctx, portalKey)
+	if routed {
+		portal = targetPortal
+		portalKey = homeKey
+		thread = mergeRoutedThread(portalMetadataOf(portal), thread)
+	} else {
+		meta, _ := portal.Metadata.(*PortalMetadata)
+		thread = mergeAccumulateRecipients(meta, thread)
+	}
 	chatInfo := nc.chatInfoForThread(ctx, thread)
 	if nc.applyPortalThread(portal, thread) {
 		if err := portal.Save(ctx); err != nil {
@@ -628,10 +640,18 @@ func (nc *MyNetworkClient) bridgeAgentMessage(ctx context.Context, msg agentapi.
 		return
 	}
 
+	// Merge routing: a portal that was merged away hands its events to the
+	// target room. Replies still get attributed to the original sender ghost;
+	// only the portal (and the participant union) changes.
+	homeKey, targetMeta, routed := nc.mergeRoute(ctx, portalKey)
+
 	// Inbound anti-spam gate: drop messages from blocked contacts and tag the
 	// sender of a first-contact message before the portal is created.
 	if !fromMe {
 		if nc.dropBlockedInbound(ctx, portalKey, msg.Sender) {
+			return
+		}
+		if routed && nc.dropBlockedInbound(ctx, homeKey, msg.Sender) {
 			return
 		}
 	}
@@ -642,21 +662,30 @@ func (nc *MyNetworkClient) bridgeAgentMessage(ctx context.Context, msg agentapi.
 	// regular text typed on the phone.
 	if !fromMe {
 		if tb, ok := parseTapback(msg.Body); ok {
-			if nc.handleIncomingTapback(ctx, portalKey, eventSender.Sender, tb, agentMessageTimestamp(msg)) {
+			searchKeys := []networkid.PortalKey{portalKey}
+			if routed {
+				searchKeys = append(searchKeys, homeKey)
+			}
+			if nc.handleIncomingTapback(ctx, homeKey, searchKeys, eventSender.Sender, tb, agentMessageTimestamp(msg)) {
 				return
 			}
 		}
 	}
 
 	thread := nc.threadForMessage(ctx, msg)
+	if routed {
+		thread = mergeRoutedThread(targetMeta, thread)
+	} else {
+		thread = mergeAccumulateRecipients(targetMeta, thread)
+	}
 	chatInfo := nc.chatInfoForThread(ctx, thread)
-	nc.ensurePortal(ctx, portalKey, chatInfo, thread)
+	nc.ensurePortal(ctx, homeKey, chatInfo, thread)
 
 	timestamp := agentMessageTimestamp(msg)
 	evt := &simplevent.Message[agentapi.Message]{
 		EventMeta: simplevent.EventMeta{
 			Type:      bridgev2.RemoteEventMessage,
-			PortalKey: portalKey,
+			PortalKey: homeKey,
 			Sender:    eventSender,
 			Timestamp: timestamp,
 			PostHandleFunc: func(ctx context.Context, portal *bridgev2.Portal) {
@@ -670,15 +699,16 @@ func (nc *MyNetworkClient) bridgeAgentMessage(ctx context.Context, msg agentapi.
 		},
 	}
 	nc.bridge.QueueRemoteEvent(nc.login, evt)
-	nc.indexMessage(portalKey, indexedMessage{
+	nc.indexMessage(homeKey, indexedMessage{
 		ID:            networkid.MessageID(msg.ID),
 		Body:          msg.Body,
 		HasAttachment: len(msg.Attachments) > 0,
 	})
 	nc.log.Info().
-		Str("portal_id", string(portalKey.ID)).
+		Str("portal_id", string(homeKey.ID)).
 		Str("message_id", msg.ID).
 		Bool("is_from_me", fromMe).
+		Bool("merge_routed", routed).
 		Int("attachment_count", len(msg.Attachments)).
 		Msg("Queued incoming message to Matrix")
 }

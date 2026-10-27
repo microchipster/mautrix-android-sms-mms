@@ -95,6 +95,9 @@ func (c *MyConnector) Init(br *bridgev2.Bridge) {
 		proc.AddHandler(CommandLabel)
 		proc.AddHandler(CommandLabels)
 		proc.AddHandler(CommandTTL)
+		proc.AddHandler(CommandMerge)
+		proc.AddHandler(CommandMerges)
+		proc.AddHandler(CommandUnmerge)
 		c.log.Info().Msg("Registered custom commands")
 	} else {
 		c.log.Warn().Msg("Command processor not available for custom commands")

@@ -42,6 +42,10 @@ func (nc *MyNetworkClient) HandleMatrixMessage(ctx context.Context, msg *bridgev
 			WithSendNotice(true)
 	}
 	meta, _ := msg.Portal.Metadata.(*PortalMetadata)
+	if targetMeta := nc.mergedPortalMetadata(ctx, msg.Portal); targetMeta != nil {
+		// The room was merged away; replies still reach the target thread.
+		meta = targetMeta
+	}
 	if meta == nil || meta.ThreadID == 0 {
 		return nil, bridgev2.WrapErrorInStatus(fmt.Errorf("this room is not linked to a phone thread yet; send a message from the phone first")).
 			WithSendNotice(true)
@@ -327,6 +331,9 @@ func (nc *MyNetworkClient) sendReactionAsText(ctx context.Context, msg *bridgev2
 		return fmt.Errorf("portal is missing")
 	}
 	meta, _ := msg.Portal.Metadata.(*PortalMetadata)
+	if targetMeta := nc.mergedPortalMetadata(ctx, msg.Portal); targetMeta != nil {
+		meta = targetMeta
+	}
 	if meta == nil || meta.ThreadID == 0 {
 		return fmt.Errorf("portal is not linked to a phone thread")
 	}
@@ -463,6 +470,9 @@ func (nc *MyNetworkClient) HandleMatrixReadReceipt(ctx context.Context, msg *bri
 		return nil
 	}
 	meta, _ := msg.Portal.Metadata.(*PortalMetadata)
+	if targetMeta := nc.mergedPortalMetadata(ctx, msg.Portal); targetMeta != nil {
+		meta = targetMeta
+	}
 	if meta == nil || meta.ThreadID == 0 {
 		return nil
 	}

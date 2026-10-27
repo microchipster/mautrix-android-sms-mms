@@ -719,6 +719,9 @@ func managementRoomHelpText() string {
 		"- label <phone> <label|--clear>\n" +
 		"- labels\n" +
 		"- ttl status | ttl run [--dry-run|--apply]\n" +
+		"- merge <room-id> <room-id> [<room-id> ...] [--into <room-id>] [--yes]\n" +
+		"- merges\n" +
+		"- unmerge <room-id>\n" +
 		"- devices\n" +
 		"- unpair <device_id|all>\n" +
 		"- logout [login_id]\n" +
@@ -727,5 +730,6 @@ func managementRoomHelpText() string {
 		"\n" +
 		"One Matrix room is maintained per phone thread; participant changes update the room " +
 		"instead of creating a new one. If a phone restore changes thread IDs, use rebind-room " +
-		"to point the new thread at the existing room."
+		"to point the new thread at the existing room. If Android fractures one conversation " +
+		"across several threads, use merge to route them into one room."
 }

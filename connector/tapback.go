@@ -234,20 +234,28 @@ func normalizeTapbackQuotedText(text string) string {
 // findTapbackTarget locates the message a tapback refers to, first in the
 // in-memory index (populated as messages are bridged) and then in the bridge
 // database (which stores MessageMetadata.Body for every bridged message).
-func (nc *MyNetworkClient) findTapbackTarget(ctx context.Context, portalKey networkid.PortalKey, tb tapback) networkid.MessageID {
-	if target := matchIndexedTapbackTarget(nc.indexedMessages(portalKey), tb); target != "" {
-		return target
+//
+// portalKeys are checked in order. A tapback that arrives on a merged-away
+// thread passes its own portal first (pre-merge history lives there) and the
+// merge target second (post-merge history lives there).
+func (nc *MyNetworkClient) findTapbackTarget(ctx context.Context, portalKeys []networkid.PortalKey, tb tapback) networkid.MessageID {
+	for _, portalKey := range portalKeys {
+		if target := matchIndexedTapbackTarget(nc.indexedMessages(portalKey), tb); target != "" {
+			return target
+		}
 	}
 	if nc.bridge == nil || nc.bridge.DB == nil {
 		return ""
 	}
-	messages, err := nc.bridge.DB.Message.GetLastNInPortal(ctx, portalKey, tapbackLookback)
-	if err != nil {
-		nc.log.Warn().Err(err).Msg("Failed to load recent messages for tapback matching")
-		return ""
-	}
-	if target := matchTapbackTarget(messages, tb); target != nil {
-		return target.ID
+	for _, portalKey := range portalKeys {
+		messages, err := nc.bridge.DB.Message.GetLastNInPortal(ctx, portalKey, tapbackLookback)
+		if err != nil {
+			nc.log.Warn().Err(err).Msg("Failed to load recent messages for tapback matching")
+			continue
+		}
+		if target := matchTapbackTarget(messages, tb); target != nil {
+			return target.ID
+		}
 	}
 	return ""
 }
@@ -255,12 +263,13 @@ func (nc *MyNetworkClient) findTapbackTarget(ctx context.Context, portalKey netw
 // handleIncomingTapback converts an incoming tapback into a Matrix reaction.
 // It reports whether the tapback was handled; when the target message is not
 // found the caller should forward the original text instead, so no information
-// is lost.
-func (nc *MyNetworkClient) handleIncomingTapback(ctx context.Context, portalKey networkid.PortalKey, sender networkid.UserID, tb tapback, timestamp time.Time) bool {
+// is lost. The reaction is queued on portalKey (the merge target for a routed
+// event); searchKeys lists every portal to look for the referenced message in.
+func (nc *MyNetworkClient) handleIncomingTapback(ctx context.Context, portalKey networkid.PortalKey, searchKeys []networkid.PortalKey, sender networkid.UserID, tb tapback, timestamp time.Time) bool {
 	if nc.bridge == nil || nc.bridge.DB == nil || sender == "" {
 		return false
 	}
-	target := nc.findTapbackTarget(ctx, portalKey, tb)
+	target := nc.findTapbackTarget(ctx, searchKeys, tb)
 	if target == "" {
 		nc.log.Debug().
 			Str("portal_id", string(portalKey.ID)).

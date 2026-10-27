@@ -124,6 +124,15 @@ type PortalMetadata struct {
 
 	// ReadState is the last telephony message ID we consider read on the phone.
 	ReadState string `json:"read_state,omitempty"`
+
+	// MergedInto is set when this portal was merged into another portal (the
+	// target). Incoming events for the merged-away thread are then routed to
+	// the target room; the source portal keeps its own identity and metadata.
+	MergedInto networkid.PortalID `json:"merged_into,omitempty"`
+	// MergedFrom lists the portals that were merged into this one. It is the
+	// reverse index of MergedInto and keeps the target's participant union
+	// stable across thread updates of the merged sources.
+	MergedFrom []networkid.PortalID `json:"merged_from,omitempty"`
 }
 
 // New creates a new instance for database registration.

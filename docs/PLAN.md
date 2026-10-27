@@ -265,6 +265,18 @@ Fidelity rules (each gets a test + a real-device check before release):
    the phone and the bridge mid-conversation; verify identical participant lists, zero
    duplicate rooms, zero duplicate messages, and correct timestamps in all cases.
 
+### 5.7 Merge fractured chats
+
+When one conversation ends up in several phone threads, `!sms merge` combines
+their rooms: sources get `MergedInto` (target portal ID) in `PortalMetadata`,
+the target gets the reverse `MergedFrom` list plus the participant union, and
+every merged-away room is tombstoned into the target. Incoming events for a
+merged source (messages and `thread.updated`) are re-routed to the target with
+the target's thread identity and the union of participants; sender ghosts are
+unchanged. `!sms merges` lists active merges, `!sms unmerge` undoes routing for
+one source without touching the tombstone. Full behavior, validation matrix and
+limitations: `docs/merged-chats.md`.
+
 ## 6. Agent HTTP API (v1 draft)
 
 Bearer token; JSON; localhost by default.
@@ -384,6 +396,19 @@ also records the CNAM limitation). `history_ttl` redacts Matrix events and delet
 rows older than a global / per-room / per-contact retention, with the `otp`,
 `credit-card` and `ssn` pattern presets plus a `custom_patterns` extension map, a dry-run
 mode and `ttl status` / `ttl run` (`docs/history-ttl.md`).
+
+**Phase 7 — Merge fractured chats. ✅ Done (bridge side).**
+`!sms merge` combines rooms that belong to one phone conversation: a portal-level
+registry (`merged_into` / `merged_from` in `PortalMetadata`), routing of incoming
+messages and `thread.updated` events from merged threads into the target (with the
+target's thread identity and the participant union, sender ghosts unchanged),
+tombstones plus notices in merged-away rooms, and a name/topic/membership update on
+the target. `!sms merges` lists active merges, `!sms unmerge` undoes routing for one
+source. Validation refuses non-portals, spaces, the management room, broken targets
+and disjoint selections unless `--yes` forces them; >2 rooms and differing participant
+sets always ask for confirmation with a participant summary first. See
+`docs/merged-chats.md` for behavior and deferred items (history moves, app-side
+multi-select UI, per-thread union rebuilds).
 
 ## 9. Testing
 

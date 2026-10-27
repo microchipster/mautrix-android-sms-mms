@@ -285,6 +285,12 @@ func (nc *MyNetworkClient) FetchMessages(ctx context.Context, params bridgev2.Fe
 	if portal == nil {
 		return &bridgev2.FetchMessagesResponse{HasMore: false}, nil
 	}
+	if _, _, merged := nc.resolveMergedPortal(ctx, portal.PortalKey); merged {
+		// A merged-away room is tombstoned; new backfill pages would land
+		// there instead of the merge target. History that was already bridged
+		// stays where it is (moving history rows is not implemented).
+		return &bridgev2.FetchMessagesResponse{HasMore: false}, nil
+	}
 	if nc.device != nil {
 		return &bridgev2.FetchMessagesResponse{HasMore: false}, nil
 	}
