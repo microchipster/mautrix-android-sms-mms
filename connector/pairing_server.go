@@ -607,6 +607,15 @@ func (s *pairingServer) handleEvents(w http.ResponseWriter, r *http.Request) {
 			accepted++
 			continue
 		}
+		if ev.Type == pairEventMergeThreads {
+			// An app-requested merge: run the same validation and execution as
+			// `!sms merge` and answer with a merge_threads.result queue
+			// command. The app shows the outcome; failures are reported there
+			// and never fail the events batch.
+			device.handleMergeThreadsEvent(r.Context(), ev)
+			accepted++
+			continue
+		}
 		if ev.Type == "ack" {
 			// The app acknowledges commands whose result is not covered by
 			// send.result (mark_read, ping, fetch_message). Acks for commands

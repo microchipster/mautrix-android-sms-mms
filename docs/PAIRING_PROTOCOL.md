@@ -125,6 +125,12 @@ with its full payload and inline parts (see below); it is sent when an event arr
 without that payload. The app must tolerate the same message being requested more than
 once (the bridge retries when an answer does not arrive, for example after a queue reset
 swallowed the command).
+`merge_threads.result` reports the outcome of a `merge_threads` app request (below):
+on success it carries `send_id` (the request's correlation id), the request's
+`thread_ids` and `target_thread`, and `room_id` (the Matrix room of the merged target);
+on a refusal or failure it carries `error: {code, message}` instead of `room_id`
+(`bad_request` for an invalid selection, `internal` when applying a valid one failed).
+The app shows the outcome and acknowledges the command like any other.
 `reset: true` means the cursor is too old — the app must re-send its current state via
 `events` and continue from the returned cursor.
 
@@ -141,6 +147,21 @@ Also `message.updated` (read/seen/status changes), `mms.downloaded`, `thread.upd
 (`thread.updated` may carry `recipients`, the current participant list of the thread; app
 transports have no thread list endpoint, so this is how the bridge refreshes a portal's
 stored participants — e.g. after a bridge restart — without waiting for a new message).
+`merge_threads` asks the bridge to combine the rooms of several phone threads the user
+selected in the app's conversation list (the conversation-list merge action):
+
+```json
+{"seq": 18, "type": "merge_threads", "send_id": "merge-1761600000000-1",
+ "thread_ids": [11, 12], "target_thread": 12}
+```
+
+`thread_ids` lists at least two phone threads of this login; `target_thread` names the
+thread whose room becomes the merged target and defaults to the first thread (it must be
+part of the selection). The bridge resolves each thread to its portal, applies the same
+validation and the same merge as `!sms merge --yes` (the app's confirmation dialog is
+the confirmation step) and answers with a `merge_threads.result` queue command. A
+refused selection changes nothing and only produces the error result. The `send_id` is
+an app-chosen correlation id echoed in the result; it is optional but recommended.
 When the phone cannot resolve the SIM for a thread it reports `sub_id: -1`; the bridge
 then matches the portal by thread id instead of rebuilding the device-scoped portal key.
 Other events: `send.result` (outcome for a queue command: `{send_id, message_id, thread_id,

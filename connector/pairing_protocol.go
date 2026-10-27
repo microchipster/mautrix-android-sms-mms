@@ -72,6 +72,20 @@ const (
 	// again in a loop.
 	pairingPayloadRequestRetention = 30 * time.Minute
 
+	// pairEventMergeThreads is a `merge_threads` request from the app (app ->
+	// bridge): the phone threads of one fractured conversation the user
+	// selected in the app, plus the thread whose room should become the merged
+	// target. The bridge answers with a pairCommandMergeResult queue command.
+	pairEventMergeThreads = "merge_threads"
+	// pairCommandMergeResult delivers the outcome of a `merge_threads` request
+	// (bridge -> app): the target room ID on success, or the validation or
+	// execution error. It echoes the request's thread IDs and send id.
+	pairCommandMergeResult = "merge_threads.result"
+	// Error codes of a merge_threads.result: the selection was invalid
+	// (`bad_request`) or applying the valid selection failed (`internal`).
+	pairMergeErrorInvalid  = "bad_request"
+	pairMergeErrorInternal = "internal"
+
 	// pairingRateLimitMax / pairingRateLimitWindow throttle pairing attempts
 	// per source IP (brute force protection for the 8 character code).
 	pairingRateLimitMax    = 10
@@ -203,6 +217,11 @@ type remoteEvent struct {
 	PartsSent  int               `json:"parts_sent,omitempty"`
 	Pending    bool              `json:"pending,omitempty"`
 	Error      *remoteEventError `json:"error,omitempty"`
+	// ThreadIDs and TargetThread carry a `merge_threads` request (app ->
+	// bridge). The send id correlates the request with the
+	// `merge_threads.result` command the bridge answers with.
+	ThreadIDs    []int64 `json:"thread_ids,omitempty"`
+	TargetThread int64   `json:"target_thread,omitempty"`
 	// CommandSeq is set on `ack` events and identifies the queue command the
 	// device acknowledged, so the command can be pruned without parsing the
 	// `ack-<seq>` send id.
@@ -293,7 +312,7 @@ type pairInfoResponse struct {
 // mirror the agent's POST /v1/send body.
 type pairCommand struct {
 	Seq         int64            `json:"seq"`
-	Type        string           `json:"type"` // send_sms, send_mms, mark_read, ping, fetch_message
+	Type        string           `json:"type"` // send_sms, send_mms, mark_read, ping, fetch_message, merge_threads.result
 	SendID      string           `json:"send_id,omitempty"`
 	MessageID   string           `json:"message_id,omitempty"` // fetch_message only
 	ThreadID    int64            `json:"thread_id,omitempty"`
@@ -302,6 +321,14 @@ type pairCommand struct {
 	Text        string           `json:"text,omitempty"`
 	Attachments []SendAttachment `json:"attachments,omitempty"`
 	UpToMS      int64            `json:"up_to_ms,omitempty"`
+
+	// merge_threads.result only: the outcome of an app-requested merge. The
+	// thread IDs and target echo the request, room_id is the merged target room
+	// and error is set when the merge was refused or failed.
+	ThreadIDs    []int64           `json:"thread_ids,omitempty"`
+	TargetThread int64             `json:"target_thread,omitempty"`
+	RoomID       string            `json:"room_id,omitempty"`
+	Error        *remoteEventError `json:"error,omitempty"`
 
 	// EnqueuedAt is local bookkeeping for retention, never sent to the app.
 	EnqueuedAt time.Time `json:"-"`

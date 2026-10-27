@@ -64,6 +64,20 @@ Confirmation (`--yes`) is required when:
 The command always prints a per-room participant summary and the union before
 it acts; without `--yes` it only prints that summary and asks for confirmation.
 
+## Merging from the app
+
+The Fossify Messages fork can request the same merge from its conversation
+list: select two or more conversations, choose **Merge as group chat** and
+confirm the participant list (the dialog warns that merged-away chats are
+tombstoned and that the merge is only reversible with `!sms unmerge`). The app
+pushes a `merge_threads` event (`thread_ids`, optional `target_thread`, see
+`docs/PAIRING_PROTOCOL.md`) through the pairing outbox; the bridge resolves each
+thread to its portal, runs the same validation and merge, and answers with a
+`merge_threads.result` queue command that the app acknowledges and shows. The
+app's dialog is the confirmation step, so the confirmation gates above are not
+asked a second time; hard errors and execution failures come back as the
+result's error and change nothing.
+
 ## Routing
 
 - Incoming messages whose thread resolves to a merged-away portal are re-routed
@@ -102,4 +116,3 @@ participant union it had at merge time, and history is not moved.
   hatch).
 - Per-thread recipient reconciliation happens on `thread.updated`; a complete
   rebuild of the union from all merged phone threads is not implemented.
-- No app-side multi-select UI yet: merging is a management-room command.

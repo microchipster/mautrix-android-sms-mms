@@ -136,7 +136,7 @@ All commands live in the management room (default prefix `!sms`):
 | `!sms label <phone> <label\|--clear>`, `!sms labels` | Tag contacts (auto-labels first-time senders) and list tags. |
 | `!sms block-user`, `!sms unblock-user` | In a DM room: drop inbound messages from that sender, bridge-side. |
 | `!sms ttl status`, `!sms ttl run [--dry-run\|--apply]` | Show or run the Matrix history retention cleanup. |
-| `!sms merge <room> <room> [...] [--into <room>] [--yes]`, `!sms merges`, `!sms unmerge <room>` | Combine fractured rooms (one conversation split across threads) into one target room. |
+| `!sms merge <room> <room> [...] [--into <room>] [--yes]`, `!sms merges`, `!sms unmerge <room>` | Combine fractured rooms (one conversation split across threads) into one target room; the app can request the same merge from its conversation list. |
 | `!sms devices` | List paired devices and their state. |
 | `!sms unpair <device_id\|all>` | Revoke a device's token. |
 | `!sms rebind-room <thread\|address> <room_id>` | Attach a phone thread to an existing Matrix room. |
