@@ -177,6 +177,7 @@ docker build -t mautrix-android-sms-mms .   # container image
 ## Docs
 
 - [`docs/PLAN.md`](docs/PLAN.md) — the plan, phases and the group-chat correctness spec.
+- [`docs/sms-bridge-handoff.md`](docs/sms-bridge-handoff.md) — full project handoff: state, runbooks, testing rig, next goals.
 - [`docs/PAIRING_PROTOCOL.md`](docs/PAIRING_PROTOCOL.md) — app pairing protocol (QR + manual, queue/events API).
 - [`docs/AGENT_API.md`](docs/AGENT_API.md) — HTTP API contract both transports implement.
 - [`docs/testing-e2e-local.md`](docs/testing-e2e-local.md) — local end-to-end test runbook.
