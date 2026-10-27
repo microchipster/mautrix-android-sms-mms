@@ -358,10 +358,7 @@ func (nc *MyNetworkClient) FetchMessages(ctx context.Context, params bridgev2.Fe
 // message, including uploading any attachments. Returns nil when the message
 // has no convertible content.
 func (nc *MyNetworkClient) makeBackfillMessage(ctx context.Context, portal *bridgev2.Portal, msg agentapi.Message) *bridgev2.BackfillMessage {
-	sender := bridgev2.EventSender{
-		Sender:   MakeUserID(msg.Sender),
-		IsFromMe: msg.Sender == "",
-	}
+	sender := nc.eventSenderForMessage(msg)
 	intent, ok := portal.GetIntentFor(ctx, sender, nc.login, bridgev2.RemoteEventMessage)
 	if !ok || intent == nil {
 		return nil

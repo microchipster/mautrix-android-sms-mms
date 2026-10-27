@@ -17,6 +17,7 @@ import (
 	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
+	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
@@ -91,6 +92,40 @@ func TestAgentMessageTimestamp(t *testing.T) {
 	}
 	if got := agentMessageTimestamp(agentapi.Message{}); got.IsZero() {
 		t.Error("agentMessageTimestamp(empty) returned zero time")
+	}
+}
+
+// TestEventSenderForOwnMessages is a regression test for outgoing (from-me)
+// messages mirrored from the phone: the sender must be a non-empty remote user
+// ID, otherwise bridgev2 stores message.sender_id = "" and Postgres rejects
+// the row with a message_sender_fkey foreign key violation. Own messages are
+// attributed to the login's own user (its own-number ghost), which bridgev2
+// creates on demand, just like it does for inbound sender ghosts.
+func TestEventSenderForOwnMessages(t *testing.T) {
+	nc := &MyNetworkClient{
+		connector: &MyConnector{config: &SimpleConfig{OwnNumbers: []string{"+15550100100"}}},
+		login:     &bridgev2.UserLogin{UserLogin: &database.UserLogin{ID: "default"}},
+	}
+
+	incoming := nc.eventSenderForMessage(agentapi.Message{Sender: "+15551234567"})
+	if incoming.IsFromMe || incoming.Sender != MakeUserID("+15551234567") {
+		t.Fatalf("incoming sender = %+v, want IsFromMe=false and sender=%q", incoming, MakeUserID("+15551234567"))
+	}
+
+	own := nc.eventSenderForMessage(agentapi.Message{ID: "sms:2:2", Sender: ""})
+	if !own.IsFromMe {
+		t.Fatalf("own sender = %+v, want IsFromMe=true", own)
+	}
+	if own.Sender != MakeUserID("+15550100100") {
+		t.Fatalf("own sender = %q, want the own-number ghost %q", own.Sender, MakeUserID("+15550100100"))
+	}
+
+	// Before the first heartbeat and without own_numbers config, the login ID
+	// keeps the sender non-empty so the foreign key still holds.
+	fallback := (&MyNetworkClient{login: &bridgev2.UserLogin{UserLogin: &database.UserLogin{ID: "default"}}}).
+		eventSenderForMessage(agentapi.Message{Sender: ""})
+	if !fallback.IsFromMe || fallback.Sender != networkid.UserID("default") {
+		t.Fatalf("fallback own sender = %+v, want IsFromMe=true and sender=default", fallback)
 	}
 }
 

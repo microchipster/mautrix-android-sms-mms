@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -511,6 +512,21 @@ func (nc *MyNetworkClient) handleAgentThreadUpdate(ctx context.Context, ev remot
 	}
 }
 
+// eventSenderForMessage builds the bridgev2 sender for an agent message.
+// Agent messages with an empty sender are the phone's own (outgoing) messages.
+// They still need a non-empty remote user ID, because bridgev2 stores it as
+// message.sender_id, which has a foreign key to the ghost table: an empty
+// sender makes the insert fail with a message_sender_fkey violation. The
+// login's own user (its own-number ghost, falling back to the login ID) is
+// that user. When double puppeting is available the Matrix event is still sent
+// as the user, so the own-number ghost only exists as a database row.
+func (nc *MyNetworkClient) eventSenderForMessage(msg agentapi.Message) bridgev2.EventSender {
+	if msg.Sender == "" {
+		return bridgev2.EventSender{IsFromMe: true, Sender: nc.ownUserID()}
+	}
+	return bridgev2.EventSender{Sender: MakeUserID(msg.Sender)}
+}
+
 // bridgeAgentMessage does the actual bridging of one agent message: room
 // setup/participant updates, tapback conversion and the message event itself.
 func (nc *MyNetworkClient) bridgeAgentMessage(ctx context.Context, msg agentapi.Message) {
@@ -526,10 +542,7 @@ func (nc *MyNetworkClient) bridgeAgentMessage(ctx context.Context, msg agentapi.
 	}
 	portalKey := nc.portalKeyFor(msg.ThreadID, msg.SubID)
 	fromMe := msg.Sender == ""
-	var sender networkid.UserID
-	if !fromMe {
-		sender = MakeUserID(msg.Sender)
-	}
+	eventSender := nc.eventSenderForMessage(msg)
 
 	// Suppress the phone's copy of messages the bridge sent itself.
 	if fromMe && nc.consumeSentFromMatrix(networkid.MessageID(msg.ID)) {
@@ -543,7 +556,7 @@ func (nc *MyNetworkClient) bridgeAgentMessage(ctx context.Context, msg agentapi.
 	// regular text typed on the phone.
 	if !fromMe {
 		if tb, ok := parseTapback(msg.Body); ok {
-			if nc.handleIncomingTapback(ctx, portalKey, sender, tb, agentMessageTimestamp(msg)) {
+			if nc.handleIncomingTapback(ctx, portalKey, eventSender.Sender, tb, agentMessageTimestamp(msg)) {
 				return
 			}
 		}
@@ -558,10 +571,7 @@ func (nc *MyNetworkClient) bridgeAgentMessage(ctx context.Context, msg agentapi.
 		EventMeta: simplevent.EventMeta{
 			Type:      bridgev2.RemoteEventMessage,
 			PortalKey: portalKey,
-			Sender: bridgev2.EventSender{
-				Sender:   sender,
-				IsFromMe: fromMe,
-			},
+			Sender:    eventSender,
 			Timestamp: timestamp,
 			PostHandleFunc: func(ctx context.Context, portal *bridgev2.Portal) {
 				nc.markPortalHistoryProgress(ctx, portal, timestamp, msg.ID, "")
@@ -971,8 +981,16 @@ func (nc *MyNetworkClient) ownNumbers() []string {
 	var numbers []string
 	if nc.login != nil {
 		if meta, _ := nc.login.Metadata.(*LoginMetadata); meta != nil {
-			for _, sub := range meta.Subscriptions {
-				if number := CanonicalAddress(sub.PhoneNumber); number != "" {
+			// Subscriptions is a map: iterate in sub ID (SIM slot) order so the
+			// list is stable across restarts, and ownUserID's first entry does
+			// not flip between SIMs (it is the sender ghost for own messages).
+			subIDs := make([]int, 0, len(meta.Subscriptions))
+			for subID := range meta.Subscriptions {
+				subIDs = append(subIDs, subID)
+			}
+			slices.Sort(subIDs)
+			for _, subID := range subIDs {
+				if number := CanonicalAddress(meta.Subscriptions[subID].PhoneNumber); number != "" {
 					numbers = append(numbers, number)
 				}
 			}
