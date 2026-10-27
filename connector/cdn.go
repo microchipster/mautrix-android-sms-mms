@@ -32,6 +32,10 @@ import (
 // the bridge stores and serves ciphertext only. The unguessable id in the
 // path is the whole secret: the download endpoints require no headers or
 // cookies.
+//
+// Albums (connector/cdn_album.go) extend the same service: one unguessable
+// id holds several encrypted items plus a client-encrypted manifest, and the
+// link's single fragment key derives per-item subkeys with HKDF.
 
 const (
 	// cdnPathPrefix is the public path space of the file service.
@@ -66,6 +70,21 @@ const (
 	cdnObjectDirName = "objects"
 	// cdnMetaSuffix names the JSON sidecar holding one file's metadata.
 	cdnMetaSuffix = ".meta.json"
+
+	// cdnKindAlbum marks a stored entry as a multi-item album. File entries
+	// carry an empty kind, so metadata written before albums stays valid.
+	cdnKindAlbum = "album"
+	// cdnDefaultMaxAlbumItems caps one album at 20 items.
+	cdnDefaultMaxAlbumItems = 20
+	// cdnHardMaxAlbumItems is the wire-format limit of the album container:
+	// the item count is a single byte, so no configuration can raise it.
+	cdnHardMaxAlbumItems = 255
+	// cdnDefaultMaxAlbumBytes caps one album's total ciphertext (500 MiB).
+	cdnDefaultMaxAlbumBytes = int64(500) << 20
+	// cdnMaxManifestBytes caps the client-encrypted manifest object (64 KiB).
+	// The manifest is small metadata (item names/types/sizes), not a second
+	// item; it is not configurable.
+	cdnMaxManifestBytes = int64(64) << 10
 
 	// cdnWrapperCSP locks the wrapper page down to inline script + blob
 	// rendering, and sandboxes it so a payload can never navigate or reach
@@ -125,8 +144,15 @@ type CdnConfig struct {
 	DataDir string `yaml:"data_dir,omitempty"`
 	// MaxFileBytes caps one encrypted upload, in bytes.
 	MaxFileBytes int64 `yaml:"max_file_bytes,omitempty"`
-	// PerUserCapBytes caps the stored ciphertext per user. Older files are
-	// pruned first (FIFO) once the cap is exceeded.
+	// MaxAlbumItems caps how many items one album may contain. The wire
+	// format allows at most 255.
+	MaxAlbumItems int `yaml:"max_album_items,omitempty"`
+	// MaxAlbumBytes caps the total ciphertext of one album, in bytes.
+	// Albums also count against PerUserCapBytes.
+	MaxAlbumBytes int64 `yaml:"max_album_bytes,omitempty"`
+	// PerUserCapBytes caps the stored ciphertext per user (files and
+	// albums). Older entries are pruned first (FIFO) once the cap is
+	// exceeded.
 	PerUserCapBytes int64 `yaml:"per_user_cap_bytes,omitempty"`
 	// DefaultExpiry is the link lifetime used when an upload does not ask
 	// for a specific one.
@@ -139,10 +165,13 @@ type CdnConfig struct {
 }
 
 // DefaultCdnConfig returns the file service defaults: disabled, 100 MiB per
-// file, 1 GiB per user, one month links, cleanup hourly.
+// file, 20 items and 500 MiB per album, 1 GiB per user, one month links,
+// cleanup hourly.
 func DefaultCdnConfig() CdnConfig {
 	return CdnConfig{
 		MaxFileBytes:    cdnDefaultMaxFileBytes,
+		MaxAlbumItems:   cdnDefaultMaxAlbumItems,
+		MaxAlbumBytes:   cdnDefaultMaxAlbumBytes,
 		PerUserCapBytes: cdnDefaultPerUserCapBytes,
 		DefaultExpiry:   cdnDuration(cdnDefaultExpiry),
 		MaxExpiry:       cdnDuration(cdnMaxExpiry),
@@ -158,6 +187,8 @@ func (c *CdnConfig) UnmarshalYAML(unmarshal func(any) error) error {
 		Domain          *string      `yaml:"domain"`
 		DataDir         *string      `yaml:"data_dir"`
 		MaxFileBytes    *int64       `yaml:"max_file_bytes"`
+		MaxAlbumItems   *int         `yaml:"max_album_items"`
+		MaxAlbumBytes   *int64       `yaml:"max_album_bytes"`
 		PerUserCapBytes *int64       `yaml:"per_user_cap_bytes"`
 		DefaultExpiry   *cdnDuration `yaml:"default_expiry"`
 		MaxExpiry       *cdnDuration `yaml:"max_expiry"`
@@ -178,6 +209,12 @@ func (c *CdnConfig) UnmarshalYAML(unmarshal func(any) error) error {
 	}
 	if raw.MaxFileBytes != nil {
 		cfg.MaxFileBytes = *raw.MaxFileBytes
+	}
+	if raw.MaxAlbumItems != nil {
+		cfg.MaxAlbumItems = *raw.MaxAlbumItems
+	}
+	if raw.MaxAlbumBytes != nil {
+		cfg.MaxAlbumBytes = *raw.MaxAlbumBytes
 	}
 	if raw.PerUserCapBytes != nil {
 		cfg.PerUserCapBytes = *raw.PerUserCapBytes
@@ -221,6 +258,15 @@ func (c CdnConfig) Validate() error {
 	if c.MaxFileBytes <= 0 {
 		return fmt.Errorf("cdn.max_file_bytes must be positive")
 	}
+	if c.MaxAlbumItems <= 0 {
+		return fmt.Errorf("cdn.max_album_items must be positive")
+	}
+	if c.MaxAlbumItems > cdnHardMaxAlbumItems {
+		return fmt.Errorf("cdn.max_album_items cannot exceed %d", cdnHardMaxAlbumItems)
+	}
+	if c.MaxAlbumBytes <= 0 {
+		return fmt.Errorf("cdn.max_album_bytes must be positive")
+	}
 	if c.PerUserCapBytes <= 0 {
 		return fmt.Errorf("cdn.per_user_cap_bytes must be positive")
 	}
@@ -250,18 +296,29 @@ func (c CdnConfig) Validate() error {
 // quotas and revocation are per Matrix user.
 type CdnAuthFunc func(r *http.Request) (owner string, ok bool)
 
-// CdnEntry is the stored metadata of one encrypted file.
+// CdnEntry is the stored metadata of one encrypted file or album. File
+// entries leave Kind empty; album entries carry cdnKindAlbum and the item
+// count. Size is the stored ciphertext total either way, so quotas treat both
+// kinds uniformly.
 type CdnEntry struct {
 	ID        string    `json:"id"`
 	Owner     string    `json:"owner"`
+	Kind      string    `json:"kind,omitempty"`
 	Size      int64     `json:"size"`
+	ItemCount int       `json:"item_count,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
-// CdnStats summarizes the stored files for the management room.
+// isAlbum reports whether the entry is a multi-item album.
+func (e CdnEntry) isAlbum() bool {
+	return e.Kind == cdnKindAlbum
+}
+
+// CdnStats summarizes the stored entries for the management room.
 type CdnStats struct {
 	Files   int       `json:"files"`
+	Albums  int       `json:"albums"`
 	Bytes   int64     `json:"bytes"`
 	Owners  int       `json:"owners"`
 	Expired int       `json:"expired"`
@@ -272,8 +329,9 @@ type CdnStats struct {
 
 // CdnService is the bridge-side file service: unguessable ids, ciphertext
 // storage, per-user quotas with FIFO pruning, and expiry cleanup. The
-// matching decryptor page is served for every file (the key stays in the URL
-// fragment and never reaches the service).
+// matching decryptor page is served for every entry (the key stays in the URL
+// fragment and never reaches the service): a file viewer for single files and
+// a gallery for albums.
 type CdnService struct {
 	log  zerolog.Logger
 	cfg  CdnConfig
@@ -363,10 +421,13 @@ func newCdnID() (string, error) {
 // fresh mux.
 func (s *CdnService) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST "+cdnPathPrefix, s.handleUpload)
+	mux.HandleFunc("POST "+cdnPathPrefix+"/albums", s.handleAlbumUpload)
 	mux.HandleFunc("GET "+cdnPathPrefix, s.handleList)
 	mux.HandleFunc("DELETE "+cdnPathPrefix+"/{id}", s.handleRevoke)
 	mux.HandleFunc("GET "+cdnPathPrefix+"/{id}", s.handleWrapper)
 	mux.HandleFunc("GET "+cdnPathPrefix+"/{id}/raw", s.handleDownload)
+	mux.HandleFunc("GET "+cdnPathPrefix+"/{id}/manifest", s.handleAlbumManifest)
+	mux.HandleFunc("GET "+cdnPathPrefix+"/{id}/items/{index}", s.handleAlbumItem)
 }
 
 // Handler returns the file service HTTP handler (auth-required upload,
@@ -498,8 +559,9 @@ func (s *CdnService) handleUpload(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleDownload serves the stored ciphertext. The URL is the secret: no
-// headers or cookies are required.
+// handleDownload serves the stored ciphertext of one file. The URL is the
+// secret: no headers or cookies are required. Albums have their own manifest
+// and item routes, so the file-only route on an album is a 404.
 func (s *CdnService) handleDownload(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	entry, err := s.loadEntry(id)
@@ -507,11 +569,18 @@ func (s *CdnService) handleDownload(w http.ResponseWriter, r *http.Request) {
 		writeCdnError(w, http.StatusInternalServerError, "internal", "failed to read the file metadata")
 		return
 	}
-	if entry == nil {
+	if entry == nil || entry.isAlbum() {
 		http.NotFound(w, r)
 		return
 	}
-	file, err := os.Open(s.objectPath(id))
+	s.writeCdnObject(w, r, s.objectPath(id), id+".bin")
+}
+
+// writeCdnObject streams one stored ciphertext object with the public
+// download headers. Missing objects are a 404; callers resolve the metadata
+// (and reject foreign kinds) before calling.
+func (s *CdnService) writeCdnObject(w http.ResponseWriter, r *http.Request, path, filename string) {
+	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			http.NotFound(w, r)
@@ -522,13 +591,13 @@ func (s *CdnService) handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 	info, err := file.Stat()
-	if err != nil {
+	if err != nil || info.IsDir() {
 		writeCdnError(w, http.StatusInternalServerError, "internal", "failed to open the file")
 		return
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", id+".bin"))
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
 	w.Header().Set("Cache-Control", "private, max-age=3600")
 	// The wrapper page is sandboxed, so its origin is opaque and fetching the
 	// ciphertext is a cross-origin request. The URL is the secret and the
@@ -540,9 +609,9 @@ func (s *CdnService) handleDownload(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, file)
 }
 
-// handleWrapper serves the static decryptor page. The page fetches the
-// ciphertext and decrypts it in the browser with the fragment key; the
-// server never sees that key.
+// handleWrapper serves the static decryptor page: the file viewer or, for
+// album ids, the gallery. The page fetches the ciphertext and decrypts it in
+// the browser with the fragment key; the server never sees that key.
 func (s *CdnService) handleWrapper(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	entry, err := s.loadEntry(id)
@@ -554,45 +623,64 @@ func (s *CdnService) handleWrapper(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Content-Security-Policy", cdnWrapperCSP)
-	w.Header().Set("X-Frame-Options", "DENY")
-	w.Header().Set("Referrer-Policy", "no-referrer")
-	w.Header().Set("Cache-Control", "no-store")
+	s.setCdnWrapperHeaders(w, entry.isAlbum())
 	w.WriteHeader(http.StatusOK)
-	if err := cdnWrapperTemplate.Execute(w, cdnWrapperData{ID: id}); err != nil {
+	page := cdnWrapperTemplate
+	if entry.isAlbum() {
+		page = cdnAlbumWrapperTemplate
+	}
+	if err := page.Execute(w, cdnWrapperData{ID: id}); err != nil {
 		s.log.Warn().Err(err).Msg("Failed to render the CDN wrapper page")
 	}
 }
 
-// cdnListResponse is the GET /f response body.
+// setCdnWrapperHeaders applies the locked-down policy shared by the file and
+// album wrapper pages.
+func (s *CdnService) setCdnWrapperHeaders(w http.ResponseWriter, album bool) {
+	csp := cdnWrapperCSP
+	if album {
+		csp = cdnAlbumWrapperCSP
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", csp)
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("Cache-Control", "no-store")
+}
+
+// cdnListResponse is the GET /f response body. Files and albums are listed
+// separately so existing file-only clients keep working; UsedBytes and
+// CapBytes cover both, since albums count against the same quota.
 type cdnListResponse struct {
 	Files     []CdnEntry `json:"files"`
+	Albums    []CdnEntry `json:"albums"`
 	CapBytes  int64      `json:"cap_bytes"`
 	UsedBytes int64      `json:"used_bytes"`
 }
 
-// handleList returns the caller's active files.
+// handleList returns the caller's active files and albums.
 func (s *CdnService) handleList(w http.ResponseWriter, r *http.Request) {
 	owner, ok := s.authenticate(r)
 	if !ok {
 		writeCdnError(w, http.StatusUnauthorized, "unauthorized", "a valid device bearer token is required")
 		return
 	}
-	entries, err := s.List(owner)
+	entries, used, err := s.Usage(owner)
 	if err != nil {
 		writeCdnError(w, http.StatusInternalServerError, "internal", "failed to list your files")
 		return
 	}
-	var used int64
+	files := make([]CdnEntry, 0, len(entries))
+	albums := make([]CdnEntry, 0)
 	for _, entry := range entries {
-		used += entry.Size
+		if entry.isAlbum() {
+			albums = append(albums, entry)
+		} else {
+			files = append(files, entry)
+		}
 	}
-	if entries == nil {
-		entries = []CdnEntry{}
-	}
-	writeCdnJSON(w, http.StatusOK, cdnListResponse{Files: entries, CapBytes: s.cfg.PerUserCapBytes, UsedBytes: used})
+	writeCdnJSON(w, http.StatusOK, cdnListResponse{Files: files, Albums: albums, CapBytes: s.cfg.PerUserCapBytes, UsedBytes: used})
 }
 
 // handleRevoke deletes one of the caller's files. Foreign ids look exactly
@@ -622,28 +710,32 @@ func (s *CdnService) handleRevoke(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// List returns the owner's active files, newest first.
-func (s *CdnService) List(owner string) ([]CdnEntry, error) {
+// Usage returns the owner's active files and albums, newest first, with the
+// byte total that counts against the per-user quota. Albums are one entry
+// each, sized as the total ciphertext of their items plus the manifest.
+func (s *CdnService) Usage(owner string) ([]CdnEntry, int64, error) {
 	if s == nil {
-		return nil, nil
+		return nil, 0, nil
 	}
 	owner = strings.TrimSpace(owner)
 	if owner == "" {
-		return nil, nil
+		return nil, 0, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	all, err := s.listAllLocked()
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	now := time.Now()
 	entries := make([]CdnEntry, 0, len(all))
+	var used int64
 	for _, entry := range all {
 		if entry.Owner != owner || !entry.ExpiresAt.After(now) {
 			continue
 		}
 		entries = append(entries, entry)
+		used += entry.Size
 	}
 	sort.Slice(entries, func(i, j int) bool {
 		if !entries[i].CreatedAt.Equal(entries[j].CreatedAt) {
@@ -651,11 +743,42 @@ func (s *CdnService) List(owner string) ([]CdnEntry, error) {
 		}
 		return entries[i].ID > entries[j].ID
 	})
-	return entries, nil
+	return entries, used, nil
 }
 
-// Revoke removes a file owned by owner. It reports ok=false for unknown ids
-// and for files owned by someone else.
+// List returns the owner's active files, newest first. Albums are excluded;
+// use ListAlbums or Usage for the album view and the quota total.
+func (s *CdnService) List(owner string) ([]CdnEntry, error) {
+	entries, _, err := s.Usage(owner)
+	if err != nil {
+		return nil, err
+	}
+	return filterCdnEntries(entries, false), nil
+}
+
+// ListAlbums returns the owner's active albums, newest first.
+func (s *CdnService) ListAlbums(owner string) ([]CdnEntry, error) {
+	entries, _, err := s.Usage(owner)
+	if err != nil {
+		return nil, err
+	}
+	return filterCdnEntries(entries, true), nil
+}
+
+// filterCdnEntries keeps only files or only albums.
+func filterCdnEntries(entries []CdnEntry, albums bool) []CdnEntry {
+	filtered := make([]CdnEntry, 0, len(entries))
+	for _, entry := range entries {
+		if entry.isAlbum() == albums {
+			filtered = append(filtered, entry)
+		}
+	}
+	return filtered
+}
+
+// Revoke removes a file or album owned by owner. It reports ok=false for
+// unknown ids and for entries owned by someone else. Albums are removed
+// whole, manifest and items together.
 func (s *CdnService) Revoke(owner, id string) (bool, error) {
 	if s == nil {
 		return false, nil
@@ -678,7 +801,8 @@ func (s *CdnService) Revoke(owner, id string) (bool, error) {
 }
 
 // Stats summarizes the service for the management room. Expired files are
-// counted separately until the cleanup removes them.
+// counted separately until the cleanup removes them. Bytes covers files and
+// albums; Owners counts users with either.
 func (s *CdnService) Stats() CdnStats {
 	if s == nil {
 		return CdnStats{}
@@ -698,7 +822,11 @@ func (s *CdnService) Stats() CdnStats {
 			stats.Expired++
 			continue
 		}
-		stats.Files++
+		if entry.isAlbum() {
+			stats.Albums++
+		} else {
+			stats.Files++
+		}
 		stats.Bytes += entry.Size
 		owners[entry.Owner] = struct{}{}
 	}
@@ -866,8 +994,10 @@ func (s *CdnService) writeMetaLocked(entry CdnEntry) error {
 	return nil
 }
 
-// removeEntryLocked deletes a file's metadata and ciphertext. Callers must
-// hold s.mu.
+// removeEntryLocked deletes an entry's metadata and payload. File payloads
+// are single objects; album payloads are directories (manifest + items).
+// os.RemoveAll handles both and never follows symlinks. Callers must hold
+// s.mu.
 func (s *CdnService) removeEntryLocked(id string) error {
 	if !validCdnID(id) {
 		return nil
@@ -875,14 +1005,15 @@ func (s *CdnService) removeEntryLocked(id string) error {
 	if err := os.Remove(s.metaPath(id)); err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	if err := os.Remove(s.objectPath(id)); err != nil && !os.IsNotExist(err) {
+	if err := os.RemoveAll(s.objectPath(id)); err != nil {
 		return err
 	}
 	return nil
 }
 
-// pruneOwnerLocked removes the owner's oldest files (never keepID) until the
-// stored bytes fit within the per-user cap. Callers must hold s.mu.
+// pruneOwnerLocked removes the owner's oldest entries (files and albums,
+// never keepID) until the stored bytes fit within the per-user cap. Albums
+// are removed whole. Callers must hold s.mu.
 func (s *CdnService) pruneOwnerLocked(owner, keepID string) (int, error) {
 	all, err := s.listAllLocked()
 	if err != nil {
@@ -924,8 +1055,10 @@ func (s *CdnService) pruneOwnerLocked(owner, keepID string) (int, error) {
 	return removed, nil
 }
 
-// runGCLocked removes expired entries, orphaned files and stale temporary
-// uploads. Callers must hold s.mu.
+// runGCLocked removes expired entries, orphaned objects/directories left by
+// interruptions, incomplete albums and stale temporary uploads. Each id is
+// judged exactly once, so an expired album is one removal, not two. Callers
+// must hold s.mu.
 func (s *CdnService) runGCLocked(now time.Time) (int, error) {
 	dirEntries, err := os.ReadDir(s.objectDir())
 	if err != nil {
@@ -935,58 +1068,77 @@ func (s *CdnService) runGCLocked(now time.Time) (int, error) {
 		return 0, err
 	}
 	removed := 0
+	seen := make(map[string]struct{}, len(dirEntries))
 	for _, dirEntry := range dirEntries {
 		name := dirEntry.Name()
 		if strings.HasPrefix(name, ".") {
 			if info, statErr := dirEntry.Info(); statErr == nil && now.Sub(info.ModTime()) > cdnStaleTempAge {
-				_ = os.Remove(filepath.Join(s.objectDir(), name))
+				// Interrupted uploads are files (single uploads) or
+				// directories (album containers staged item by item).
+				_ = os.RemoveAll(filepath.Join(s.objectDir(), name))
 			}
 			continue
 		}
-		if dirEntry.IsDir() {
-			continue
-		}
+		id := name
 		if strings.HasSuffix(name, cdnMetaSuffix) {
-			id := strings.TrimSuffix(name, cdnMetaSuffix)
-			entry, err := s.readMeta(id)
-			if err != nil {
-				return removed, err
-			}
-			orphan := entry == nil
-			expired := entry != nil && !entry.ExpiresAt.After(now)
-			missingObject := false
-			if _, statErr := os.Stat(s.objectPath(id)); statErr != nil {
-				if os.IsNotExist(statErr) {
-					missingObject = true
-				} else {
-					return removed, statErr
-				}
-			}
-			if orphan || expired || missingObject {
-				if err := s.removeEntryLocked(id); err != nil {
-					return removed, err
-				}
-				removed++
-			}
+			id = strings.TrimSuffix(name, cdnMetaSuffix)
+		}
+		if !validCdnID(id) {
 			continue
 		}
-		// A ciphertext file without metadata: the upload was interrupted
-		// between the rename and the metadata write.
-		if !validCdnID(name) {
+		if _, done := seen[id]; done {
 			continue
 		}
-		meta, err := s.readMeta(name)
+		seen[id] = struct{}{}
+		gone, err := s.gcEntryLocked(id, now)
 		if err != nil {
 			return removed, err
 		}
-		if meta == nil {
-			if err := os.Remove(s.objectPath(name)); err != nil && !os.IsNotExist(err) {
-				return removed, err
-			}
+		if gone {
 			removed++
 		}
 	}
 	return removed, nil
+}
+
+// gcEntryLocked decides the fate of one metadata id: keep an active, complete
+// file or album, remove anything that is expired, missing its payload or
+// missing its metadata. Callers must hold s.mu. It reports whether an entry
+// was removed.
+func (s *CdnService) gcEntryLocked(id string, now time.Time) (bool, error) {
+	entry, err := s.readMeta(id)
+	if err != nil {
+		return false, err
+	}
+	if entry == nil {
+		// No readable metadata: whatever object or directory is left is an
+		// interrupted upload.
+		return true, s.removeEntryLocked(id)
+	}
+	if !entry.ExpiresAt.After(now) {
+		return true, s.removeEntryLocked(id)
+	}
+	if entry.isAlbum() {
+		// An album is kept only while manifest and every promised item exist;
+		// a partial album is removed whole, so item bytes never outlive their
+		// metadata (or survive a crash mid-write).
+		if !s.albumDirComplete(id, entry) {
+			return true, s.removeEntryLocked(id)
+		}
+		return false, nil
+	}
+	info, err := os.Stat(s.objectPath(id))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return true, s.removeEntryLocked(id)
+		}
+		return false, err
+	}
+	if info.IsDir() {
+		// A file entry must map to a plain object, not a directory.
+		return true, s.removeEntryLocked(id)
+	}
+	return false, nil
 }
 
 // cdnWrapperData feeds the decryptor page. ID is escaped for the JS context
@@ -1121,21 +1273,28 @@ func NewCdnCommand(service *CdnService) *commands.FullHandler {
 			}
 			switch action {
 			case "list":
-				entries, err := service.List(owner)
+				entries, used, err := service.Usage(owner)
 				if err != nil {
-					ce.Reply("Failed to list your files: %v", err)
+					ce.Reply("Failed to list your file links: %v", err)
 					return
 				}
 				if len(entries) == 0 {
-					ce.Reply("No active file links uploaded by you.")
+					ce.Reply("No active file links or albums uploaded by you.")
 					return
 				}
-				lines := make([]string, 0, len(entries)+1)
+				lines := make([]string, 0, len(entries)+2)
 				for _, entry := range entries {
+					if entry.isAlbum() {
+						lines = append(lines, fmt.Sprintf("- `%s` — album: %d item(s), %s, expires %s",
+							entry.ID, entry.ItemCount, formatCdnBytes(entry.Size), formatCdnTime(entry.ExpiresAt)))
+						continue
+					}
 					lines = append(lines, fmt.Sprintf("- `%s` — %s, expires %s",
 						entry.ID, formatCdnBytes(entry.Size), formatCdnTime(entry.ExpiresAt)))
 				}
-				ce.Reply("Your file links (%d):\n%s\n\nRevoke with `$cmdprefix cdn revoke <id>`.",
+				lines = append(lines, fmt.Sprintf("Storage: %s used of %s.",
+					formatCdnBytes(used), formatCdnBytes(service.cfg.PerUserCapBytes)))
+				ce.Reply("Your file links and albums (%d):\n%s\n\nRevoke with `$cmdprefix cdn revoke <id>`.",
 					len(entries), strings.Join(lines, "\n"))
 			case "revoke":
 				if len(ce.Args) < 2 {
@@ -1160,8 +1319,8 @@ func NewCdnCommand(service *CdnService) *commands.FullHandler {
 						lastGC = formatCdnTime(stats.LastGC)
 					}
 					lines := []string{fmt.Sprintf(
-						"File service: %d active file(s), %s across %d user(s), %d expired awaiting cleanup. Last cleanup: %s.",
-						stats.Files, formatCdnBytes(stats.Bytes), stats.Owners, stats.Expired, lastGC)}
+						"File service: %d active file(s), %d active album(s), %s across %d user(s), %d expired awaiting cleanup. Last cleanup: %s.",
+						stats.Files, stats.Albums, formatCdnBytes(stats.Bytes), stats.Owners, stats.Expired, lastGC)}
 					if stats.GCError != "" {
 						lines = append(lines, "Last cleanup error: "+stats.GCError)
 					}
@@ -1171,16 +1330,12 @@ func NewCdnCommand(service *CdnService) *commands.FullHandler {
 					ce.Reply("%s", strings.Join(lines, "\n"))
 					return
 				}
-				entries, err := service.List(owner)
+				entries, used, err := service.Usage(owner)
 				if err != nil {
 					ce.Reply("Failed to read your file service usage: %v", err)
 					return
 				}
-				var used int64
-				for _, entry := range entries {
-					used += entry.Size
-				}
-				ce.Reply("Your file links: %d active, %s used of %s.",
+				ce.Reply("Your file links and albums: %d active, %s used of %s.",
 					len(entries), formatCdnBytes(used), formatCdnBytes(service.cfg.PerUserCapBytes))
 			case "gc":
 				if !ce.User.Permissions.Admin {
@@ -1201,7 +1356,7 @@ func NewCdnCommand(service *CdnService) *commands.FullHandler {
 		Aliases: []string{"files"},
 		Help: commands.HelpMeta{
 			Section:     commands.HelpSectionAdmin,
-			Description: "List, revoke, and inspect bridge-hosted encrypted file links",
+			Description: "List, revoke, and inspect bridge-hosted encrypted file links and albums",
 			Args:        "list | revoke <id> | stats | gc",
 		},
 	}
@@ -1210,8 +1365,8 @@ func NewCdnCommand(service *CdnService) *commands.FullHandler {
 // cdnCommandHelpText is the `cdn` command usage shown in the management room.
 func cdnCommandHelpText() string {
 	return "Usage: $cmdprefix cdn <list|revoke <id>|stats|gc>\n" +
-		"- list: show your active file links (id, size, expiry)\n" +
-		"- revoke <id>: delete one of your file links\n" +
+		"- list: show your active file links and albums (id, size, expiry)\n" +
+		"- revoke <id>: delete one of your file links or albums\n" +
 		"- stats: show storage usage (global for admins, yours otherwise)\n" +
 		"- gc: run expiry cleanup now (admins only)"
 }
