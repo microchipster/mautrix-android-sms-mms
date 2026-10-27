@@ -20,6 +20,12 @@ serves a minimal wrapper page that fetches the ciphertext, decrypts it in the
 browser with WebCrypto, and renders the payload from a blob URL. The service
 exists to dodge carrier MMS limits, not to be bulk storage.
 
+**Albums** extend the same service: one link holds several encrypted items
+plus a small encrypted manifest (item names/types/sizes), and the link serves
+a gallery page that decrypts and renders each item client-side. The link
+shape is identical, so the URL does not reveal whether it points at a file or
+an album.
+
 The feature is **fully configuration-gated**: without `cdn.enabled` and a
 `cdn.domain` there is no service (no listener routes, no management command
 backing, nothing).
@@ -28,27 +34,41 @@ backing, nothing).
 
 - **Zero-knowledge uploads**: the bridge stores and serves ciphertext only.
   It never sees the AES key, the plaintext, or the original filename/type.
-- **URL is the secret**: `GET /f/<id>` and `GET /f/<id>/raw` need no headers
-  and no cookies. Whoever has the full link has the file; there is no second
-  factor, so treat links like passwords.
+- **URL is the secret**: `GET /f/<id>` and the ciphertext routes need no
+  headers and no cookies. Whoever has the full link has the file (or the whole
+  album); there is no second factor, so treat links like passwords.
 - **No payload rendering in the app's domain**: only sniffed image, audio,
-  video and PDF types are rendered on the wrapper page, from a `blob:` URL
-  whose MIME type the page itself derived from magic bytes. HTML, SVG and
-  scripts are never rendered. The wrapper sets
-  `X-Content-Type-Options: nosniff` and a strict CSP with `sandbox
-  allow-scripts` (`default-src 'none'`, `connect-src 'self'`, blob-only
-  media/object sources, no forms, no framing).
-- **Ciphertext downloads** are served as `application/octet-stream` with
-  `Content-Disposition: attachment`, `X-Content-Type-Options: nosniff` and
-  `Cache-Control: private`, so nothing ever renders the raw bytes inline.
-  Because the wrapper page is sandboxed (opaque origin), `/raw` also sends
-  `Access-Control-Allow-Origin: *`; that is safe since the URL is the secret
-  and the bytes are undecryptable without the fragment key.
+  video and PDF types are rendered on the file wrapper page, from a `blob:`
+  URL whose MIME type the page itself derived from magic bytes. The album
+  gallery renders sniffed image/audio/video payloads the same way and offers
+  everything else as a download card. HTML, SVG and scripts are never
+  rendered. Both pages set `X-Content-Type-Options: nosniff` and a strict CSP
+  with `sandbox allow-scripts` (`default-src 'none'`, `connect-src 'self'`,
+  blob-only media/object sources, no forms, no framing); the album page adds
+  `allow-downloads` for its download cards.
+- **Ciphertext downloads** (`/raw`, `/manifest`, `/items/<index>`) are served
+  as `application/octet-stream` with `Content-Disposition: attachment`,
+  `X-Content-Type-Options: nosniff` and `Cache-Control: private`, so nothing
+  ever renders the raw bytes inline. Because the wrapper pages are sandboxed
+  (opaque origin), they also send `Access-Control-Allow-Origin: *`; that is
+  safe since the URL is the secret and the bytes are undecryptable without the
+  fragment key.
+- **Album subkeys**: an album has one fragment key too. The app derives a
+  distinct 32-byte subkey per item with HKDF-SHA256, so the manifest and every
+  item are encrypted under their own key. The manifest (item names/types/
+  sizes) is encrypted as well; the bridge never sees names, types, or any key.
+- **Album gallery**: the album wrapper uses the file wrapper's CSP plus
+  `allow-downloads` for the "other types" cards. It fetches items one by one,
+  renders a payload only when its magic bytes sniff to image/audio/video, and
+  writes manifest strings with `textContent` only, so a hostile manifest
+  cannot inject markup, scripts or external requests. Downloads are
+  `application/octet-stream` blobs behind a user gesture.
 - **Expiry**: links die after the upload's expiry (default 1 month,
   configurable per upload, hard-rejected above 1 year). The service treats
   expired files as gone even before the periodic cleanup removes them.
 - **Quotas**: each user has a byte cap; uploads beyond it prune the oldest
-  files (FIFO) so the cap cannot fill up the disk.
+  files (FIFO) so the cap cannot fill up the disk. Albums count against the
+  same cap and are pruned whole.
 - **Own files only**: list and revoke are scoped to the uploader's Matrix
   user. Foreign ids are indistinguishable from unknown ids (404), so the API
   cannot probe other users' files. The bridge cannot reconstruct links — the
@@ -64,9 +84,141 @@ Everything lives under `cdn.data_dir` (the playbook points it at
 <data_dir>/objects/<id>.meta.json  metadata: id, owner, size, created_at, expires_at
 ```
 
+An album uses the same id space (an id is either a single object or a
+directory, never both) and the same sidecar, with `kind: "album"`:
+
+```
+<data_dir>/objects/<id>                 album directory
+<data_dir>/objects/<id>.meta.json       metadata: id, owner, kind=album, item_count,
+                                        size (items + manifest), created_at, expires_at
+<data_dir>/objects/<id>/manifest        encrypted manifest object
+<data_dir>/objects/<id>/items/<index>   encrypted item ciphertext, 0-based index
+```
+
 Files are written with `os.CreateTemp` + rename (no fixed shared temp paths),
 metadata sidecars are written the same way, and a crash between the two steps
-leaves an orphan that the cleanup removes.
+leaves an orphan that the cleanup removes. Album uploads are staged in a
+`.tmp-album-*` directory inside the same directory and renamed into place in
+one step; interrupted stagings are removed by the cleanup once stale.
+
+## Albums
+
+An album is one link holding up to `cdn.max_album_items` encrypted items plus
+a small encrypted manifest. The link shape does not change:
+
+```
+https://cdn.example.com/f/<id>#<key>
+```
+
+The app encrypts every item locally, builds the manifest, and uploads both in
+one request; the bridge stores ciphertext only. Opening the link serves the
+gallery page instead of the single-file viewer — `GET /f/<id>` picks the page
+from the stored `kind`, so there is no separate album URL shape.
+
+### Limits
+
+- At most `cdn.max_album_items` items (default 20). The container's count
+  byte limits the wire format to 255, which is also the hard maximum of the
+  config key.
+- At most `cdn.max_album_bytes` of item + manifest ciphertext (default
+  500 MiB). The container framing is not counted.
+- At most 64 KiB of manifest ciphertext (`album_manifest_too_large`
+  otherwise): the manifest is metadata, not a second item.
+- Each item is additionally capped by `cdn.max_file_bytes`, exactly like a
+  single file upload.
+- Albums count against `cdn.per_user_cap_bytes` and share the FIFO pruning:
+  the oldest entry (file or album) goes first, and a pruned album is removed
+  whole, manifest and all items.
+- Mixed media is allowed; the manifest order is the display order.
+
+### Upload wire format
+
+One `POST /f/albums` body carries everything, so an album is created
+atomically (all items are stored, or none):
+
+```
+magic            8 bytes          ASCII "CDNALB01"
+count            1 byte           item count (1..255)
+item lengths     count × 8 bytes  uint64 big-endian ciphertext length per item, selection order
+manifest length  8 bytes          uint64 big-endian manifest ciphertext length
+payload          item 0, item 1, …, item count-1, then the manifest
+```
+
+Every part is a ciphertext in the single-file format: 12-byte GCM nonce,
+ciphertext and tag. The bridge validates the declared count and sizes before
+reading any payload, and rejects bad magic, a zero item/manifest length,
+truncation and trailing bytes with `bad_request` (400); the count cap is
+`album_too_many_items` (400), the album size cap `album_too_large` (413), a
+per-item size cap `file_too_large` (413), and a manifest above 64 KiB
+`album_manifest_too_large` (400).
+
+### Manifest
+
+The manifest is UTF-8 JSON, encrypted under its own subkey, and it is never
+parsed by the bridge:
+
+```json
+{
+  "version": 1,
+  "items": [
+    {"name": "IMG_0001.jpg", "type": "image/jpeg", "size": 184320},
+    {"name": "clip.mp4",     "type": "video/mp4",  "size": 5242880}
+  ]
+}
+```
+
+- `version` must be `1`.
+- `items` is in display order; item `i` is stored at index `i`.
+- `name` is a display/file name (the app should send a basename), `type` is
+  the plaintext MIME type, `size` is the plaintext size in bytes
+  (informational; the ciphertext is 28 bytes larger).
+- Readers must ignore unknown fields and render `name`/`type` as text only,
+  never as markup.
+
+### Key derivation (exact)
+
+The link fragment holds one 32-byte fragment key `K` (unpadded base64url).
+Never reuse a fragment key across albums, and never send it to the bridge.
+Subkeys are derived with HKDF-SHA256 (RFC 5869) with `L = 32`:
+
+```
+salt = ASCII bytes of "cdn-album-item"            (14 bytes, no terminator)
+info = ASCII bytes of "item:" + decimal(index)    for the item at 0-based position index
+     = ASCII bytes of "manifest"                   for the manifest object
+
+itemKey(i)  = HKDF-SHA256(ikm = K, salt, info = "item:" + decimal(i), 32)
+manifestKey = HKDF-SHA256(ikm = K, salt, info = "manifest", 32)
+```
+
+On the wire the info strings are `item:0`, `item:1`, … and `manifest`. Item
+names are **not** used as HKDF input: names can repeat and are only known
+after the manifest decrypts, while the index binds every item to its
+position. Each item is then AES-256-GCM encrypted under `itemKey(i)` with a
+fresh random 12-byte nonce and no AAD, exactly like a single file; the
+manifest is AES-256-GCM under `manifestKey`.
+
+The gallery page derives the same subkeys in the browser with WebCrypto
+(`crypto.subtle.deriveBits` with `{name: "HKDF", hash: "SHA-256"}`), so the
+app and the wrapper must implement this derivation identically.
+
+### Gallery page
+
+The album link serves a minimal, self-contained gallery (inline HTML+JS, no
+external assets) with the file wrapper's CSP/nosniff discipline plus
+`allow-downloads`:
+
+- the manifest is fetched once (`GET /f/<id>/manifest`) and decrypted with
+  `manifestKey`; it supplies display text only;
+- image cells fetch and decrypt their item and show it as a grid thumbnail
+  (off-screen cells load when scrolled into view);
+- audio/video cells load and decrypt on demand and become blob players;
+- every other type becomes a download card: the plaintext is decrypted in the
+  browser and offered as an `application/octet-stream` blob download;
+- a failing item shows an error state in its own cell (and a retry/download
+  option) without breaking the rest of the grid;
+- payloads render only when their magic bytes sniff to image/audio/video, so
+  the manifest's `type` field can never make the browser execute or render
+  HTML/SVG/JS.
 
 ## Configuration
 
@@ -89,6 +241,12 @@ network:
     # One encrypted upload in bytes (default 100 MiB).
     max_file_bytes: 104857600
 
+    # One album: item count (default 20, maximum 255) and total item+manifest
+    # ciphertext in bytes (default 500 MiB). Albums also count against
+    # per_user_cap_bytes.
+    max_album_items: 20
+    max_album_bytes: 524288000
+
     # Stored ciphertext per user in bytes (default 1 GiB). Oldest files are
     # pruned first once the cap is exceeded.
     per_user_cap_bytes: 1073741824
@@ -98,43 +256,57 @@ network:
     default_expiry: 30d
     max_expiry: 365d
 
-    # How often expired files are removed (default 1h).
+    # How often expired entries are removed (default 1h).
     gc_interval: 1h
 ```
 
 Validation runs at startup: enabling the feature without a domain/data
-directory, non-positive size caps, an expiry above 365d, a default expiry
-above the maximum, or a domain containing a scheme/path stops the bridge with
-an actionable error instead of starting a broken service. A disabled `cdn`
-section is always valid.
+directory, non-positive size caps, an album item cap above 255, an expiry
+above 365d, a default expiry above the maximum, or a domain containing a
+scheme/path stops the bridge with an actionable error instead of starting a
+broken service. A disabled `cdn` section is always valid. The album caps are
+ordinary `cdn` keys: the playbook's `simple-config.yaml` template needs
+matching role variables to override the bridge defaults (follow-up on the
+playbook side; the defaults apply until then).
 
 ## HTTP API
 
 | Route | Auth | Purpose |
 |---|---|---|
 | `POST /f[?expires=30d]` | bearer | Upload one ciphertext body. Returns `{"id","size","expires_at_ms"}` (201). |
-| `GET /f/{id}` | none | Wrapper page (paste-link-into-browser endpoint). |
-| `GET /f/{id}/raw` | none | Ciphertext, `application/octet-stream`. |
-| `GET /f` | bearer | List your active files: `{"files":[…],"cap_bytes","used_bytes"}`. |
-| `DELETE /f/{id}` | bearer | Revoke your file (204, or 404 for unknown/foreign ids). |
+| `POST /f/albums[?expires=30d]` | bearer | Upload one album container (items + manifest). Returns `{"id","size","items","expires_at_ms"}` (201). |
+| `GET /f/{id}` | none | Wrapper page: the file viewer or the album gallery, chosen from the stored kind. |
+| `GET /f/{id}/raw` | none | Ciphertext of a single file, `application/octet-stream` (404 for album ids). |
+| `GET /f/{id}/manifest` | none | Album manifest ciphertext (404 for files, unknown or expired ids). |
+| `GET /f/{id}/items/{index}` | none | One album item ciphertext by 0-based index (404 out of range, non-canonical, or for files). |
+| `GET /f` | bearer | List your active entries: `{"files":[…],"albums":[…],"cap_bytes","used_bytes"}`. `used_bytes` covers both kinds. |
+| `DELETE /f/{id}` | bearer | Revoke a file or a whole album (204, or 404 for unknown/foreign ids). |
 
 Upload details:
 
-- Body is the raw ciphertext (`application/octet-stream`); nothing is parsed.
-- `expires` accepts duration strings (`12h`, `7d`, `30d`). Missing means the
-  configured default; invalid, zero, or above `max_expiry` is a 400.
+- Body is the raw ciphertext (`application/octet-stream`); nothing is parsed
+  for files. Album bodies are the framed container above: the bridge reads the
+  item count and declared sizes, streams each part into the album directory
+  and never decrypts anything.
+- `expires` accepts duration strings (`12h`, `7d`, `30d`) on both endpoints.
+  Missing means the configured default; invalid, zero, or above `max_expiry`
+  is a 400.
 - Errors use a JSON envelope: `{"error":"<code>","message":"…"}` with codes
-  `unauthorized` (401), `bad_request` (400), `file_too_large` and
+  `unauthorized` (401), `bad_request` (400), `album_too_many_items`,
+  `album_manifest_too_large` (400), `file_too_large`, `album_too_large` and
   `quota_exceeded` (413), `internal` (500).
 
 ## Management-room commands
 
 ```
-!sms cdn list                  # your active links: id, size, expiry
-!sms cdn revoke <id>           # kill one of your links
+!sms cdn list                  # your active links and albums: id, size, expiry
+!sms cdn revoke <id>           # kill one of your links (a file or a whole album)
 !sms cdn stats                 # global numbers for admins, your usage otherwise
 !sms cdn gc                    # run expiry cleanup now (admins only)
 ```
+
+Albums appear in the same list (`album: N item(s)`) and count toward the same
+usage numbers; revoking an album deletes the manifest and every item.
 
 The implementation ships as `NewCdnCommand(service)` in
 `connector/cdn.go`; registering it is a one-liner (below). Commands are
@@ -350,12 +522,29 @@ bridge is this exact patch set:
   Append `?expires=<duration>` when the user picked a lifetime
   (`12h`, `7d`, `30d`, …). Success is 201 with
   `{"id","size","expires_at_ms"}`.
-- **Link**: `<cdn_base_url>/f/<id>#<key>`. Never log or sync the fragment;
-  strip it before analytics, thumbnails or reposts. The bridge cannot
-  regenerate the link, so the app should keep it (or re-upload).
+- **Links**: `<cdn_base_url>/f/<id>#<key>` for both files and albums. Never
+  log or sync the fragment; strip it before analytics, thumbnails or reposts.
+  The bridge cannot regenerate the link, so the app should keep it (or
+  re-upload).
+- **Albums**:
+  - Pick one random 32-byte fragment key per album (CSPRNG); never reuse it.
+  - Derive `itemKey(i)` and `manifestKey` exactly as in the key-derivation
+    section (HKDF-SHA256, salt `cdn-album-item`, info `item:<i>`/`manifest`).
+  - Encrypt each selected item under its index's subkey and the manifest JSON
+    under `manifestKey`, then build the container and
+    `POST <cdn_base_url>/f/albums` with the same bearer token and optional
+    `?expires=`. One request per album, selection order = item order, mixed
+    media allowed.
+  - Pre-check `max_album_items`, `max_album_bytes` (items + manifest) and
+    `max_file_bytes` per item before uploading; the bridge defaults are 20 and
+    500 MiB, but the deployment may lower them.
+  - Success is 201 with `{"id","size","items","expires_at_ms"}`; `size` is
+    the stored ciphertext (items + manifest, framing excluded).
+  - Album management uses the same endpoints: `GET /f` returns albums in the
+    `albums` array, `DELETE /f/<id>` revokes the whole album.
 - **Management from the app**: `GET <cdn_base_url>/f` lists the device
-  user's files; `DELETE <cdn_base_url>/f/<id>` revokes one. Both use the
-  same bearer token; foreign/unknown ids return 404.
+  user's files and albums; `DELETE <cdn_base_url>/f/<id>` revokes one. Both
+  use the same bearer token; foreign/unknown ids return 404.
 - **App settings** (matching the parked plan):
   | Setting | Effect |
   |---|---|
@@ -364,34 +553,56 @@ bridge is this exact patch set:
   | Expiry default (+ ask each time) | Value sent as `?expires=`; must not exceed the bridge's 365d cap. |
   | Upload size limit | App-side pre-check against `max_file_bytes` (remember the +28 bytes overhead). |
   | Global expiry override | App-wide default applied to every URL upload. |
-- The wrapper page is server-rendered; the app does not need its own viewer.
-  Recipients with any browser can open the link, and clients that unfurl URLs
-  must not fetch the fragment (they never do — fragments are not sent).
+- The wrapper pages are server-rendered; the app does not need its own
+  viewer. Recipients with any browser can open a link (album links get the
+  gallery page), and clients that unfurl URLs must not fetch the fragment
+  (they never do — fragments are not sent).
 
 ## Validation
 
-`scripts/validate/t20_cdn.sh` runs this contract against a live base URL (see
-[validation.md](validation.md)): encrypted round trips for text/binary data,
-wrapper-page headers, wrong-key failure, 401/404 handling, expiry, quotas,
-revoke and cross-user isolation. `go test ./... -run Cdn -count=1` covers the
-same HTTP contract in-process, including the app's AES-256-GCM steps.
+`scripts/validate/t20_cdn.sh` runs the single-file contract against a live
+base URL (see [validation.md](validation.md)): encrypted round trips for
+text/binary data, wrapper-page headers, wrong-key failure, 401/404 handling,
+expiry, quotas, revoke and cross-user isolation.
+
+`go test ./... -run Cdn -count=1` covers the same HTTP contract in-process,
+including the app's AES-256-GCM steps, and the full album contract: container
+framing and caps, manifest round-trip, HKDF subkey derivation (cross-checked
+against an RFC 5869 reference and the file helpers), partial item fetches,
+gallery-page headers/escaping, quota/FIFO accounting, expiry and whole-album
+revocation. Live album probes in `t20_cdn.sh` are a follow-up.
 
 ## Caveats
 
 - There is no per-file password beyond the fragment key; a leaked link is a
   leaked file until it is revoked or expires.
+- An album link exposes every item at once; anyone with the link can fetch
+  items one by one for as long as the album lives. Revoking or expiring the
+  album kills the manifest and all items together.
+- The bridge cannot see or validate album item names/types — they live only
+  in the encrypted manifest. A hostile uploader can only affect viewers of
+  their own album, and the gallery still renders manifest strings as text and
+  payloads as sniffed blobs.
 - Expiry is enforced on read and by the hourly cleanup; an expired link
   returns 404 immediately, bytes may linger on disk until the next cleanup.
 - The bridge cannot list, restore or rebuild keys, and cannot show working
   URLs in the management room (only ids).
-- Quota pruning silently removes the oldest files of that user; the app
-  should show remaining quota (`used_bytes`/`cap_bytes`) before uploading.
+- Quota pruning silently removes the oldest entries of that user; a pruned
+  album loses all of its items. The app should show remaining quota
+  (`used_bytes`/`cap_bytes`) before uploading.
 - `data_dir` is under the bridge data volume, so bridge backups include the
   ciphertext (still useless without the keys).
 
 ## Deferred
 
 - App-side uploader, crypto helpers and settings UI.
+- App-side albums: multi-select "Send as album" (subject to the size UX) and
+  in-thread thumbnail-grid rendering that opens the gallery viewer.
+- Live album probes in `scripts/validate/t20_cdn.sh` (the Go contract tests
+  cover the framing, crypto and HTTP behavior in-process).
+- Playbook role variables and `simple-config.yaml` lines for
+  `max_album_items` / `max_album_bytes`; the bridge defaults apply until they
+  land.
 - Playbook role variables, simple-config template, Traefik router and DNS
   (patch plan above).
 - Command help text in `managementRoomHelpText()` and the parent playbook
