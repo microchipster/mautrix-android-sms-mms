@@ -719,6 +719,8 @@ func managementRoomHelpText() string {
 		"- label <phone> <label|--clear>\n" +
 		"- labels\n" +
 		"- spam status | spam recent [count]\n" +
+		"- spam why <number> | spam policy <number> <policy|clear>\n" +
+		"- spam import <file>\n" +
 		"- ttl status | ttl run [--dry-run|--apply]\n" +
 		"- merge <room-id> <room-id> [<room-id> ...] [--into <room-id>] [--yes]\n" +
 		"- merges\n" +

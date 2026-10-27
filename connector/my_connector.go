@@ -34,12 +34,13 @@ type MyConnector struct {
 	ttlCancel context.CancelFunc
 	ttlState  ttlState
 
-	spamMu       sync.Mutex
-	spamRate     *spamRateLimiter
-	spamDupes    *spamDuplicateTracker
-	spamRecent   []spamRecord
-	spamCounters spamCounters
-	spamLast     time.Time
+	spamMu           sync.Mutex
+	spamStore        *spamStore
+	spamDigest       spamDigestState
+	spamDigestCancel context.CancelFunc
+	spamRecent       []spamRecord
+	spamCounters     spamCounters
+	spamLast         time.Time
 }
 
 // NewMyConnector creates a new instance of MyConnector.
@@ -249,6 +250,7 @@ func (c *MyConnector) Start(ctx context.Context) error {
 		c.log.Warn().Msg("No stored Android SMS/MMS logins found; no agent event feed will be started")
 	}
 	c.startHistoryTTLLoop()
+	c.startSpamLoop()
 	if c.cdn != nil {
 		c.cdn.StartGC()
 	}
@@ -260,6 +262,7 @@ func (c *MyConnector) Start(ctx context.Context) error {
 func (c *MyConnector) Stop() {
 	c.log.Info().Msg("MyConnector Stop called")
 	c.stopHistoryTTLLoop()
+	c.stopSpamLoop()
 	if c.cdn != nil {
 		c.cdn.StopGC()
 	}

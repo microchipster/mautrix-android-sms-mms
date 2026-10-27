@@ -52,8 +52,30 @@ func TestAntiSpamConfigDefaults(t *testing.T) {
 	if cfg.Duplicates.Count != defaultAntiSpamDuplicateCount || cfg.Duplicates.Window.Duration() != defaultAntiSpamDuplicateWindow {
 		t.Errorf("duplicates = %+v", cfg.Duplicates)
 	}
-	if !cfg.Notices.Management {
-		t.Error("management notices should default to on")
+	if cfg.Notices.NoticeMode() != AntiSpamNoticeImmediate {
+		t.Errorf("notices.mode = %q, want immediate", cfg.Notices.Mode)
+	}
+	if cfg.Notices.DigestInterval.Duration() != defaultAntiSpamDigestInterval {
+		t.Errorf("notices.digest_interval = %s, want %s", cfg.Notices.DigestInterval.Duration(), defaultAntiSpamDigestInterval)
+	}
+	if cfg.SenderClasses.HomeCountry != defaultAntiSpamHomeCountry {
+		t.Errorf("sender_classes.home_country = %q, want %q", cfg.SenderClasses.HomeCountry, defaultAntiSpamHomeCountry)
+	}
+	if cfg.SenderClasses.ShortcodeWeight != defaultAntiSpamShortcodeWeight ||
+		cfg.SenderClasses.TollFreeWeight != defaultAntiSpamTollFreeWeight ||
+		cfg.SenderClasses.AlphanumericWeight != defaultAntiSpamAlphanumericWeight ||
+		cfg.SenderClasses.InternationalWeight != defaultAntiSpamInternationalWeight {
+		t.Errorf("sender class weights = %+v", cfg.SenderClasses)
+	}
+	if cfg.Reputation.Weight != defaultAntiSpamReputationWeight ||
+		cfg.Reputation.FlagWeight != defaultAntiSpamReputationFlagWeight ||
+		cfg.Reputation.BlockWeight != defaultAntiSpamReputationBlockWeight ||
+		cfg.Reputation.VolumeThreshold != defaultAntiSpamReputationVolumeThreshold ||
+		cfg.Reputation.MaxScore != defaultAntiSpamReputationMaxScore {
+		t.Errorf("reputation = %+v", cfg.Reputation)
+	}
+	if cfg.Feeds.Weight != defaultAntiSpamFeedWeight || len(cfg.Feeds.Paths) != 0 {
+		t.Errorf("feeds = %+v", cfg.Feeds)
 	}
 }
 
@@ -157,8 +179,11 @@ network:
 	if cfg.Duplicates.Count != 5 || cfg.Duplicates.Window.Duration() != 2*time.Hour {
 		t.Errorf("duplicates = %+v", cfg.Duplicates)
 	}
-	if cfg.Notices.Management {
-		t.Error("notices.management: false was not applied")
+	if cfg.Notices.NoticeMode() != AntiSpamNoticeOff {
+		t.Error("legacy notices.management: false should map to mode off")
+	}
+	if cfg.SenderClasses.HomeCountry != defaultAntiSpamHomeCountry || cfg.Reputation.Weight != defaultAntiSpamReputationWeight {
+		t.Errorf("new sections lost their defaults: %+v %+v", cfg.SenderClasses, cfg.Reputation)
 	}
 }
 
@@ -224,6 +249,19 @@ network:
     duplicates:
       count: 4
       window: 2h
+    notices:
+      mode: digest
+      digest_interval: 30m
+    sender_classes:
+      shortcode_weight: 1
+      hold_classes: [alphanumeric]
+      home_country: "49"
+    reputation:
+      weight: 5
+      max_score: 40
+    feeds:
+      paths: [/tmp/urlhaus.txt]
+      weight: 7
 `).AntiSpam
 	data, err := yaml.Marshal(&cfg)
 	if err != nil {
@@ -252,8 +290,117 @@ network:
 	if back.URLs.Weight != defaultAntiSpamURLWeight {
 		t.Errorf("urls defaults lost after round trip: %+v", back.URLs)
 	}
-	if !back.Notices.Management {
-		t.Error("notices default lost after round trip")
+	if back.Notices.NoticeMode() != AntiSpamNoticeDigest || back.Notices.DigestInterval.Duration() != 30*time.Minute {
+		t.Errorf("notices mismatch after round trip: %+v", back.Notices)
+	}
+	if back.SenderClasses.ShortcodeWeight != 1 || back.SenderClasses.HomeCountry != "49" {
+		t.Errorf("sender_classes mismatch after round trip: %+v", back.SenderClasses)
+	}
+	if len(back.SenderClasses.HoldClasses) != 1 || back.SenderClasses.HoldClasses[0] != "alphanumeric" {
+		t.Errorf("hold_classes mismatch after round trip: %v", back.SenderClasses.HoldClasses)
+	}
+	if back.Reputation.Weight != 5 || back.Reputation.MaxScore != 40 || back.Reputation.FlagWeight != defaultAntiSpamReputationFlagWeight {
+		t.Errorf("reputation mismatch after round trip: %+v", back.Reputation)
+	}
+	if len(back.Feeds.Paths) != 1 || back.Feeds.Paths[0] != "/tmp/urlhaus.txt" || back.Feeds.Weight != 7 {
+		t.Errorf("feeds mismatch after round trip: %+v", back.Feeds)
+	}
+}
+
+func TestAntiSpamConfigNoticesModes(t *testing.T) {
+	digest := unmarshalNetworkConfig(t, `
+network:
+  anti_spam:
+    notices:
+      mode: DIGEST
+      digest_interval: 30m
+`).AntiSpam
+	if digest.Notices.NoticeMode() != AntiSpamNoticeDigest || digest.Notices.DigestInterval.Duration() != 30*time.Minute {
+		t.Errorf("digest notices = %+v", digest.Notices)
+	}
+	off := unmarshalNetworkConfig(t, "network:\n  anti_spam:\n    notices:\n      mode: off\n").AntiSpam
+	if off.Notices.NoticeMode() != AntiSpamNoticeOff {
+		t.Errorf("off notices = %+v", off.Notices)
+	}
+	if off.Notices.DigestInterval.Duration() != defaultAntiSpamDigestInterval {
+		t.Errorf("off notices lost the digest interval default: %+v", off.Notices)
+	}
+	// An explicit mode wins over the legacy management flag.
+	legacy := unmarshalNetworkConfig(t, `
+network:
+  anti_spam:
+    notices:
+      management: false
+      mode: digest
+`).AntiSpam
+	if legacy.Notices.NoticeMode() != AntiSpamNoticeDigest {
+		t.Errorf("explicit mode must win over management: %+v", legacy.Notices)
+	}
+}
+
+func TestAntiSpamConfigNewSectionsExplicitValues(t *testing.T) {
+	cfg := unmarshalNetworkConfig(t, `
+network:
+  anti_spam:
+    sender_classes:
+      shortcode_weight: 1
+      toll_free_weight: 2
+      alphanumeric_weight: 3
+      international_weight: 4
+      hold_classes: ["ALPHANUMERIC"]
+      block_classes: [shortcode]
+      home_country: "+49"
+    reputation:
+      weight: 5
+      flag_weight: 2
+      block_weight: 3
+      volume_threshold: 20
+      max_score: 50
+    feeds:
+      paths: [" /tmp/urlhaus.txt ", "", " .feeds/urlhaus.txt "]
+      weight: 9
+`).AntiSpam
+	if cfg.SenderClasses.ShortcodeWeight != 1 || cfg.SenderClasses.TollFreeWeight != 2 ||
+		cfg.SenderClasses.AlphanumericWeight != 3 || cfg.SenderClasses.InternationalWeight != 4 {
+		t.Errorf("sender class weights = %+v", cfg.SenderClasses)
+	}
+	if len(cfg.SenderClasses.HoldClasses) != 1 || cfg.SenderClasses.HoldClasses[0] != "alphanumeric" {
+		t.Errorf("hold_classes = %v", cfg.SenderClasses.HoldClasses)
+	}
+	if len(cfg.SenderClasses.BlockClasses) != 1 || cfg.SenderClasses.BlockClasses[0] != "shortcode" {
+		t.Errorf("block_classes = %v", cfg.SenderClasses.BlockClasses)
+	}
+	if cfg.SenderClasses.HomeCountry != "49" {
+		t.Errorf("home_country = %q, want 49", cfg.SenderClasses.HomeCountry)
+	}
+	if cfg.Reputation.Weight != 5 || cfg.Reputation.FlagWeight != 2 || cfg.Reputation.BlockWeight != 3 ||
+		cfg.Reputation.VolumeThreshold != 20 || cfg.Reputation.MaxScore != 50 {
+		t.Errorf("reputation = %+v", cfg.Reputation)
+	}
+	if len(cfg.Feeds.Paths) != 2 || cfg.Feeds.Paths[0] != "/tmp/urlhaus.txt" || cfg.Feeds.Paths[1] != ".feeds/urlhaus.txt" || cfg.Feeds.Weight != 9 {
+		t.Errorf("feeds = %+v", cfg.Feeds)
+	}
+}
+
+func TestAntiSpamConfigRejectsBadNewSections(t *testing.T) {
+	tests := []string{
+		"network:\n  anti_spam:\n    notices:\n      mode: nope\n",
+		"network:\n  anti_spam:\n    notices:\n      digest_interval: -1m\n",
+		"network:\n  anti_spam:\n    sender_classes:\n      shortcode_weight: -1\n",
+		"network:\n  anti_spam:\n    sender_classes:\n      hold_classes: [nope]\n",
+		"network:\n  anti_spam:\n    sender_classes:\n      block_classes: [nope]\n",
+		"network:\n  anti_spam:\n    sender_classes:\n      hold_classes: [shortcode]\n      block_classes: [shortcode]\n",
+		"network:\n  anti_spam:\n    sender_classes:\n      home_country: US\n",
+		"network:\n  anti_spam:\n    reputation:\n      weight: -1\n",
+		"network:\n  anti_spam:\n    feeds:\n      weight: -1\n",
+	}
+	for _, content := range tests {
+		var wrapper struct {
+			Network *SimpleConfig `yaml:"network"`
+		}
+		if err := yaml.Unmarshal([]byte(content), &wrapper); err == nil {
+			t.Errorf("expected an error for config:\n%s", content)
+		}
 	}
 }
 

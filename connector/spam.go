@@ -14,12 +14,12 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/commands"
 	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/id"
 )
 
 // Anti-spam decision actions.
@@ -40,12 +40,9 @@ const (
 )
 
 const (
-	// spamRecentCapacity bounds the in-memory `spam recent` ring.
+	// spamRecentCapacity bounds the persisted `spam recent` log and its
+	// in-memory mirror.
 	spamRecentCapacity = 200
-	// spamRateLimiterMaxSenders bounds the first-contact limiter state.
-	spamRateLimiterMaxSenders = 2048
-	// spamDuplicateMaxBodies bounds the duplicate tracker state.
-	spamDuplicateMaxBodies = 1024
 	// spamRecentDefaultCount is how many records `spam recent` shows.
 	spamRecentDefaultCount = 20
 )
@@ -73,7 +70,15 @@ type spamPolicy struct {
 	URLWeight           int
 	DuplicateWindow     time.Duration
 	DuplicateCount      int
-	Notices             bool
+	NoticeMode          string
+	DigestInterval      time.Duration
+	ClassWeights        map[string]int
+	ClassHold           map[string]struct{}
+	ClassBlock          map[string]struct{}
+	HomeCountry         string
+	Reputation          AntiSpamReputationConfig
+	FeedWeight          int
+	FeedPaths           []string
 }
 
 // compileSpamPolicy validates and compiles the anti-spam configuration. The
@@ -93,7 +98,12 @@ func compileSpamPolicy(cfg AntiSpamConfig) (spamPolicy, error) {
 		URLWeight:           cfg.URLs.Weight,
 		DuplicateWindow:     cfg.Duplicates.Window.Duration(),
 		DuplicateCount:      cfg.Duplicates.Count,
-		Notices:             cfg.Notices.Management,
+		NoticeMode:          cfg.Notices.NoticeMode(),
+		DigestInterval:      cfg.Notices.DigestInterval.Duration(),
+		HomeCountry:         normalizeSpamHomeCountry(cfg.SenderClasses.HomeCountry),
+		Reputation:          cfg.Reputation,
+		FeedWeight:          cfg.Feeds.Weight,
+		FeedPaths:           append([]string(nil), cfg.Feeds.Paths...),
 	}
 	if policy.UnknownSenderPolicy == "" {
 		policy.UnknownSenderPolicy = AntiSpamPolicyBridge
@@ -104,8 +114,31 @@ func compileSpamPolicy(cfg AntiSpamConfig) (spamPolicy, error) {
 	if policy.DuplicateWindow <= 0 {
 		policy.DuplicateWindow = defaultAntiSpamDuplicateWindow
 	}
+	if policy.DigestInterval <= 0 {
+		policy.DigestInterval = defaultAntiSpamDigestInterval
+	}
 	if policy.URLWeight < 0 {
 		policy.URLWeight = 0
+	}
+	if policy.Reputation.Weight < 0 {
+		policy.Reputation.Weight = 0
+	}
+	if policy.FeedWeight < 0 {
+		policy.FeedWeight = 0
+	}
+	policy.ClassWeights = map[string]int{
+		SpamSenderClassShortcode:     cfg.SenderClasses.ShortcodeWeight,
+		SpamSenderClassTollFree:      cfg.SenderClasses.TollFreeWeight,
+		SpamSenderClassAlphanumeric:  cfg.SenderClasses.AlphanumericWeight,
+		SpamSenderClassInternational: cfg.SenderClasses.InternationalWeight,
+	}
+	policy.ClassHold = make(map[string]struct{}, len(cfg.SenderClasses.HoldClasses))
+	for _, class := range cfg.SenderClasses.HoldClasses {
+		policy.ClassHold[strings.ToLower(strings.TrimSpace(class))] = struct{}{}
+	}
+	policy.ClassBlock = make(map[string]struct{}, len(cfg.SenderClasses.BlockClasses))
+	for _, class := range cfg.SenderClasses.BlockClasses {
+		policy.ClassBlock[strings.ToLower(strings.TrimSpace(class))] = struct{}{}
 	}
 	for _, label := range cfg.AllowLabels {
 		policy.AllowLabels[strings.ToLower(strings.TrimSpace(label))] = struct{}{}
@@ -151,26 +184,47 @@ func (d spamDecision) dropped() bool {
 }
 
 // spamEvaluation is the pure input of the decision engine. Stateful inputs
-// (first-contact rate, duplicate count) are computed by the caller so the
-// decision itself stays testable without clocks or counters.
+// (first-contact rate, duplicate count, reputation, feed matches, sender
+// class) are computed by the caller so the decision itself stays testable
+// without clocks or counters.
 type spamEvaluation struct {
-	Body           string
-	KnownContact   bool
-	Labels         []string
-	RateCount      int
-	DuplicateCount int
+	Body            string
+	KnownContact    bool
+	Labels          []string
+	Override        string
+	RateCount       int
+	DuplicateCount  int
+	SenderClass     string
+	ClassWeight     int
+	ClassHold       bool
+	ClassBlock      bool
+	ReputationScore int
+	FeedSignals     []string
 }
 
 // evaluateSpam applies the configured policy to one message. Precedence:
-// block patterns, then hold for unknown senders, then score/duplicate/rate
-// flags, then the unknown-sender label.
+// per-contact override "allow", block rules (pattern/class/override), hold for
+// unknown senders, then score/duplicate/rate flags, then the unknown-sender
+// label.
 func evaluateSpam(policy spamPolicy, ev spamEvaluation) spamDecision {
 	decision := spamDecision{Action: spamActionAllow}
 	if !policy.Enabled {
 		return decision
 	}
+	if ev.Override == SpamContactPolicyAllow {
+		return decision
+	}
 	allowed := ev.KnownContact || hasSpamAllowLabel(ev.Labels, policy.AllowLabels)
-	blocked := false
+	switch ev.Override {
+	case SpamContactPolicyBridge:
+		allowed = true
+	case SpamContactPolicyLabel, SpamContactPolicyHold, SpamContactPolicyBlock:
+		allowed = false
+	}
+	if ev.Override != "" && ev.Override != SpamContactPolicyAllow {
+		decision.Reasons = append(decision.Reasons, "override:"+ev.Override)
+	}
+	blocked := ev.ClassBlock
 	for _, pattern := range policy.Patterns {
 		if !pattern.Re.MatchString(ev.Body) {
 			continue
@@ -185,6 +239,18 @@ func evaluateSpam(policy spamPolicy, ev spamEvaluation) spamDecision {
 		decision.Score += policy.URLWeight
 		decision.Reasons = append(decision.Reasons, "url:"+signal)
 	}
+	for _, signal := range ev.FeedSignals {
+		decision.Score += policy.FeedWeight
+		decision.Reasons = append(decision.Reasons, "feed:"+signal)
+	}
+	if ev.SenderClass != "" && ev.ClassWeight > 0 {
+		decision.Score += ev.ClassWeight
+		decision.Reasons = append(decision.Reasons, "class:"+ev.SenderClass)
+	}
+	if ev.ReputationScore > 0 {
+		decision.Score += ev.ReputationScore
+		decision.Reasons = append(decision.Reasons, "reputation")
+	}
 	duplicate := policy.DuplicateCount > 0 && ev.DuplicateCount >= policy.DuplicateCount
 	if duplicate {
 		decision.Reasons = append(decision.Reasons, "duplicate")
@@ -197,15 +263,25 @@ func evaluateSpam(policy spamPolicy, ev spamEvaluation) spamDecision {
 	if overThreshold {
 		decision.Reasons = append(decision.Reasons, "score")
 	}
+	unknownPolicy := policy.UnknownSenderPolicy
+	switch ev.Override {
+	case SpamContactPolicyLabel:
+		unknownPolicy = AntiSpamPolicyLabel
+	case SpamContactPolicyHold:
+		unknownPolicy = AntiSpamPolicyHold
+	}
+	if ev.ClassHold && !allowed {
+		unknownPolicy = AntiSpamPolicyHold
+	}
 
-	if blocked {
+	if blocked || ev.Override == SpamContactPolicyBlock {
 		decision.Action = spamActionBlock
 		decision.Notify = true
 		return decision
 	}
 	if !allowed {
 		decision.Reasons = append(decision.Reasons, "unknown-sender")
-		if policy.UnknownSenderPolicy == AntiSpamPolicyHold {
+		if unknownPolicy == AntiSpamPolicyHold {
 			decision.Action = spamActionHold
 			decision.Notify = true
 			return decision
@@ -217,7 +293,7 @@ func evaluateSpam(policy spamPolicy, ev spamEvaluation) spamDecision {
 		decision.Notify = true
 	case !allowed:
 		decision.Action = spamActionLabel
-		decision.Notify = policy.UnknownSenderPolicy == AntiSpamPolicyBridge
+		decision.Notify = unknownPolicy == AntiSpamPolicyBridge
 	}
 	return decision
 }
@@ -335,127 +411,168 @@ func spamBodyHash(body string) string {
 	return hex.EncodeToString(sum[:16])
 }
 
-// spamRateLimiter counts recent messages per sender in a sliding window.
-type spamRateLimiter struct {
-	mu      sync.Mutex
-	window  time.Duration
-	entries map[string][]time.Time
+// ensureSpamStore lazily creates and caches the persistent anti-spam state
+// store in the bridge database. It returns an error when the bridge database
+// is not available (e.g. in unit tests of the pure decision engine); callers
+// fall back to zero state in that case.
+func (c *MyConnector) ensureSpamStore(ctx context.Context) (*spamStore, error) {
+	if c == nil || c.bridge == nil || c.bridge.DB == nil {
+		return nil, fmt.Errorf("bridge database is not available")
+	}
+	c.spamMu.Lock()
+	if c.spamStore == nil {
+		c.spamStore = newSpamStore(c.bridge.DB.Database, c.bridge.DB.BridgeID)
+	}
+	store := c.spamStore
+	c.spamMu.Unlock()
+	if err := store.ensure(ctx); err != nil {
+		return nil, err
+	}
+	return store, nil
 }
 
-func newSpamRateLimiter(window time.Duration) *spamRateLimiter {
-	if window <= 0 {
-		window = defaultAntiSpamFirstContactWindow
+// loadSpamRecent seeds the in-memory recent-decisions mirror from the
+// persistent store, so `spam recent` survives restarts.
+func (c *MyConnector) loadSpamRecent(ctx context.Context) {
+	store, err := c.ensureSpamStore(ctx)
+	if err != nil {
+		return
 	}
-	return &spamRateLimiter{window: window, entries: make(map[string][]time.Time)}
+	records, err := store.recentDecisions(ctx, spamRecentCapacity)
+	if err != nil {
+		c.log.Warn().Err(err).Msg("Failed to load persisted anti-spam decisions")
+		return
+	}
+	c.spamMu.Lock()
+	c.spamRecent = records
+	c.spamMu.Unlock()
 }
 
-// record adds one message from sender and returns how many messages from that
-// sender are inside the window (including this one).
-func (r *spamRateLimiter) record(sender string, now time.Time) int {
-	if r == nil || sender == "" {
-		return 0
+// importConfiguredSpamFeeds imports every anti_spam.feeds.paths file. It only
+// reads local files; the bridge never fetches feeds itself.
+func (c *MyConnector) importConfiguredSpamFeeds(ctx context.Context, paths []string) {
+	if c == nil || len(paths) == 0 {
+		return
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	cutoff := now.Add(-r.window)
-	kept := r.entries[sender][:0]
-	for _, ts := range r.entries[sender] {
-		if !ts.Before(cutoff) {
-			kept = append(kept, ts)
-		}
+	store, err := c.ensureSpamStore(ctx)
+	if err != nil {
+		c.log.Warn().Err(err).Msg("Anti-spam feed paths are configured but the state store is unavailable")
+		return
 	}
-	kept = append(kept, now)
-	r.entries[sender] = kept
-	if len(r.entries) > spamRateLimiterMaxSenders {
-		r.pruneLocked(cutoff)
-	}
-	return len(kept)
-}
-
-func (r *spamRateLimiter) pruneLocked(cutoff time.Time) {
-	for sender, timestamps := range r.entries {
-		kept := timestamps[:0]
-		for _, ts := range timestamps {
-			if !ts.Before(cutoff) {
-				kept = append(kept, ts)
-			}
-		}
-		if len(kept) == 0 {
-			delete(r.entries, sender)
+	for _, path := range paths {
+		result, err := store.importFeedFile(ctx, path)
+		if err != nil {
+			c.log.Warn().Err(err).Str("path", path).Msg("Failed to import a configured anti-spam feed")
 			continue
 		}
-		r.entries[sender] = kept
-	}
-	for sender := range r.entries {
-		if len(r.entries) <= spamRateLimiterMaxSenders {
-			break
-		}
-		delete(r.entries, sender)
+		c.log.Info().Str("path", path).Str("source", result.Source).
+			Int("added", result.Added).Int("total", result.Total).Msg("Imported anti-spam feed file")
 	}
 }
 
-// spamDuplicateTracker counts distinct senders per normalized body hash.
-type spamDuplicateTracker struct {
-	mu      sync.Mutex
-	window  time.Duration
-	entries map[string]map[string]time.Time
-}
-
-func newSpamDuplicateTracker(window time.Duration) *spamDuplicateTracker {
-	if window <= 0 {
-		window = defaultAntiSpamDuplicateWindow
+// recordSpamDigest folds one decision into the pending digest. It is a no-op
+// unless notices.mode is "digest".
+func (c *MyConnector) recordSpamDigest(record spamRecord, room id.RoomID) {
+	if c == nil || c.antiSpamConfig().Notices.NoticeMode() != AntiSpamNoticeDigest {
+		return
 	}
-	return &spamDuplicateTracker{window: window, entries: make(map[string]map[string]time.Time)}
+	c.spamMu.Lock()
+	c.spamDigest.add(record, room)
+	c.spamMu.Unlock()
 }
 
-// record adds one body/sender observation and returns how many distinct
-// senders sent the same body inside the window (including this one).
-func (d *spamDuplicateTracker) record(body, sender string, now time.Time) int {
-	if d == nil || sender == "" {
+// spamDigestPending reports how many decisions are waiting for the next
+// digest flush.
+func (c *MyConnector) spamDigestPending() int {
+	if c == nil {
 		return 0
 	}
-	hash := spamBodyHash(body)
-	if hash == "" {
-		return 0
+	c.spamMu.Lock()
+	defer c.spamMu.Unlock()
+	return c.spamDigest.Total
+}
+
+// takeSpamDigest renders and resets the pending digest.
+func (c *MyConnector) takeSpamDigest(now time.Time) (string, id.RoomID, bool) {
+	if c == nil {
+		return "", "", false
 	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	cutoff := now.Add(-d.window)
-	senders, ok := d.entries[hash]
+	c.spamMu.Lock()
+	defer c.spamMu.Unlock()
+	return c.spamDigest.take(now)
+}
+
+// flushSpamDigest posts the pending digest to the management room it was
+// accumulated from, then resets it.
+func (c *MyConnector) flushSpamDigest(ctx context.Context) {
+	if c == nil {
+		return
+	}
+	text, room, ok := c.takeSpamDigest(time.Now().UTC())
 	if !ok {
-		senders = make(map[string]time.Time)
-		d.entries[hash] = senders
+		return
 	}
-	for existing, firstSeen := range senders {
-		if firstSeen.Before(cutoff) {
-			delete(senders, existing)
-		}
+	c.log.Info().Str("room_id", string(room)).Msg("Posting anti-spam digest")
+	if c.bridge == nil || c.bridge.Bot == nil || room == "" {
+		return
 	}
-	if _, seen := senders[sender]; !seen {
-		senders[sender] = now
-	}
-	if len(d.entries) > spamDuplicateMaxBodies {
-		d.pruneLocked(cutoff)
-	}
-	return len(senders)
+	sendNotice(c.bridge.Bot, room, text)
 }
 
-func (d *spamDuplicateTracker) pruneLocked(cutoff time.Time) {
-	for hash, senders := range d.entries {
-		for sender, firstSeen := range senders {
-			if firstSeen.Before(cutoff) {
-				delete(senders, sender)
+// startSpamLoop loads the persisted anti-spam state, imports the configured
+// local feed files and starts the digest scheduler when digest mode is on.
+func (c *MyConnector) startSpamLoop() {
+	if c == nil || c.bridge == nil {
+		return
+	}
+	cfg := c.antiSpamConfig()
+	if !cfg.Enabled {
+		return
+	}
+	ctx := context.Background()
+	c.loadSpamRecent(ctx)
+	c.importConfiguredSpamFeeds(ctx, cfg.Feeds.Paths)
+	if cfg.Notices.NoticeMode() != AntiSpamNoticeDigest {
+		return
+	}
+	interval := cfg.Notices.DigestInterval.Duration()
+	if interval <= 0 {
+		interval = defaultAntiSpamDigestInterval
+	}
+	c.spamMu.Lock()
+	if c.spamDigestCancel != nil {
+		c.spamMu.Unlock()
+		return
+	}
+	loopCtx, cancel := context.WithCancel(context.Background())
+	c.spamDigestCancel = cancel
+	c.spamMu.Unlock()
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-loopCtx.Done():
+				return
+			case <-ticker.C:
+				c.flushSpamDigest(loopCtx)
 			}
 		}
-		if len(senders) == 0 {
-			delete(d.entries, hash)
-		}
+	}()
+	c.log.Info().Dur("interval", interval).Msg("Started anti-spam digest loop")
+}
+
+// stopSpamLoop cancels the digest scheduler.
+func (c *MyConnector) stopSpamLoop() {
+	if c == nil {
+		return
 	}
-	for hash := range d.entries {
-		if len(d.entries) <= spamDuplicateMaxBodies {
-			break
-		}
-		delete(d.entries, hash)
+	c.spamMu.Lock()
+	cancel := c.spamDigestCancel
+	c.spamDigestCancel = nil
+	c.spamMu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 }
 
@@ -501,50 +618,38 @@ func (c *spamCounters) add(action string, dryRun bool) {
 	}
 }
 
-// spamRateLimiter returns the connector's first-contact limiter, recreating it
-// when the configured window changes.
-func (c *MyConnector) spamRateLimiter(window time.Duration) *spamRateLimiter {
-	c.spamMu.Lock()
-	defer c.spamMu.Unlock()
-	if c.spamRate == nil || c.spamRate.window != window {
-		c.spamRate = newSpamRateLimiter(window)
-	}
-	return c.spamRate
-}
-
-// spamDuplicateTracker returns the connector's duplicate detector, recreating
-// it when the configured window changes.
-func (c *MyConnector) spamDuplicateTracker(window time.Duration) *spamDuplicateTracker {
-	c.spamMu.Lock()
-	defer c.spamMu.Unlock()
-	if c.spamDupes == nil || c.spamDupes.window != window {
-		c.spamDupes = newSpamDuplicateTracker(window)
-	}
-	return c.spamDupes
-}
-
-// recordSpamDecision stores one decision in the counters and the recent ring.
-// Allow decisions are counted but not kept in the ring.
-func (c *MyConnector) recordSpamDecision(record spamRecord) {
+// recordSpamDecision stores one decision in the in-memory counters and recent
+// mirror and, best-effort, in the persistent store. Allow decisions are
+// counted but not kept in the recent ring or in the store.
+func (c *MyConnector) recordSpamDecision(ctx context.Context, record spamRecord) {
 	if c == nil {
 		return
 	}
 	c.spamMu.Lock()
-	defer c.spamMu.Unlock()
 	c.spamCounters.add(record.Action, record.DryRun)
 	c.spamLast = record.Time
+	if record.Action != spamActionAllow {
+		if len(c.spamRecent) >= spamRecentCapacity {
+			// Drop the oldest half to keep memory bounded without a ring index.
+			keep := spamRecentCapacity / 2
+			copy(c.spamRecent, c.spamRecent[len(c.spamRecent)-keep:])
+			c.spamRecent = c.spamRecent[:keep]
+		}
+		stored := record
+		stored.Reasons = append([]string(nil), record.Reasons...)
+		c.spamRecent = append(c.spamRecent, stored)
+	}
+	c.spamMu.Unlock()
 	if record.Action == spamActionAllow {
 		return
 	}
-	if len(c.spamRecent) >= spamRecentCapacity {
-		// Drop the oldest half to keep memory bounded without a ring index.
-		keep := spamRecentCapacity / 2
-		copy(c.spamRecent, c.spamRecent[len(c.spamRecent)-keep:])
-		c.spamRecent = c.spamRecent[:keep]
+	store, err := c.ensureSpamStore(ctx)
+	if err != nil {
+		return
 	}
-	stored := record
-	stored.Reasons = append([]string(nil), record.Reasons...)
-	c.spamRecent = append(c.spamRecent, stored)
+	if err := store.addDecision(ctx, record); err != nil {
+		c.log.Warn().Err(err).Msg("Failed to persist anti-spam decision")
+	}
 }
 
 // spamSnapshot returns the counters, a copy of the recent decisions (oldest
@@ -599,21 +704,74 @@ func (nc *MyNetworkClient) spamGate(ctx context.Context, portalKey networkid.Por
 	}
 	labels := nc.ghostLabels(ctx, MakeUserID(canonical))
 
-	rateCount := 0
-	if !known {
-		rateCount = nc.connector.spamRateLimiter(policy.FirstContactWindow).record(canonical, ts)
+	// The persistent store keeps first-contact rate, duplicates, decisions,
+	// reputation and per-contact overrides across restarts. Without it (no
+	// database), the gate degrades to zero state instead of failing.
+	store, err := nc.connector.ensureSpamStore(ctx)
+	if err != nil {
+		nc.log.Debug().Err(err).Msg("Anti-spam state store is not available; continuing without persisted state")
+		store = nil
 	}
-	duplicateCount := 0
-	if !group {
-		duplicateCount = nc.connector.spamDuplicateTracker(policy.DuplicateWindow).record(body, canonical, ts)
+	contact := spamContactStats{}
+	if store != nil {
+		if stored, ok, err := store.contact(ctx, canonical); err != nil {
+			nc.log.Warn().Err(err).Str("sender", canonical).Msg("Failed to load anti-spam contact history")
+		} else if ok {
+			contact = stored
+		}
 	}
 
+	// Per-contact override first, then the global policy: allow/bridge vouch
+	// for the sender, label/hold/block force the unknown-sender paths.
+	vetted := known || hasSpamAllowLabel(labels, policy.AllowLabels)
+	switch contact.Policy {
+	case SpamContactPolicyAllow, SpamContactPolicyBridge:
+		vetted = true
+	case SpamContactPolicyLabel, SpamContactPolicyHold, SpamContactPolicyBlock:
+		vetted = false
+	}
+
+	rateCount := 0
+	if !vetted && policy.FirstContactLimit > 0 && store != nil {
+		rateCount, err = store.recordRate(ctx, canonical, ts, policy.FirstContactWindow, spamStoreMaxSenders)
+		if err != nil {
+			nc.log.Warn().Err(err).Str("sender", canonical).Msg("Failed to record first-contact rate")
+			rateCount = 0
+		}
+	}
+	duplicateCount := 0
+	if !group && store != nil {
+		duplicateCount, err = store.recordDuplicate(ctx, spamBodyHash(body), canonical, ts, policy.DuplicateWindow, spamStoreMaxBodies)
+		if err != nil {
+			nc.log.Warn().Err(err).Str("sender", canonical).Msg("Failed to record duplicate body")
+			duplicateCount = 0
+		}
+	}
+
+	class := spamSenderClass(canonical, policy.HomeCountry)
+	classWeight, classHold, classBlock := 0, false, false
+	reputationScore := 0
+	if !vetted {
+		classWeight = policy.ClassWeights[class]
+		_, classHold = policy.ClassHold[class]
+		_, classBlock = policy.ClassBlock[class]
+		reputationScore, _ = spamReputationScore(policy.Reputation, contact, ts)
+	}
+	feedSignals := spamFeedSignals(ctx, store, canonical, body)
+
 	decision := evaluateSpam(policy, spamEvaluation{
-		Body:           body,
-		KnownContact:   known,
-		Labels:         labels,
-		RateCount:      rateCount,
-		DuplicateCount: duplicateCount,
+		Body:            body,
+		KnownContact:    vetted,
+		Labels:          labels,
+		Override:        contact.Policy,
+		RateCount:       rateCount,
+		DuplicateCount:  duplicateCount,
+		SenderClass:     class,
+		ClassWeight:     classWeight,
+		ClassHold:       classHold,
+		ClassBlock:      classBlock,
+		ReputationScore: reputationScore,
+		FeedSignals:     feedSignals,
 	})
 	record := spamRecord{
 		Time:      ts.UTC(),
@@ -625,7 +783,25 @@ func (nc *MyNetworkClient) spamGate(ctx context.Context, portalKey networkid.Por
 		Reasons:   decision.Reasons,
 		DryRun:    policy.DryRun,
 	}
+	if store != nil {
+		if err := store.recordContactMessage(ctx, canonical, ts); err != nil {
+			nc.log.Warn().Err(err).Str("sender", canonical).Msg("Failed to record anti-spam contact history")
+		}
+	}
 	return decision, nc.applySpamDecision(ctx, canonical, decision, record)
+}
+
+// spamFeedSignals matches the sender and the URLs in the body against the
+// imported offline feeds. Feed entries are local data; nothing is fetched.
+func spamFeedSignals(ctx context.Context, store *spamStore, sender, body string) []string {
+	if store == nil {
+		return nil
+	}
+	entries, err := store.feedEntries(ctx)
+	if err != nil || len(entries) == 0 {
+		return nil
+	}
+	return spamFeedMatches(entries, sender, body)
 }
 
 // applySpamDecision logs the decision, records counters and (unless dry-run)
@@ -635,7 +811,12 @@ func (nc *MyNetworkClient) applySpamDecision(ctx context.Context, sender string,
 	if nc == nil || nc.connector == nil {
 		return false
 	}
-	nc.connector.recordSpamDecision(record)
+	nc.connector.recordSpamDecision(ctx, record)
+	room := id.RoomID("")
+	if nc.login != nil && nc.login.User != nil {
+		room = nc.login.User.ManagementRoom
+	}
+	nc.connector.recordSpamDigest(record, room)
 	if decision.Action == spamActionAllow {
 		return false
 	}
@@ -651,6 +832,18 @@ func (nc *MyNetworkClient) applySpamDecision(ctx context.Context, sender string,
 	if record.DryRun {
 		nc.sendSpamNotice(ctx, decision, record, true)
 		return false
+	}
+	// Dry runs do not count towards the sender's reputation: nothing was
+	// enforced and the flag may be a false positive being tuned away.
+	// flagged covers every enforced spam verdict (flag/hold/block); blocked
+	// is the subset that was dropped.
+	if decision.Action == spamActionFlag || decision.Action == spamActionHold || decision.Action == spamActionBlock {
+		if store, err := nc.connector.ensureSpamStore(ctx); err == nil {
+			blocked := decision.Action == spamActionBlock
+			if err := store.recordContactOutcome(ctx, sender, true, blocked); err != nil {
+				nc.log.Warn().Err(err).Str("sender", sender).Msg("Failed to record anti-spam contact outcome")
+			}
+		}
 	}
 	nc.applyGhostLabel(ctx, MakeUserID(sender), spamGhostLabel(decision))
 	if decision.Notify {
@@ -727,7 +920,12 @@ func (nc *MyNetworkClient) sendSpamNotice(ctx context.Context, decision spamDeci
 		return
 	}
 	policy, err := compileSpamPolicy(nc.connector.antiSpamConfig())
-	if err != nil || !policy.Notices || !decision.Notify {
+	if err != nil {
+		return
+	}
+	// Digest mode batches decisions into the periodic summary; off mode
+	// disables management notices entirely.
+	if policy.NoticeMode != AntiSpamNoticeImmediate || !decision.Notify {
 		return
 	}
 	if nc.login == nil || nc.login.User == nil {
@@ -789,8 +987,12 @@ func applySpamMessageMetadata(converted *bridgev2.ConvertedMessage, decision spa
 	}
 }
 
-// CommandSpam reports the anti-spam configuration and counters and lists the
-// recent decisions (ids only).
+// spamCommandUsage is the `spam` command usage line.
+const spamCommandUsage = "Usage: spam status | spam recent [count] | spam why <number> | " +
+	"spam policy <number> <allow|bridge|label|hold|block|clear> | spam import <file>"
+
+// CommandSpam reports the anti-spam configuration and counters and manages the
+// persistent per-contact policies and offline feeds (ids only, never bodies).
 var CommandSpam = &commands.FullHandler{
 	Func: func(ce *commands.Event) {
 		connector, _ := ce.Bridge.Network.(*MyConnector)
@@ -799,33 +1001,96 @@ var CommandSpam = &commands.FullHandler{
 			return
 		}
 		if len(ce.Args) == 0 || strings.EqualFold(ce.Args[0], "status") {
-			ce.Reply("%s", connector.formatSpamStatus())
+			ce.Reply("%s", connector.formatSpamStatus(ce.Ctx))
 			return
 		}
-		if !strings.EqualFold(ce.Args[0], "recent") {
-			ce.Reply("Usage: spam status | spam recent [count]")
-			return
-		}
-		count := spamRecentDefaultCount
-		if len(ce.Args) > 1 {
-			parsed, err := parseSpamRecentCount(ce.Args[1])
-			if err != nil {
-				ce.Reply("%v", err)
+		switch strings.ToLower(strings.TrimSpace(ce.Args[0])) {
+		case "recent":
+			count := spamRecentDefaultCount
+			if len(ce.Args) > 1 {
+				parsed, err := parseSpamRecentCount(ce.Args[1])
+				if err != nil {
+					ce.Reply("%v", err)
+					return
+				}
+				count = parsed
+			}
+			if len(ce.Args) > 2 {
+				ce.Reply("%s", spamCommandUsage)
 				return
 			}
-			count = parsed
+			ce.Reply("%s", connector.formatSpamRecent(count))
+		case "why":
+			if len(ce.Args) != 2 {
+				ce.Reply("%s", spamCommandUsage)
+				return
+			}
+			canonical := CanonicalAddress(ce.Args[1])
+			if canonical == "" {
+				ce.Reply("Invalid phone number or sender ID %q", ce.Args[1])
+				return
+			}
+			ce.Reply("%s", connector.formatSpamWhy(ce.Ctx, ce.Bridge, ce.User, canonical))
+		case "policy":
+			if len(ce.Args) != 3 {
+				ce.Reply("%s", spamCommandUsage)
+				return
+			}
+			canonical := CanonicalAddress(ce.Args[1])
+			if canonical == "" {
+				ce.Reply("Invalid phone number or sender ID %q", ce.Args[1])
+				return
+			}
+			value := strings.ToLower(strings.TrimSpace(ce.Args[2]))
+			if value != SpamContactPolicyClear && !validSpamContactPolicy(value) {
+				ce.Reply("%s", spamCommandUsage)
+				return
+			}
+			store, err := connector.ensureSpamStore(ce.Ctx)
+			if err != nil {
+				ce.Reply("Failed to open the anti-spam state store: %v", err)
+				return
+			}
+			storedPolicy := value
+			if value == SpamContactPolicyClear {
+				storedPolicy = ""
+			}
+			if err := store.setContactPolicy(ce.Ctx, canonical, storedPolicy); err != nil {
+				ce.Reply("Failed to save the per-contact policy: %v", err)
+				return
+			}
+			if value == SpamContactPolicyClear {
+				ce.Reply("Cleared the per-contact anti-spam policy for %s.", canonical)
+				return
+			}
+			ce.Reply("Per-contact anti-spam policy for %s: %s. Use `spam status` to list overrides.", canonical, value)
+		case "import":
+			if len(ce.Args) < 2 {
+				ce.Reply("%s", spamCommandUsage)
+				return
+			}
+			path := strings.TrimSpace(strings.Join(ce.Args[1:], " "))
+			store, err := connector.ensureSpamStore(ce.Ctx)
+			if err != nil {
+				ce.Reply("Failed to open the anti-spam state store: %v", err)
+				return
+			}
+			result, err := store.importFeedFile(ce.Ctx, path)
+			if err != nil {
+				ce.Reply("Failed to import feed file: %v", err)
+				return
+			}
+			ce.Reply("Imported %d new entry/entries from %s (%d entries in the feed store). The bridge never fetches feeds itself.",
+				result.Added, path, result.Total)
+		default:
+			ce.Reply("%s", spamCommandUsage)
 		}
-		if len(ce.Args) > 2 {
-			ce.Reply("Usage: spam status | spam recent [count]")
-			return
-		}
-		ce.Reply("%s", connector.formatSpamRecent(count))
 	},
 	Name: "spam",
 	Help: commands.HelpMeta{
 		Section:     commands.HelpSectionAdmin,
-		Description: "Show the local anti-spam state and recent decisions (ids only)",
-		Args:        "status | recent [count]",
+		Description: "Show the local anti-spam state, explain decisions and manage policies/feeds (ids only)",
+		Args:        "status | recent [count] | why <number> | policy <number> <policy> | import <file>",
 	},
 	RequiresAdmin: true,
 }
@@ -841,8 +1106,9 @@ func parseSpamRecentCount(arg string) (int, error) {
 	return count, nil
 }
 
-// formatSpamStatus renders the effective configuration and counters.
-func (c *MyConnector) formatSpamStatus() string {
+// formatSpamStatus renders the effective configuration, counters and the
+// persistent state summary (overrides, feed entries, pending digest).
+func (c *MyConnector) formatSpamStatus(ctx context.Context) string {
 	cfg := c.antiSpamConfig()
 	counters, recent, last := c.spamSnapshot()
 	lines := []string{
@@ -854,9 +1120,37 @@ func (c *MyConnector) formatSpamStatus() string {
 			len(cfg.URLs.SuspiciousTLDs), len(cfg.URLs.Shorteners), cfg.URLs.Weight),
 		fmt.Sprintf("Duplicates: %d sender(s) with the same body within %s",
 			cfg.Duplicates.Count, formatTTLDuration(cfg.Duplicates.Window.Duration())),
-		fmt.Sprintf("Management notices: %t", cfg.Notices.Management),
+		fmt.Sprintf("Sender classes: home country %s; weights shortcode %d, toll-free %d, alphanumeric %d, international %d; hold: %s; block: %s",
+			firstNotEmpty(cfg.SenderClasses.HomeCountry, "unset"),
+			cfg.SenderClasses.ShortcodeWeight, cfg.SenderClasses.TollFreeWeight,
+			cfg.SenderClasses.AlphanumericWeight, cfg.SenderClasses.InternationalWeight,
+			formatSpamList(cfg.SenderClasses.HoldClasses), formatSpamList(cfg.SenderClasses.BlockClasses)),
+		fmt.Sprintf("Reputation: weight %d per factor (flag %d, block %d, volume above %d msg/day, cap %d)",
+			cfg.Reputation.Weight, cfg.Reputation.FlagWeight, cfg.Reputation.BlockWeight,
+			cfg.Reputation.VolumeThreshold, cfg.Reputation.MaxScore),
+		fmt.Sprintf("Feeds: %d configured path(s), weight %d", len(cfg.Feeds.Paths), cfg.Feeds.Weight),
+		fmt.Sprintf("Management notices: mode %s (digest interval %s)",
+			cfg.Notices.NoticeMode(), formatTTLDuration(cfg.Notices.DigestInterval.Duration())),
 		fmt.Sprintf("Decisions: %d evaluated — %d allowed, %d labeled, %d flagged, %d held, %d blocked (%d dry run)",
 			counters.Evaluated, counters.Allowed, counters.Labeled, counters.Flagged, counters.Held, counters.Blocked, counters.DryRun),
+	}
+	if pending := c.spamDigestPending(); pending > 0 {
+		lines = append(lines, fmt.Sprintf("Pending digest decisions: %d", pending))
+	}
+	if store, err := c.ensureSpamStore(ctx); err == nil {
+		if entries, err := store.feedEntries(ctx); err == nil && len(entries) > 0 {
+			lines = append(lines, fmt.Sprintf("Feed store: %d entr(ies) imported", len(entries)))
+		}
+		if overrides, err := store.contactPolicies(ctx); err == nil && len(overrides) > 0 {
+			lines = append(lines, fmt.Sprintf("Per-contact policies: %d override(s)", len(overrides)))
+			for index, override := range overrides {
+				if index >= spamStatusOverrideLimit {
+					lines = append(lines, fmt.Sprintf("- … and %d more (use `spam why <number>`)", len(overrides)-index))
+					break
+				}
+				lines = append(lines, fmt.Sprintf("- %s: %s", override.Sender, override.Policy))
+			}
+		}
 	}
 	if len(recent) > 0 {
 		lines = append(lines, fmt.Sprintf("Recent decisions kept: %d", len(recent)))
@@ -867,6 +1161,168 @@ func (c *MyConnector) formatSpamStatus() string {
 		lines = append(lines, fmt.Sprintf("Last decision: %s", last.Format("2006-01-02 15:04:05 MST")))
 	}
 	return strings.Join(lines, "\n")
+}
+
+// spamStatusOverrideLimit bounds how many per-contact overrides `spam status`
+// lists inline.
+const spamStatusOverrideLimit = 20
+
+// spamWhyReport is the collected explanation for one sender.
+type spamWhyReport struct {
+	Sender             string
+	Class              string
+	ClassWeight        int
+	Override           string
+	Labels             []string
+	AllowLabel         string
+	Known              bool
+	RateCount          int
+	RateLimit          int
+	RateWindow         time.Duration
+	DuplicateHashes    int
+	DuplicateMax       int
+	DuplicateThreshold int
+	DuplicateWindow    time.Duration
+	Contact            spamContactStats
+	ContactFound       bool
+	ReputationScore    int
+	FeedSignals        []string
+	FeedWeight         int
+	Recent             []spamRecord
+	Verdict            spamDecision
+}
+
+// formatSpamWhy explains the current verdict for one sender: labels,
+// allowlist source, per-contact override, sender class, rate/duplicate state,
+// reputation, feed matches and the recent decisions (ids only).
+func (c *MyConnector) formatSpamWhy(ctx context.Context, br *bridgev2.Bridge, user *bridgev2.User, sender string) string {
+	cfg := c.antiSpamConfig()
+	report := spamWhyReport{Sender: sender, Class: spamSenderClass(sender, cfg.SenderClasses.HomeCountry)}
+	if !cfg.Enabled {
+		return fmt.Sprintf("Anti-spam is disabled; %s is never evaluated.", sender)
+	}
+	policy, err := compileSpamPolicy(cfg)
+	if err != nil {
+		return fmt.Sprintf("Anti-spam configuration is invalid: %v", err)
+	}
+	report.ClassWeight = policy.ClassWeights[report.Class]
+
+	if store, err := c.ensureSpamStore(ctx); err == nil {
+		if contact, ok, err := store.contact(ctx, sender); err == nil {
+			report.Contact, report.ContactFound = contact, ok
+			report.Override = contact.Policy
+		}
+	}
+	report.Labels = c.connectorGhostLabels(ctx, br, sender)
+	report.AllowLabel = spamAllowLabelMatch(report.Labels, policy.AllowLabels)
+	if br != nil {
+		if portal, err := br.GetExistingPortalByKey(ctx, networkid.PortalKey{ID: MakeAddressPortalID(sender)}); err == nil && portal != nil {
+			report.Known = true
+		}
+		if !report.Known && user != nil {
+			if login := user.GetDefaultLogin(); login != nil {
+				if dm, err := br.GetDMPortal(ctx, login.ID, MakeUserID(sender)); err == nil && dm != nil {
+					report.Known = true
+				}
+			}
+		}
+	}
+	vetted := report.Known || report.AllowLabel != ""
+	switch report.Override {
+	case SpamContactPolicyAllow, SpamContactPolicyBridge:
+		vetted = true
+	case SpamContactPolicyLabel, SpamContactPolicyHold, SpamContactPolicyBlock:
+		vetted = false
+	}
+	now := time.Now().UTC()
+	report.RateLimit = policy.FirstContactLimit
+	report.RateWindow = policy.FirstContactWindow
+	report.DuplicateThreshold = policy.DuplicateCount
+	report.DuplicateWindow = policy.DuplicateWindow
+	if store, err := c.ensureSpamStore(ctx); err == nil {
+		if count, err := store.rateCount(ctx, sender, now.Add(-policy.FirstContactWindow)); err == nil {
+			report.RateCount = count
+		}
+		if hashes, maxSenders, err := store.duplicateState(ctx, sender, now.Add(-policy.DuplicateWindow)); err == nil {
+			report.DuplicateHashes, report.DuplicateMax = hashes, maxSenders
+		}
+		report.FeedSignals = spamFeedSignals(ctx, store, sender, "")
+	}
+	report.FeedWeight = policy.FeedWeight
+	report.Recent = c.spamRecentForSender(ctx, sender, spamWhyRecentLimit)
+	classWeight, classHold, classBlock := 0, false, false
+	reputationScore := 0
+	if !vetted {
+		classWeight = report.ClassWeight
+		_, classHold = policy.ClassHold[report.Class]
+		_, classBlock = policy.ClassBlock[report.Class]
+		reputationScore, _ = spamReputationScore(policy.Reputation, report.Contact, now)
+	}
+	report.ReputationScore = reputationScore
+	report.Verdict = evaluateSpam(policy, spamEvaluation{
+		KnownContact:    vetted,
+		Override:        report.Override,
+		RateCount:       report.RateCount,
+		DuplicateCount:  report.DuplicateMax,
+		SenderClass:     report.Class,
+		ClassWeight:     classWeight,
+		ClassHold:       classHold,
+		ClassBlock:      classBlock,
+		ReputationScore: reputationScore,
+		FeedSignals:     report.FeedSignals,
+	})
+	return formatSpamWhyReport(report)
+}
+
+// spamWhyRecentLimit is how many recent decisions `spam why` shows.
+const spamWhyRecentLimit = 5
+
+// connectorGhostLabels loads ghost labels without a network client.
+func (c *MyConnector) connectorGhostLabels(ctx context.Context, br *bridgev2.Bridge, sender string) []string {
+	if c == nil || br == nil || sender == "" {
+		return nil
+	}
+	ghost, err := br.GetExistingGhostByID(ctx, MakeUserID(sender))
+	if err != nil || ghost == nil {
+		return nil
+	}
+	meta, _ := ghost.Metadata.(*GhostMetadata)
+	if meta == nil {
+		return nil
+	}
+	return append([]string(nil), meta.Labels...)
+}
+
+// spamRecentForSender returns the newest decisions for one sender, from the
+// persistent store when available and the in-memory mirror otherwise.
+func (c *MyConnector) spamRecentForSender(ctx context.Context, sender string, limit int) []spamRecord {
+	if c == nil || limit <= 0 {
+		return nil
+	}
+	if store, err := c.ensureSpamStore(ctx); err == nil {
+		if records, err := store.recentDecisionsForSender(ctx, sender, limit); err == nil {
+			return records
+		}
+	}
+	_, recent, _ := c.spamSnapshot()
+	records := make([]spamRecord, 0, limit)
+	for i := len(recent) - 1; i >= 0 && len(records) < limit; i-- {
+		if recent[i].Sender == sender {
+			records = append(records, recent[i])
+		}
+	}
+	return records
+}
+
+// spamAllowLabelMatch returns the allowlist label carried by the ghost, or "".
+func spamAllowLabelMatch(labels []string, allow map[string]struct{}) string {
+	for _, label := range labels {
+		normalized := strings.ToLower(strings.TrimSpace(label))
+		if _, ok := allow[normalized]; ok {
+			return label
+		}
+	}
+	return ""
 }
 
 // formatSpamRecent renders the most recent decisions, newest first.

@@ -6,6 +6,8 @@ package connector
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +16,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/id"
 )
 
 // testSpamPolicy compiles an enabled policy with the given mutations.
@@ -258,50 +261,6 @@ func TestSpamBodyHash(t *testing.T) {
 	}
 }
 
-func TestSpamRateLimiter(t *testing.T) {
-	limiter := newSpamRateLimiter(10 * time.Minute)
-	base := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
-	for i, want := range []int{1, 2, 3} {
-		if got := limiter.record("+15551234567", base.Add(time.Duration(i)*time.Minute)); got != want {
-			t.Fatalf("record %d = %d, want %d", i, got, want)
-		}
-	}
-	if got := limiter.record("+15550000000", base); got != 1 {
-		t.Errorf("other sender count = %d, want 1", got)
-	}
-	// Window expiry: only this message remains inside the window.
-	if got := limiter.record("+15551234567", base.Add(21*time.Minute)); got != 1 {
-		t.Errorf("after window count = %d, want 1", got)
-	}
-	if got := limiter.record("", base); got != 0 {
-		t.Errorf("empty sender count = %d, want 0", got)
-	}
-}
-
-func TestSpamDuplicateTracker(t *testing.T) {
-	tracker := newSpamDuplicateTracker(time.Hour)
-	base := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
-	if got := tracker.record("same body", "+15551111111", base); got != 1 {
-		t.Fatalf("first sender count = %d, want 1", got)
-	}
-	if got := tracker.record("SAME   body", "+15552222222", base.Add(time.Minute)); got != 2 {
-		t.Errorf("second sender count = %d, want 2", got)
-	}
-	if got := tracker.record("same body", "+15552222222", base.Add(2*time.Minute)); got != 2 {
-		t.Errorf("repeat sender count = %d, want 2", got)
-	}
-	if got := tracker.record("other", "+15553333333", base); got != 1 {
-		t.Errorf("other body count = %d, want 1", got)
-	}
-	if got := tracker.record("", "+15554444444", base); got != 0 {
-		t.Errorf("empty body count = %d, want 0", got)
-	}
-	// The window expires all earlier observations.
-	if got := tracker.record("same body", "+15559999999", base.Add(2*time.Hour)); got != 1 {
-		t.Errorf("after window count = %d, want 1", got)
-	}
-}
-
 func TestFormatSpamNotice(t *testing.T) {
 	record := spamRecord{Sender: "+15551234567", Score: 12, Reasons: []string{"pattern:urgency", "url:shortener"}}
 	tests := []struct {
@@ -338,14 +297,15 @@ func TestFormatSpamStatusAndRecent(t *testing.T) {
 	cfg.Enabled = true
 	cfg.DryRun = true
 	connector := &MyConnector{config: &SimpleConfig{AntiSpam: cfg}}
+	ctx := context.Background()
 	base := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
-	connector.recordSpamDecision(spamRecord{Time: base, Sender: "+15551111111", Action: spamActionAllow})
-	connector.recordSpamDecision(spamRecord{
+	connector.recordSpamDecision(ctx, spamRecord{Time: base, Sender: "+15551111111", Action: spamActionAllow})
+	connector.recordSpamDecision(ctx, spamRecord{
 		Time: base.Add(time.Minute), Sender: "+15552222222", MessageID: "sms:1:1",
 		Action: spamActionFlag, Score: 12, Reasons: []string{"pattern:urgency"}, DryRun: true,
 	})
 
-	status := connector.formatSpamStatus()
+	status := connector.formatSpamStatus(ctx)
 	for _, want := range []string{
 		"Anti-spam: enabled (dry run: true)",
 		"Unknown sender policy: bridge",
@@ -369,7 +329,7 @@ func TestFormatSpamStatusAndRecent(t *testing.T) {
 	}
 
 	// Newest first.
-	connector.recordSpamDecision(spamRecord{Time: base.Add(2 * time.Minute), Sender: "+15553333333", Action: spamActionBlock})
+	connector.recordSpamDecision(ctx, spamRecord{Time: base.Add(2 * time.Minute), Sender: "+15553333333", Action: spamActionBlock})
 	recent = connector.formatSpamRecent(10)
 	if strings.Index(recent, "+15553333333") > strings.Index(recent, "+15552222222") {
 		t.Errorf("decisions are not newest-first:\n%s", recent)
@@ -612,6 +572,448 @@ func TestSpamGateDisabledConfigDoesNothing(t *testing.T) {
 	counters, _, _ := connector.spamSnapshot()
 	if counters.Evaluated != 0 {
 		t.Errorf("disabled gate must not record decisions: %+v", counters)
+	}
+}
+
+func TestSpamSenderClass(t *testing.T) {
+	tests := []struct {
+		name               string
+		sender, home, want string
+	}{
+		{name: "shortcode", sender: "55555", home: "1", want: SpamSenderClassShortcode},
+		{name: "shortcode minimum", sender: "123", home: "1", want: SpamSenderClassShortcode},
+		{name: "home number", sender: "+15551234567", home: "1", want: SpamSenderClassHome},
+		{name: "toll free 800", sender: "+18005551234", home: "1", want: SpamSenderClassTollFree},
+		{name: "toll free 888", sender: "+18885551234", home: "1", want: SpamSenderClassTollFree},
+		{name: "alphanumeric", sender: "BANK", home: "1", want: SpamSenderClassAlphanumeric},
+		{name: "international", sender: "+4915112345678", home: "1", want: SpamSenderClassInternational},
+		{name: "international with matching home", sender: "+4915112345678", home: "49", want: SpamSenderClassHome},
+		{name: "international disabled", sender: "+4915112345678", home: "", want: SpamSenderClassHome},
+		{name: "short toll free lookalike", sender: "+1800555123", home: "1", want: SpamSenderClassHome},
+		{name: "email gateway", sender: "user@example.com", home: "1", want: ""},
+		{name: "empty", sender: "", home: "1", want: ""},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := spamSenderClass(test.sender, test.home); got != test.want {
+				t.Errorf("spamSenderClass(%q, %q) = %q, want %q", test.sender, test.home, got, test.want)
+			}
+		})
+	}
+}
+
+func TestEvaluateSpamContactOverrides(t *testing.T) {
+	policy := testSpamPolicy(t, func(cfg *AntiSpamConfig) {
+		cfg.UnknownSenderPolicy = AntiSpamPolicyHold
+		cfg.Patterns = nil
+		cfg.Threshold = 0
+	})
+	tests := []struct {
+		override   string
+		wantAction string
+		wantNotify bool
+		wantDrop   bool
+		wantReason string
+	}{
+		{override: SpamContactPolicyAllow, wantAction: spamActionAllow},
+		{override: SpamContactPolicyBridge, wantAction: spamActionAllow},
+		{override: SpamContactPolicyLabel, wantAction: spamActionLabel, wantReason: "override:label"},
+		{override: SpamContactPolicyHold, wantAction: spamActionHold, wantNotify: true, wantDrop: true, wantReason: "override:hold"},
+		{override: SpamContactPolicyBlock, wantAction: spamActionBlock, wantNotify: true, wantDrop: true, wantReason: "override:block"},
+	}
+	for _, test := range tests {
+		t.Run(test.override, func(t *testing.T) {
+			decision := evaluateSpam(policy, spamEvaluation{Body: "hello", Override: test.override})
+			if decision.Action != test.wantAction || decision.Notify != test.wantNotify || decision.dropped() != test.wantDrop {
+				t.Fatalf("decision = %+v, want action %q notify %t drop %t", decision, test.wantAction, test.wantNotify, test.wantDrop)
+			}
+			if test.wantReason != "" && !hasReason(decision, test.wantReason) {
+				t.Errorf("reasons = %v, want %s", decision.Reasons, test.wantReason)
+			}
+		})
+	}
+	// An override wins over the known-contact state.
+	if decision := evaluateSpam(policy, spamEvaluation{Body: "hello", KnownContact: true, Override: SpamContactPolicyHold}); decision.Action != spamActionHold {
+		t.Errorf("known contact with hold override = %+v, want hold", decision)
+	}
+	if decision := evaluateSpam(policy, spamEvaluation{Body: "hello", KnownContact: true, Override: SpamContactPolicyLabel}); decision.Action != spamActionLabel {
+		t.Errorf("known contact with label override = %+v, want label", decision)
+	}
+}
+
+func TestEvaluateSpamSenderClassAndFeedScoring(t *testing.T) {
+	policy := testSpamPolicy(t, func(cfg *AntiSpamConfig) {
+		cfg.Patterns = nil
+		cfg.Threshold = 10
+	})
+	decision := evaluateSpam(policy, spamEvaluation{Body: "hi", SenderClass: SpamSenderClassAlphanumeric, ClassWeight: 6})
+	if decision.Score != 6 || decision.Action != spamActionLabel || !hasReason(decision, "class:alphanumeric") {
+		t.Errorf("class scoring = %+v", decision)
+	}
+	decision = evaluateSpam(policy, spamEvaluation{Body: "hi", SenderClass: SpamSenderClassShortcode, ClassWeight: 4, ReputationScore: 6})
+	if decision.Score != 10 || decision.Action != spamActionFlag || !hasReason(decision, "class:shortcode") || !hasReason(decision, "reputation") {
+		t.Errorf("class+reputation scoring = %+v", decision)
+	}
+	decision = evaluateSpam(policy, spamEvaluation{Body: "hi", SenderClass: SpamSenderClassShortcode, ClassWeight: 4, ClassBlock: true})
+	if decision.Action != spamActionBlock || !decision.dropped() || !decision.Notify || !hasReason(decision, "class:shortcode") {
+		t.Errorf("class block = %+v", decision)
+	}
+	decision = evaluateSpam(policy, spamEvaluation{Body: "hi", SenderClass: SpamSenderClassInternational, ClassWeight: 3, ClassHold: true})
+	if decision.Action != spamActionHold || !decision.dropped() {
+		t.Errorf("class hold = %+v", decision)
+	}
+	// Feed signals are a hard signal: they score even for known contacts and
+	// use the configured feed weight (default 6 here).
+	decision = evaluateSpam(policy, spamEvaluation{Body: "hi", KnownContact: true, FeedSignals: []string{"sender", "url"}})
+	if decision.Score != 12 || decision.Action != spamActionFlag {
+		t.Errorf("feed scoring = %+v", decision)
+	}
+	if !hasReason(decision, "feed:sender") || !hasReason(decision, "feed:url") {
+		t.Errorf("feed reasons = %v", decision.Reasons)
+	}
+}
+
+func TestSpamReputationScore(t *testing.T) {
+	now := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
+	cfg := DefaultAntiSpamReputationConfig()
+	if score, factor := spamReputationScore(cfg, spamContactStats{}, now); score != 0 || factor != 0 {
+		t.Errorf("empty history = (%d, %d), want (0, 0)", score, factor)
+	}
+	score, factor := spamReputationScore(cfg, spamContactStats{Total: 1, Flagged: 1, FirstSeen: now}, now)
+	if score != 2 || factor != 1 {
+		t.Errorf("one flag = (%d, %d), want (2, 1)", score, factor)
+	}
+	score, factor = spamReputationScore(cfg, spamContactStats{Total: 5, Flagged: 3, Blocked: 2, FirstSeen: now}, now)
+	if score != 14 || factor != 7 {
+		t.Errorf("flags+blocks = (%d, %d), want (14, 7)", score, factor)
+	}
+	capped := cfg
+	capped.MaxScore = 10
+	if score, _ = spamReputationScore(capped, spamContactStats{Total: 5, Flagged: 3, Blocked: 2, FirstSeen: now}, now); score != 10 {
+		t.Errorf("capped score = %d, want 10", score)
+	}
+	disabled := cfg
+	disabled.Weight = 0
+	if score, _ = spamReputationScore(disabled, spamContactStats{Total: 5, Flagged: 3, Blocked: 2, FirstSeen: now}, now); score != 0 {
+		t.Errorf("disabled score = %d, want 0", score)
+	}
+	// Volume: 100 messages over two days is 50/day, 40 above the threshold.
+	burst := spamContactStats{Total: 100, FirstSeen: now.Add(-48 * time.Hour)}
+	score, factor = spamReputationScore(cfg, burst, now)
+	if factor != 40 || score != defaultAntiSpamReputationMaxScore {
+		t.Errorf("volume score = (%d, %d), want capped 20 with factor 40", score, factor)
+	}
+	// The first day counts as a full day, so a same-day burst is not diluted.
+	if got := (spamContactStats{Total: 5, FirstSeen: now.Add(-time.Hour)}).messagesPerDay(now); got != 5 {
+		t.Errorf("messagesPerDay = %f, want 5", got)
+	}
+}
+
+func TestSpamDigestState(t *testing.T) {
+	base := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
+	state := spamDigestState{}
+	state.add(spamRecord{Time: base, Sender: "+15551111111", Action: spamActionAllow}, "!mgmt:example.com")
+	if state.Total != 1 || state.Room != id.RoomID("!mgmt:example.com") {
+		t.Fatalf("state after allow = %+v", state)
+	}
+	state.add(spamRecord{
+		Time: base.Add(time.Minute), Sender: "+15552222222", Action: spamActionFlag, Score: 12,
+		Reasons: []string{"pattern:urgency", "url:shortener"},
+	}, "")
+	state.add(spamRecord{
+		Time: base.Add(2 * time.Minute), Sender: "+15553333333", Action: spamActionBlock, Score: 20,
+		Reasons: []string{"pattern:urgency"}, DryRun: true,
+	}, "")
+	if state.Total != 3 || state.DryRun != 1 {
+		t.Fatalf("state = %+v", state)
+	}
+	now := base.Add(time.Hour)
+	text := formatSpamDigest(&state, now)
+	for _, want := range []string{
+		"Anti-spam digest: 3 decision(s) in the last 1h",
+		"1 allowed", "0 labeled", "1 flagged", "0 held", "1 blocked",
+		"(1 dry run)",
+		"Top reasons: pattern:urgency (2), url:shortener (1)",
+		"Senders: +15552222222 (1), +15553333333 (1)",
+		"Use `spam recent` for details.",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("digest missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "message") && strings.Contains(text, "body") {
+		t.Errorf("digest must not contain message bodies:\n%s", text)
+	}
+	flushed, room, ok := state.take(now)
+	if !ok || room != id.RoomID("!mgmt:example.com") || flushed != text {
+		t.Fatalf("take = (%q, %q, %t), want the digest and its room", flushed, room, ok)
+	}
+	if state.Total != 0 || state.Room != "" {
+		t.Errorf("take must reset the state: %+v", state)
+	}
+	if _, _, ok := state.take(now); ok {
+		t.Error("taking an empty digest must report nothing pending")
+	}
+}
+
+func TestConnectorSpamDigestModeWiring(t *testing.T) {
+	cfg := DefaultAntiSpamConfig()
+	cfg.Enabled = true
+	connector := &MyConnector{config: &SimpleConfig{AntiSpam: cfg}}
+	record := spamRecord{Time: time.Now().UTC(), Sender: "+15551234567", Action: spamActionFlag, Reasons: []string{"pattern:urgency"}}
+	// Immediate mode never accumulates.
+	connector.recordSpamDigest(record, "!mgmt:example.com")
+	if pending := connector.spamDigestPending(); pending != 0 {
+		t.Errorf("immediate mode pending = %d, want 0", pending)
+	}
+	cfg.Notices = AntiSpamNoticesConfig{Mode: AntiSpamNoticeDigest, DigestInterval: TTLDuration(time.Hour)}
+	connector.config.AntiSpam = cfg
+	connector.recordSpamDigest(record, "!mgmt:example.com")
+	if pending := connector.spamDigestPending(); pending != 1 {
+		t.Fatalf("digest mode pending = %d, want 1", pending)
+	}
+	text, room, ok := connector.takeSpamDigest(time.Now().UTC())
+	if !ok || room != id.RoomID("!mgmt:example.com") || !strings.Contains(text, "Anti-spam digest") {
+		t.Fatalf("takeSpamDigest = (%q, %q, %t)", text, room, ok)
+	}
+	if pending := connector.spamDigestPending(); pending != 0 {
+		t.Errorf("pending after flush = %d, want 0", pending)
+	}
+}
+
+func TestSpamDigestLoopScheduling(t *testing.T) {
+	// Immediate mode never starts the digest scheduler.
+	_, _, bridge, connector := newSpamGateTestClient(t, nil)
+	connector.startSpamLoop()
+	connector.spamMu.Lock()
+	cancel := connector.spamDigestCancel
+	connector.spamMu.Unlock()
+	if cancel != nil {
+		t.Fatal("immediate mode must not start the digest loop")
+	}
+
+	// Digest mode starts it, and Stop cancels it.
+	cfg := connector.antiSpamConfig()
+	cfg.Notices = AntiSpamNoticesConfig{Mode: AntiSpamNoticeDigest, DigestInterval: TTLDuration(time.Hour)}
+	connector.config.AntiSpam = cfg
+	connector.startSpamLoop()
+	connector.spamMu.Lock()
+	cancel = connector.spamDigestCancel
+	connector.spamMu.Unlock()
+	if cancel == nil {
+		t.Fatal("digest mode must start the digest loop")
+	}
+	connector.stopSpamLoop()
+	connector.spamMu.Lock()
+	cancel = connector.spamDigestCancel
+	connector.spamMu.Unlock()
+	if cancel != nil {
+		t.Fatal("stopSpamLoop must cancel the digest loop")
+	}
+	if bridge == nil {
+		t.Fatal("test bridge is missing")
+	}
+}
+
+func TestSpamWhyReportAgainstDatabase(t *testing.T) {
+	b, nc, bridge, connector := newSpamGateTestClient(t, func(cfg *AntiSpamConfig) {
+		cfg.Patterns = []AntiSpamPatternConfig{{Name: "kw", Regex: `(?i)urgent`, Weight: 10, Action: AntiSpamActionFlag}}
+		cfg.Threshold = 10
+		cfg.FirstContact = AntiSpamFirstContactConfig{Limit: 1, Window: TTLDuration(10 * time.Minute)}
+	})
+	ctx := context.Background()
+	sender := "+15551234567"
+	ghostID := MakeUserID(sender)
+	b.seedGhost(t, string(ghostID))
+	ghost, err := bridge.GetExistingGhostByID(ctx, ghostID)
+	if err != nil || ghost == nil {
+		t.Fatalf("load ghost: %v, %v", ghost, err)
+	}
+	meta, _ := ghost.Metadata.(*GhostMetadata)
+	meta.Labels = []string{SpamFlagLabel}
+	if err := bridge.DB.Ghost.Update(ctx, ghost.Ghost); err != nil {
+		t.Fatalf("update ghost: %v", err)
+	}
+
+	now := time.Now().UTC()
+	decision, _ := nc.spamGate(ctx, networkid.PortalKey{ID: "thread-scope-1-1"}, sender, "sms:1:1", "hello there", now, false)
+	if decision.Action != spamActionLabel {
+		t.Fatalf("first decision = %+v, want label", decision)
+	}
+	decision, _ = nc.spamGate(ctx, networkid.PortalKey{ID: "thread-scope-1-2"}, sender, "sms:1:2", "urgent hello", now.Add(time.Second), false)
+	if decision.Action != spamActionFlag || !hasReason(decision, "first-contact-rate") {
+		t.Fatalf("second decision = %+v, want first-contact flag", decision)
+	}
+
+	report := connector.formatSpamWhy(ctx, bridge, nil, sender)
+	for _, want := range []string{
+		"Anti-spam why +15551234567:",
+		"Sender class: home",
+		"Per-contact policy: none",
+		"Labels: spam, unknown sender",
+		"Known contact: no",
+		"First contact: 2 message(s) in the last 10m0s (limit 1)",
+		"Duplicates: 2 body hash(es)",
+		"History: first seen",
+		"2 message(s), 1 flagged",
+		"Recent:",
+		"pattern:kw",
+		"Verdict for a new empty message: flag",
+	} {
+		if !strings.Contains(report, want) {
+			t.Errorf("why report missing %q:\n%s", want, report)
+		}
+	}
+
+	store, err := connector.ensureSpamStore(ctx)
+	if err != nil {
+		t.Fatalf("ensureSpamStore error: %v", err)
+	}
+	if err := store.setContactPolicy(ctx, sender, SpamContactPolicyAllow); err != nil {
+		t.Fatalf("setContactPolicy error: %v", err)
+	}
+	report = connector.formatSpamWhy(ctx, bridge, nil, sender)
+	if !strings.Contains(report, "Per-contact policy: allow (source: `spam policy`)") {
+		t.Errorf("why report lost the override:\n%s", report)
+	}
+	if !strings.Contains(report, "Verdict for a new empty message: allow") {
+		t.Errorf("override must change the verdict:\n%s", report)
+	}
+}
+
+func TestSpamGateContactOverrideAgainstDatabase(t *testing.T) {
+	b, nc, bridge, connector := newSpamGateTestClient(t, nil)
+	ctx := context.Background()
+	sender := "+15551234567"
+	b.seedGhost(t, string(MakeUserID(sender)))
+	store, err := connector.ensureSpamStore(ctx)
+	if err != nil {
+		t.Fatalf("ensureSpamStore error: %v", err)
+	}
+
+	if err := store.setContactPolicy(ctx, sender, SpamContactPolicyBlock); err != nil {
+		t.Fatalf("setContactPolicy(block) error: %v", err)
+	}
+	decision, drop := nc.spamGate(ctx, networkid.PortalKey{ID: "thread-scope-1-1"}, sender, "sms:1:1", "see you at 8", time.Now().UTC(), false)
+	if decision.Action != spamActionBlock || !drop || !hasReason(decision, "override:block") {
+		t.Fatalf("block override decision = %+v, drop %t", decision, drop)
+	}
+	ghost, _ := bridge.GetExistingGhostByID(ctx, MakeUserID(sender))
+	if meta, _ := ghost.Metadata.(*GhostMetadata); meta == nil || !hasLabel(meta.Labels, SpamFlagLabel) {
+		t.Fatalf("block override labels = %+v", ghost.Metadata)
+	}
+
+	if err := store.setContactPolicy(ctx, sender, SpamContactPolicyAllow); err != nil {
+		t.Fatalf("setContactPolicy(allow) error: %v", err)
+	}
+	decision, drop = nc.spamGate(ctx, networkid.PortalKey{ID: "thread-scope-1-2"}, sender, "sms:1:2", "URGENT: wire transfer now", time.Now().UTC(), false)
+	if decision.Action != spamActionAllow || drop {
+		t.Fatalf("allow override decision = %+v, drop %t", decision, drop)
+	}
+
+	// Clearing the override restores the global policy.
+	if err := store.setContactPolicy(ctx, sender, ""); err != nil {
+		t.Fatalf("clear policy error: %v", err)
+	}
+	decision, drop = nc.spamGate(ctx, networkid.PortalKey{ID: "thread-scope-1-3"}, sender, "sms:1:3", "URGENT: wire transfer now", time.Now().UTC(), false)
+	if decision.Action != spamActionFlag || drop {
+		t.Fatalf("cleared override decision = %+v, drop %t", decision, drop)
+	}
+}
+
+func TestSpamGateSenderClassScoringAgainstDatabase(t *testing.T) {
+	b, nc, _, _ := newSpamGateTestClient(t, func(cfg *AntiSpamConfig) {
+		cfg.Patterns = nil
+		cfg.Threshold = 5
+		cfg.SenderClasses = DefaultAntiSpamSenderClassesConfig()
+	})
+	ctx := context.Background()
+	sender := "BANK"
+	b.seedGhost(t, string(MakeUserID(sender)))
+	decision, drop := nc.spamGate(ctx, networkid.PortalKey{ID: "thread-scope-1-1"}, sender, "sms:1:1", "your code is 1234", time.Now().UTC(), false)
+	if decision.Action != spamActionFlag || drop || !hasReason(decision, "class:alphanumeric") {
+		t.Fatalf("alphanumeric decision = %+v, drop %t", decision, drop)
+	}
+	// A known contact is not class-scored.
+	b.seedPortal(t, "thread-scope-1-1", "!room1:example.com", &PortalMetadata{
+		ThreadID: 1, SubID: 1, Recipients: []string{sender},
+	})
+	decision, drop = nc.spamGate(ctx, networkid.PortalKey{ID: "thread-scope-1-1"}, sender, "sms:1:2", "your code is 1234", time.Now().UTC(), false)
+	if decision.Action != spamActionAllow || drop {
+		t.Fatalf("known alphanumeric decision = %+v, drop %t", decision, drop)
+	}
+}
+
+func TestSpamGateFeedMatchAgainstDatabase(t *testing.T) {
+	b, nc, _, connector := newSpamGateTestClient(t, func(cfg *AntiSpamConfig) {
+		cfg.Patterns = nil
+		cfg.Threshold = 5
+		cfg.Feeds = AntiSpamFeedsConfig{Weight: 6}
+	})
+	ctx := context.Background()
+	sender := "+15551234567"
+	b.seedGhost(t, string(MakeUserID(sender)))
+	store, err := connector.ensureSpamStore(ctx)
+	if err != nil {
+		t.Fatalf("ensureSpamStore error: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "feed.txt")
+	if err := os.WriteFile(path, []byte("# local list\n"+sender+"\n"), 0o600); err != nil {
+		t.Fatalf("write feed file: %v", err)
+	}
+	if _, err := store.importFeedFile(ctx, path); err != nil {
+		t.Fatalf("importFeedFile error: %v", err)
+	}
+	decision, drop := nc.spamGate(ctx, networkid.PortalKey{ID: "thread-scope-1-1"}, sender, "sms:1:1", "hello", time.Now().UTC(), false)
+	if decision.Action != spamActionFlag || drop || !hasReason(decision, "feed:sender") || decision.Score != 6 {
+		t.Fatalf("feed decision = %+v, drop %t", decision, drop)
+	}
+}
+
+func TestSpamGateDigestModeWiring(t *testing.T) {
+	b, nc, _, connector := newSpamGateTestClient(t, func(cfg *AntiSpamConfig) {
+		cfg.Patterns = nil
+		cfg.Notices = AntiSpamNoticesConfig{Mode: AntiSpamNoticeDigest, DigestInterval: TTLDuration(time.Hour)}
+	})
+	ctx := context.Background()
+	sender := "+15551234567"
+	b.seedGhost(t, string(MakeUserID(sender)))
+	if _, _ = nc.spamGate(ctx, networkid.PortalKey{ID: "thread-scope-1-1"}, sender, "sms:1:1", "hello", time.Now().UTC(), false); connector.spamDigestPending() != 1 {
+		t.Fatalf("pending digest = %d, want 1", connector.spamDigestPending())
+	}
+	text, _, ok := connector.takeSpamDigest(time.Now().UTC())
+	if !ok || !strings.Contains(text, "Anti-spam digest: 1 decision(s)") {
+		t.Fatalf("digest text = %q, ok %t", text, ok)
+	}
+}
+
+func TestSpamStateSurvivesConnectorRestart(t *testing.T) {
+	b, nc, bridge, connector := newSpamGateTestClient(t, func(cfg *AntiSpamConfig) {
+		cfg.Patterns = nil
+		cfg.Threshold = 0
+		cfg.FirstContact = AntiSpamFirstContactConfig{Limit: 1, Window: TTLDuration(10 * time.Minute)}
+	})
+	ctx := context.Background()
+	sender := "+15551234567"
+	b.seedGhost(t, string(MakeUserID(sender)))
+	now := time.Now().UTC()
+	decision, _ := nc.spamGate(ctx, networkid.PortalKey{ID: "thread-scope-1-1"}, sender, "sms:1:1", "hi", now, false)
+	if decision.Action != spamActionLabel {
+		t.Fatalf("first decision = %+v, want label", decision)
+	}
+
+	// A new connector over the same database simulates a bridge restart: the
+	// rate limiter and the decision log must both carry over.
+	restarted := &MyConnector{log: zerolog.Nop(), bridge: bridge, config: connector.config}
+	restartedNc := &MyNetworkClient{log: zerolog.Nop(), bridge: bridge, login: nc.login, connector: restarted}
+	decision, _ = restartedNc.spamGate(ctx, networkid.PortalKey{ID: "thread-scope-1-2"}, sender, "sms:1:2", "hi again", now.Add(time.Minute), false)
+	if decision.Action != spamActionFlag || !hasReason(decision, "first-contact-rate") {
+		t.Fatalf("restart decision = %+v, want a persisted first-contact flag", decision)
+	}
+	restarted.loadSpamRecent(ctx)
+	recent := restarted.formatSpamRecent(10)
+	if !strings.Contains(recent, sender) || !strings.Contains(recent, "flag") || !strings.Contains(recent, "label") {
+		t.Errorf("recent decisions after restart = %q", recent)
 	}
 }
 
