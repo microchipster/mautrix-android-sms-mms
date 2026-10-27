@@ -462,6 +462,14 @@ phone_sms_count_since() {
 	sqlite_query "select count(*) from sms where date >= $1;" | tail -n 1
 }
 
+# phone_has_new_sms_since EPOCH_MS — condition for `wait_for`: succeeds once the
+# phone has at least one SMS row (inbox or sent) dated >= EPOCH_MS.
+phone_has_new_sms_since() {
+	local count
+	count="$(phone_sms_count_since "$1" 2>/dev/null | tail -n 1)"
+	[ -n "$count" ] && [ "$count" -gt 0 ]
+}
+
 # phone_sms_rows_since EPOCH_MS — SMS rows (`_id|thread_id|date|type|address`)
 # dated >= EPOCH_MS, oldest first. type: 1 inbox, 2 sent, others per Android.
 phone_sms_rows_since() {

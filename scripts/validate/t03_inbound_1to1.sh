@@ -62,8 +62,9 @@ if [ "$VALIDATE_LIVE_SENDS" = "1" ] && [ -n "$IAMB_PHONE_ROOM" ]; then
 		pass "inbound probe sent from iamb room $IAMB_PHONE_ROOM (at ${before}ms)"
 		live_probe_ran=1
 		rc=0
-		wait_for 180 5 phone_sms_count_since "$before" >"$WORK/count.json" 2>&1 || rc=$?
+		wait_for 180 5 phone_has_new_sms_since "$before" || rc=$?
 		if [ "$rc" -eq 0 ]; then
+			phone_sms_count_since "$before" >"$WORK/count.json" 2>&1 || true
 			pass "phone received a new SMS row after the probe (rows since ${before}ms: $(cat "$WORK/count.json"))"
 		else
 			fail "phone did not record a new SMS row within 180s of the probe"
@@ -148,18 +149,35 @@ fi
 # Message event from the sender ghost near the SMS timestamp.
 portal_room="$(awk -F'\t' -v d="$sms_date" 'BEGIN { best = 0 } { if ($1 != "" ) { print $1; exit } }' "$WORK/rooms.tsv")"
 ghost="$(printf '%s' "$sender" | sed 's/+/=2b/g')"
+ghost_esc="$(printf '%s' "$ghost" | sed 's/=/=3d/g')"
+attempts=1
+if [ "$live_probe_ran" = "1" ]; then
+	# The bridge may need a little while to mirror the probe into Matrix.
+	attempts=12
+fi
 rc=0
-iamb_cmd message "$portal_room" >"$WORK/portal-events.json" 2>"$WORK/portal-events.err" || rc=$?
+hits=0
+for attempt in $(seq 1 "$attempts"); do
+	rc=0
+	iamb_cmd message "$portal_room" >"$WORK/portal-events.json" 2>"$WORK/portal-events.err" || rc=$?
+	if [ "$rc" -ne 0 ]; then
+		break
+	fi
+	hits="$(jq -r --arg ghost "$ghost" --arg ghost_esc "$ghost_esc" 'select(.type == "m.room.message") | (.sender // "") | select(contains($ghost) or contains($ghost_esc))' "$WORK/portal-events.json" | wc -l | tr -d ' ')"
+	if [ "$hits" -ge 1 ]; then
+		break
+	fi
+	if [ "$attempt" -lt "$attempts" ]; then
+		sleep 10
+	fi
+done
 if [ "$rc" -ne 0 ]; then
 	skip_check "iamb message fetch failed for $portal_room: $(tr '\n' ' ' <"$WORK/portal-events.err")"
+elif [ "$hits" -ge 1 ]; then
+	ev="$(jq -r --arg ghost "$ghost" --arg ghost_esc "$ghost_esc" 'select(.type == "m.room.message") | select(((.sender // "") | contains($ghost)) or ((.sender // "") | contains($ghost_esc))) | .event_id' "$WORK/portal-events.json" | tail -n 1)"
+	pass "portal $portal_room carries $hits message event(s) from the sender ghost (last $ev)"
 else
-	hits="$(jq -r --arg ghost "$ghost" 'select(.type == "m.room.message") | (.sender // "") | select(contains($ghost))' "$WORK/portal-events.json" | wc -l | tr -d ' ')"
-	if [ "$hits" -ge 1 ]; then
-		ev="$(jq -r --arg ghost "$ghost" 'select(.type == "m.room.message") | select((.sender // "") | contains($ghost)) | .event_id' "$WORK/portal-events.json" | tail -n 1)"
-		pass "portal $portal_room carries $hits message event(s) from the sender ghost (last $ev)"
-	else
-		fail "portal $portal_room has no message event from sender ghost $ghost"
-	fi
+	fail "portal $portal_room has no message event from sender ghost $ghost"
 fi
 
 # Own-number ghost check.
