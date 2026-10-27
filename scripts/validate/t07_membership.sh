@@ -166,49 +166,78 @@ fi
 
 # --- live membership probe --------------------------------------------------
 if [ "$VALIDATE_LIVE_SENDS" = "1" ] && [ -n "$IAMB_GROUP_ROOM" ]; then
-	first_thread="$(head -n 1 "$WORK/group-threads" | cut -d'|' -f1)"
-	rc=0
-	phone_thread_participants "$first_thread" >"$WORK/participants" 2>/dev/null || rc=$?
-	if [ "$rc" -ne 0 ]; then
-		skip_check "live membership probe: cannot read participants of thread $first_thread"
-	else
-		mapfile -t numbers <"$WORK/participants"
-		: >"$WORK/before.tsv"
-		for n in "${numbers[@]}"; do
-			room_ids_matching_name "$n" >>"$WORK/before.tsv" 2>/dev/null || true
-		done
-		sort -u "$WORK/before.tsv" >"$WORK/before-rooms"
-		before_channels="$(while IFS=$'\t' read -r room _; do [ -n "$room" ] && portal_channel_id "$room" 2>/dev/null || true; done <"$WORK/before-rooms" | sort -u | sed '/^$/d')"
-
-		before_ms="$(now_ms)"
-		rc=0
-		iamb_send "$IAMB_GROUP_ROOM" "validate t07 membership probe $before_ms" >"$WORK/send.json" 2>"$WORK/send.err" || rc=$?
-		case "$rc" in
-		"$RC_OK")
-			pass "membership probe sent from $IAMB_GROUP_ROOM (at ${before_ms}ms)"
-			sleep 30
-			: >"$WORK/after.tsv"
+	# Snapshot the portal rooms of every known group thread: the probe room may
+	# text a thread that is not the first one, and the check must catch an
+	# existing thread gaining a second portal (fracture) or losing a channel id.
+	membership_snapshot_rooms() {
+		local t_id p_rc=0
+		: >"$WORK/live-rooms.tsv"
+		while IFS='|' read -r t_id _count; do
+			[ -n "$t_id" ] || continue
+			p_rc=0
+			phone_thread_participants "$t_id" >"$WORK/live-participants" 2>/dev/null || p_rc=$?
+			[ "$p_rc" -eq 0 ] || continue
+			[ -s "$WORK/live-participants" ] || continue
+			mapfile -t numbers <"$WORK/live-participants"
+			: >"$WORK/live-cand.tsv"
 			for n in "${numbers[@]}"; do
-				room_ids_matching_name "$n" >>"$WORK/after.tsv" 2>/dev/null || true
+				room_ids_matching_name "$n" >>"$WORK/live-cand.tsv" 2>/dev/null || true
 			done
-			sort -u "$WORK/after.tsv" >"$WORK/after-rooms"
-			new_rooms="$(comm -13 "$WORK/before-rooms" "$WORK/after-rooms" | sed '/^$/d')"
-			if [ -n "$new_rooms" ]; then
-				fail "membership probe created new room(s): $(printf '%s' "$new_rooms" | tr '\n' ' ')"
+			LC_ALL=C sort -u "$WORK/live-cand.tsv" >>"$WORK/live-rooms.tsv"
+		done <"$WORK/group-threads"
+		cut -f1 "$WORK/live-rooms.tsv" | sed '/^$/d' | LC_ALL=C sort -u
+	}
+	channel_list() {
+		local room
+		while IFS= read -r room; do
+			[ -n "$room" ] || continue
+			portal_channel_id "$room" 2>/dev/null || true
+		done
+	}
+	existing_threads="$(cut -d'|' -f1 "$WORK/group-threads" | sed '/^$/d')"
+	before_rooms="$(membership_snapshot_rooms)"
+	before_channels="$(channel_list <<<"$before_rooms" | sed '/^$/d')"
+	before_ms="$(now_ms)"
+	rc=0
+	iamb_send "$IAMB_GROUP_ROOM" "validate t07 membership probe $before_ms" >"$WORK/send.json" 2>"$WORK/send.err" || rc=$?
+	case "$rc" in
+	"$RC_OK")
+		pass "membership probe sent from $IAMB_GROUP_ROOM (at ${before_ms}ms)"
+		sleep 30
+		after_rooms="$(membership_snapshot_rooms)"
+		new_rooms="$(LC_ALL=C comm -13 <(printf '%s\n' "$before_rooms") <(printf '%s\n' "$after_rooms") | sed '/^$/d')"
+		fractured=""
+		created=""
+		while IFS= read -r room; do
+			[ -n "$room" ] || continue
+			chan="$(portal_channel_id "$room" 2>/dev/null || true)"
+			suffix="${chan##*-}"
+			if [ -n "$chan" ] && printf '%s\n' "$existing_threads" | grep -qx "$suffix"; then
+				fractured="$fractured $room"
 			else
-				pass "membership probe kept the same room set ($(wc -l <"$WORK/after-rooms" | tr -d ' ') room(s))"
+				created="$created $room"
 			fi
-			after_channels="$(while IFS=$'\t' read -r room _; do [ -n "$room" ] && portal_channel_id "$room" 2>/dev/null || true; done <"$WORK/after-rooms" | sort -u | sed '/^$/d')"
-			if [ "$before_channels" = "$after_channels" ]; then
-				pass "membership probe kept the same channel id(s): $(printf '%s' "$after_channels" | tr '\n' ' ')"
-			else
-				fail "membership probe changed channel ids (before: $(printf '%s' "$before_channels" | tr '\n' ' ') / after: $(printf '%s' "$after_channels" | tr '\n' ' '))"
-			fi
-			;;
-		"$RC_UNREACHABLE") skip_check "membership probe send failed: $(tr '\n' ' ' <"$WORK/send.err")" ;;
-		*) fail "membership probe send misbehaved: $(tr '\n' ' ' <"$WORK/send.err")" ;;
-		esac
-	fi
+		done <<<"$new_rooms"
+		if [ -n "$fractured" ]; then
+			fail "membership probe gave an existing thread a second portal:$fractured"
+		else
+			pass "membership probe kept one portal per existing thread (new conversation rooms:${created:- none})"
+		fi
+		after_channels="$(channel_list <<<"$after_rooms" | sed '/^$/d')"
+		dups_after="$(printf '%s\n' "$after_channels" | LC_ALL=C sort | uniq -d | sed '/^$/d')"
+		missing_channels="$(LC_ALL=C comm -23 <(printf '%s\n' "$before_channels" | LC_ALL=C sort -u | sed '/^$/d') <(printf '%s\n' "$after_channels" | LC_ALL=C sort -u | sed '/^$/d') | sed '/^$/d')"
+		unique_after="$(printf '%s\n' "$after_channels" | LC_ALL=C sort -u | sed '/^$/d' | wc -l | tr -d ' ')"
+		if [ -n "$dups_after" ]; then
+			fail "membership probe duplicated channel id(s): $dups_after"
+		elif [ -n "$missing_channels" ]; then
+			fail "membership probe lost channel id(s): $missing_channels"
+		else
+			pass "membership probe kept every channel id ($unique_after unique), no duplicates"
+		fi
+		;;
+	"$RC_UNREACHABLE") skip_check "membership probe send failed: $(tr '\n' ' ' <"$WORK/send.err")" ;;
+	*) fail "membership probe send misbehaved: $(tr '\n' ' ' <"$WORK/send.err")" ;;
+	esac
 else
 	skip_check "live membership probe disabled (set VALIDATE_LIVE_SENDS=1 and IAMB_GROUP_ROOM)"
 fi

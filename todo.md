@@ -3,6 +3,7 @@
 > Resume-friendly tracker: tick `- [ ]` items as they complete. Keep evidence as IDs/senders/timestamps only — never log message bodies. Env-driven harnesses, no hardcoded local setup (this is a community project).
 
 ## 0. Conventions
+
 - [ ] Deploy order: **the test deployment first** (number attached via test ssh host), validate, then production.
 - [ ] LineageOS only (no GrapheneOS builds); degoogled Android focus, non-root paths must keep working (app transport; the adb-agent path was dropped 2026-10-26).
 - [ ] Devices: adb serial `<adb-serial>` (US Mobile `+15550100100`, LineageOS 21, root) + localhost adb number + test-host number; iamb public/personal for JMP side.
@@ -10,6 +11,7 @@
 - [ ] Group correctness is the top invariant: any change that risks a second room, fractured portals, or own-number ghosts requires an acceptance-matrix re-run.
 
 ## 1. Control intents (automation enabler)
+
 - [ ] `control_enabled` pref (default false) + trust gate (control token extra OR `android.permission.DUMP`).
 - [ ] Ordered broadcasts with `setResultData(json)`: `control.STATUS`, `control.CONFIG`, `control.PAIR`, `control.UNPAIR`, `control.SEND`, `control.SYNC`.
 - [ ] STATUS JSON: enabled, service running, paired device id/user, hs+bridge URLs, token present (never the token), port, default-SMS role, permissions, last heartbeat, queue+event cursors, outbox sizes, version.
@@ -22,6 +24,7 @@
 - [ ] `docs/bridge-mode.md` (usage + security notes).
 
 ## 2. Per-repo e2e harness
+
 - [x] `scripts/validate/lib.sh` env contract: `ADB_SERIAL`, `BRIDGE_URL`, `BRIDGE_TOKEN`, `AGENT_URL` (replaces `SMS_AGENT_URL`), `AGENT_TOKEN`, `SMSMMS_INFO_PATH`, `APP_PACKAGE`, `IAMB_*`/`JMP_*` pass-through (agent env vars unused — adb-agent path dropped 2026-10-26).
 - [x] Scaffold landed 2026-10-26: `scripts/validate/t01_local_rig.sh` smoke test + `docs/validation.md`; helpers `curl_json`, `bridge_info`, `agent_info`, `drive_app`, `assert_agent_reachable`, `assert_paired`, `sha256_16`, `wait_for_room` (Matrix-side placeholder).
 - [x] Helpers landed 2026-10-26/27: `adb_cmd`/`adb_shell` (local or `ADB_SSH`), `sqlite_query` + phone SMS/PDU/thread/part helpers, `sha256_file`/`sha256_compare`, `iamb_cmd`/`iamb_send`/`iamb_send_wait`/`room_for_number`/`archive_tail`, `portal_for_thread`/`send_and_wait`/`assert_one_room`, `prepare_attachment`/`control_send`.
@@ -29,6 +32,7 @@
 - [x] Acceptance suite landed: `t02`–`t14` (pairing, inbound, group create, attachments, group send, membership, tapbacks, read state, restart dedupe, non-root, multi-device, group events, invite/join) + `fixtures/cat.gif`.
 
 ## 3. Acceptance matrix (all devices/modes)
+
 - [x] 1. Pair (QR + `control.PAIR`) → `!sms devices` shows device; bridge heartbeat. (t02 PASS 2026-10-27: the test deployment + test phone, 1 device, fresh heartbeat.)
 - [ ] 2. 1:1 inbound SMS → one portal room (30-day backfill), correct sender ghost, no own-number ghost. (t03: portal/channel ids/own-number filter PASS, but the portal carries no `m.room.message` from the phone — inbound content not delivered; fix then re-run.)
 - [x] 3. Group create (iamb `create` group) → exactly ONE room with membership; second sender → no fracture. (t04 PASS with a live group probe: same phone thread, same room set, unique channel ids; portal names cover 1/2 participants — `PORTAL_STRICT_PARTICIPANTS=1` enforces full coverage.)
@@ -44,6 +48,7 @@
 - [x] 13. Invite→join flows (`create` via bridge, iamb invites). (t14 PASS: no pending invites, management room + portal candidates joined.)
 
 ## 4. Polish backlog
+
 - [ ] Auto-fit attachment pipeline (resize/compress to MMS limit; `mmsFileSizeLimit` today is UI-only).
 - [ ] Delivery states (sent/delivered receipts back into Matrix).
 - [ ] Outgoing tapbacks.
@@ -51,12 +56,14 @@
 - [ ] Release tagging checklist (bump VERSION_NAME/CODE, verify cert, Forgejo release, update `docs/PLAN.md`).
 
 ## 5. Deployments
-- [ ] sms-mms → **the test deployment** (test ssh host number) first: deploy, check `/_smsmms/v1/info`, pair test phone.
+
+- [ ] sms-mms → **the test deployment** (number on the test ssh host) first: deploy, check `/_smsmms/v1/info`, pair test phone.
 - [ ] Run acceptance subset on the test deployment; fix; repeat.
 - [ ] Then deploy to production (existing runbook + traps: preload `--network host`, as_token needs install-synapse after registration changes).
 - [ ] jmpchat bridge: the test deployment only for tests (no production).
 
 ## 6. Calls follow-up (after A/B)
+
 - [ ] See `mautrix-jmpchat/docs/SFRAME_CALLS_SPIKE.md` (M0–M4: research → Go SFrame codec → key receipt prototype → media round-trip → integration).
 
 ## Resolved decisions + new features (2026-10-26)
@@ -69,7 +76,7 @@
 
 ## File service ("CDN") — resolved spec (2026-10-26, deferred until domains exist)
 
-- [ ] Domains: `cdn.example.com` and `cdn.example.com` (user configures DNS; feature must be
+- [ ] Domains: `cdn.example.com` and `cdn.example.net` (user configures DNS; feature must be
       fully config-gated: no domain in the role => no service, same on the app side).
 - [ ] Zero-knowledge: files are encrypted client-side (AES-GCM) before upload; the key lives in the
       URL fragment and never reaches the server; server stores ciphertext only ("encrypted at rest").
@@ -85,3 +92,7 @@
       ask-each-time toggle; upload size limit; global expiry override.
 - [x] Transport (2026-10-26): app pairing only — the adb-agent path was dropped as too complex; the bridge uses the app transport.
       for exhaustive testing (no hard requirement).
+
+## Plus plus
+
+- [ ] forward calls from a rooted lineageos device usb connected over adb to matrix SIP directly so you could make and receive real calls via matrix clients.

@@ -103,16 +103,24 @@ if [ "$VALIDATE_LIVE_SENDS" = "1" ] && [ -n "$IAMB_GROUP_PORTAL" ] && [ "$role" 
 		skip_check "live group send: iamb not available"
 	else
 		before_ms="$(now_ms)"
+		# Provider dates have second granularity, so a row written in the same
+		# second as the probe can look older than before_ms: count rows by
+		# their monotonically increasing id instead.
+		before_sms_id="$(sqlite_query "select coalesce(max(_id),0) from sms;" 2>/dev/null | tail -n 1)"
+		before_pdu_id="$(sqlite_query "select coalesce(max(_id),0) from pdu;" 2>/dev/null | tail -n 1)"
+		[ -n "$before_sms_id" ] || before_sms_id=0
+		[ -n "$before_pdu_id" ] || before_pdu_id=0
 		rc=0
 		iamb_send "$IAMB_GROUP_PORTAL" "validate t06 group send probe $before_ms" >"$WORK/send.json" 2>"$WORK/send.err" || rc=$?
 		case "$rc" in
 		"$RC_OK")
 			pass "Matrix message sent into portal $IAMB_GROUP_PORTAL (at ${before_ms}ms)"
-			LIVE_BEFORE_MS="$before_ms"
+			LIVE_BEFORE_SMS_ID="$before_sms_id"
+			LIVE_BEFORE_PDU_ID="$before_pdu_id"
 			has_new_phone_rows() {
 				local c p
-				c="$(phone_sms_count_since "$LIVE_BEFORE_MS" 2>/dev/null || echo 0)"
-				p="$(phone_pdu_count_since "$LIVE_BEFORE_MS" 2>/dev/null || echo 0)"
+				c="$(sqlite_query "select count(*) from sms where _id > $LIVE_BEFORE_SMS_ID;" 2>/dev/null | tail -n 1)"
+				p="$(sqlite_query "select count(*) from pdu where _id > $LIVE_BEFORE_PDU_ID;" 2>/dev/null | tail -n 1)"
 				[ "${c:-0}" -gt 0 ] || [ "${p:-0}" -gt 0 ]
 			}
 			rc=0
@@ -120,8 +128,8 @@ if [ "$VALIDATE_LIVE_SENDS" = "1" ] && [ -n "$IAMB_GROUP_PORTAL" ] && [ "$role" 
 			if [ "$rc" -ne 0 ]; then
 				fail "live group send: no new SMS/MMS row on the phone within 240s"
 			else
-				after_pdu_rows="$(phone_mms_rows_since "$before_ms")"
-				after_sms_rows="$(phone_sms_rows_since "$before_ms")"
+				after_pdu_rows="$(sqlite_query "select _id,thread_id,date,msg_box from pdu where _id > $LIVE_BEFORE_PDU_ID order by _id;" 2>/dev/null)"
+				after_sms_rows="$(sqlite_query "select _id,thread_id,date,type,address from sms where _id > $LIVE_BEFORE_SMS_ID order by _id;" 2>/dev/null)"
 				delta_pdu="$(printf '%s\n' "$after_pdu_rows" | sed '/^$/d' | wc -l | tr -d ' ')"
 				delta_sms="$(printf '%s\n' "$after_sms_rows" | sed '/^$/d' | wc -l | tr -d ' ')"
 				if [ "$delta_pdu" -eq 1 ] && [ "$delta_sms" -eq 0 ]; then

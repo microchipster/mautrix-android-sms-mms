@@ -8,7 +8,9 @@
 #
 # The harness is env-driven: nothing below hardcodes a specific workstation.
 # Defaults target the local dev rig described in docs/testing-e2e-local.md and
-# are overridden for a deployment (see docs/validation.md).
+# are overridden for a deployment (see docs/validation.md). `ADB_SERIAL`,
+# `AGENT_TOKEN` and `IAMB_SSH` are required: helpers that use them fail with a
+# clear error when unset instead of falling back to a hardcoded setup value.
 #
 # Probe return codes (callers SKIP an unreachable component, but FAIL a
 # reachable one that answers wrong):
@@ -19,9 +21,9 @@
 # Environment contract
 # --------------------
 # adb / phone (all optional unless noted):
-#   ADB_SERIAL            adb serial of the phone under test (default <adb-serial>).
+#   ADB_SERIAL            adb serial of the phone under test (required).
 #   ADB_SSH               when set, run adb on that host: `ssh $ADB_SSH adb ...`
-#                         (e.g. ADB_SSH=<ssh-host> for the phone plugged into <ssh-host>).
+#                         (e.g. ADB_SSH=<ssh-host> for a phone plugged into another host).
 #   APP_PACKAGE           app under test (default org.fossify.messages.bridge).
 #   CONTROL_TOKEN         optional control-intent token extra; also accepted by
 #                         drive_app for token-gated app builds. Never logged.
@@ -45,7 +47,8 @@
 #
 # ADB agent HTTP API (docs/AGENT_API.md):
 #   AGENT_URL             agent base URL (default http://127.0.0.1:8093).
-#   AGENT_TOKEN           bearer token (default <agent-token>).
+#   AGENT_TOKEN           bearer token (required for agent calls; /v1/health is
+#                         auth-free but the harness still sends the header).
 #   AGENT_INFO_PATH       agent info path (default /v1/health).
 #
 # HTTP behaviour:
@@ -64,7 +67,7 @@
 #   BRIDGE_MATRIX_TOKEN   optional access token for that polling.
 #
 # iamb/quirk notes:
-#   - This harness targets the patched iamb CLI on <ssh-host>: message bodies go in
+#   - This harness targets the patched iamb CLI on the ssh host: message bodies go in
 #     `--inline '<text>'` (or `--attach`); `--wait-output json` returns the
 #     machine-readable send/wait summary. `--no-ipc`, when used, is a global
 #     flag and must come before the subcommand (iamb_cmd inserts it correctly).
@@ -89,8 +92,30 @@
 #   INVITES_ACCEPT            1 = let t14 accept pending invites.
 #   PHONE_HEARTBEAT_MAX_AGE_MS heartbeat staleness limit (t02/t11, default 1800000).
 #   BRIDGE_DB / BRIDGE_RESTART_CMD / RESTART_TIMEOUT  restart-dedupe checks (t10).
+#   APP_RESTART               1 = let t10 restart the paired app and assert no
+#                             phone rows are duplicated (opt-in; disruptive).
 #   INBOUND_LOOKBACK_MS / READ_LOOKBACK_MS  lookback windows (t03/t08/t09).
 #   MAX_GROUP_THREADS / MAX_CANDIDATE_ROOMS / MAX_SCAN_ROOMS  slow-scan caps.
+#   EXPECT_PORTAL_MIRROR      1 = FAIL when a live probe's phone-side message
+#                             is missing from its Matrix portal (default 1;
+#                             0 degrades that check to a SKIP with evidence).
+#   PORTAL_MIRROR_WAIT        seconds to wait for the portal mirror (default 60).
+#   SMS_TARGET_NUMBER         outbound target for the SMS message-type probes
+#                             (t15; defaults to JMP_NUMBER).
+#   MEDIA_TARGET_NUMBER       outbound target for the media-variant probes
+#                             (t18; defaults to SMS_TARGET_NUMBER).
+#   MEDIA_BYTE_EXACT_INBOUND  1 = inbound video/audio parts must hash-match the
+#                             fixture (default 1; 0 documents the degradation as
+#                             a SKIP when the JMP/MMS transport transcodes).
+#   APP_BRIDGE_URL            app HTTP API base URL (t17) when it is already
+#                             reachable (e.g. via a manual tunnel).
+#   APP_BRIDGE_TOKEN          bearer token for APP_BRIDGE_URL (never logged).
+#   APP_BRIDGE_PORT           app HTTP API port for the adb-forward path
+#                             (t17; default 8391, the app's bridge_port).
+#   APP_HTTP_ENABLE_TEMP      1 = let t17 temporarily enable the app's
+#                             static-token HTTP API via control.CONFIG
+#                             (bridge_enabled=true + a generated token) and
+#                             restore the preference afterwards.
 #
 # Bodies, message text and tokens are never logged: evidence is ids, room ids,
 # counts, timestamps and SHA-256 hashes only.
@@ -172,6 +197,16 @@ READ_LOOKBACK_MS="${READ_LOOKBACK_MS:-2592000000}"
 MAX_GROUP_THREADS="${MAX_GROUP_THREADS:-3}"
 MAX_CANDIDATE_ROOMS="${MAX_CANDIDATE_ROOMS:-6}"
 MAX_SCAN_ROOMS="${MAX_SCAN_ROOMS:-3}"
+APP_RESTART="${APP_RESTART:-0}"
+EXPECT_PORTAL_MIRROR="${EXPECT_PORTAL_MIRROR:-1}"
+PORTAL_MIRROR_WAIT="${PORTAL_MIRROR_WAIT:-60}"
+SMS_TARGET_NUMBER="${SMS_TARGET_NUMBER:-${JMP_NUMBER:-}}"
+MEDIA_TARGET_NUMBER="${MEDIA_TARGET_NUMBER:-${SMS_TARGET_NUMBER:-}}"
+MEDIA_BYTE_EXACT_INBOUND="${MEDIA_BYTE_EXACT_INBOUND:-1}"
+APP_BRIDGE_URL="${APP_BRIDGE_URL:-}"
+APP_BRIDGE_TOKEN="${APP_BRIDGE_TOKEN:-}"
+APP_BRIDGE_PORT="${APP_BRIDGE_PORT:-8391}"
+APP_HTTP_ENABLE_TEMP="${APP_HTTP_ENABLE_TEMP:-0}"
 
 export ADB_SERIAL ADB_SSH APP_PACKAGE CONTROL_TOKEN
 export PHONE_TELEPHONY_DB PHONE_SQLITE_BIN PHONE_SQLITE_MODE PHONE_DOWNLOAD_DIR PHONE_ATTACHMENT_DIR PHONE_NUMBER
@@ -183,6 +218,8 @@ export VALIDATE_LIVE_SENDS IAMB_PHONE_ROOM IAMB_GROUP_ROOM IAMB_GROUP_PORTAL IAM
 export ATTACHMENT_TARGET_NUMBER MMS_SIZE_LIMIT_BYTES PHONE_EXPECT_READ PORTAL_STRICT_PARTICIPANTS EXPECT_REACTION_TEXT
 export INVITES_ACCEPT PHONE_HEARTBEAT_MAX_AGE_MS BRIDGE_DB BRIDGE_RESTART_CMD RESTART_TIMEOUT
 export INBOUND_LOOKBACK_MS READ_LOOKBACK_MS MAX_GROUP_THREADS MAX_CANDIDATE_ROOMS MAX_SCAN_ROOMS
+export APP_RESTART EXPECT_PORTAL_MIRROR PORTAL_MIRROR_WAIT SMS_TARGET_NUMBER MEDIA_TARGET_NUMBER MEDIA_BYTE_EXACT_INBOUND
+export APP_BRIDGE_URL APP_BRIDGE_TOKEN APP_BRIDGE_PORT APP_HTTP_ENABLE_TEMP
 export JMP_PROFILE JMP_NUMBER JMP_MGMT_ROOM
 
 # Repository paths.
@@ -297,6 +334,7 @@ bridge_info() {
 # documented info endpoint is /v1/health, auth-free) and validate ok=true plus
 # protocol_version=1. Prints the JSON body on success.
 agent_info() {
+	require_env AGENT_TOKEN
 	local body rc=0 proto ok err
 	local -a curl_args=()
 	if [ -n "$AGENT_TOKEN" ]; then
@@ -340,6 +378,7 @@ adb_serial_args() {
 
 # adb_shell ARGS... — run `adb [-s SERIAL] shell ARGS...`.
 adb_shell() {
+	require_env ADB_SERIAL
 	local -a args=()
 	while IFS= read -r arg; do
 		[ -n "$arg" ] && args+=("$arg")
@@ -349,6 +388,7 @@ adb_shell() {
 
 # adb_exec_out ARGS... — run `adb [-s SERIAL] exec-out ARGS...` (binary-safe).
 adb_exec_out() {
+	require_env ADB_SERIAL
 	local -a args=()
 	while IFS= read -r arg; do
 		[ -n "$arg" ] && args+=("$arg")
@@ -360,6 +400,7 @@ adb_exec_out() {
 # copied to the ssh host first (adb reads it there) and the remote copy is
 # removed again.
 adb_push() {
+	require_env ADB_SERIAL
 	local src="$1" dst="$2" rc=0 remote_src="$src" remote_tmp=""
 	local -a args=()
 	while IFS= read -r arg; do
@@ -384,6 +425,7 @@ adb_push() {
 
 # adb_device_online — RC_OK when the device answers `get-state` with "device".
 adb_device_online() {
+	require_env ADB_SERIAL
 	local state rc=0
 	local -a args=()
 	while IFS= read -r arg; do
@@ -426,6 +468,7 @@ device_arg() {
 # `su -c` when the direct attempt fails (Magisk-style su that joins argv).
 # Returns RC_OK, RC_MISBEHAVING (sqlite error) or RC_UNREACHABLE (no adb).
 sqlite_query() {
+	require_env ADB_SERIAL
 	local sql="$1" rc=0 out
 	local -a runner=()
 	if ! command -v adb >/dev/null 2>&1 && [ -z "$ADB_SSH" ]; then
@@ -564,6 +607,71 @@ phone_part_sha256() {
 	printf '%s\n' "$sum"
 }
 
+# phone_part_text_hex PART_ID — hex of a part's inline text payload (`part.text`;
+# '' for file-backed parts). Hex survives newlines in the text; only the hex is
+# handled locally and it is never logged as a body.
+phone_part_text_hex() {
+	require_int "PART_ID" "$1"
+	sqlite_query "select coalesce(hex(text),'') from part where _id = $1;" | tail -n 1
+}
+
+# phone_part_text_sha256 PART_ID — SHA-256 of the part's inline text bytes.
+phone_part_text_sha256() {
+	local hex
+	hex="$(phone_part_text_hex "$1")" || return $?
+	printf '%s' "$hex" | xxd -r -p | sha256sum | cut -d ' ' -f 1
+}
+
+# phone_mms_part_row PDU_ID CT_PREFIX — first part of PDU_ID whose content type
+# starts with CT_PREFIX (`_id|ct|name|chset|seq|_data`); empty when none match.
+phone_mms_part_row() {
+	require_int "PDU_ID" "$1"
+	phone_mms_parts "$1" | awk -F'|' -v prefix="$2" '$2 ~ "^" prefix { print; exit }'
+}
+
+# phone_max_sms_id — current highest SMS `_id` (0 when the table is empty).
+phone_max_sms_id() {
+	sqlite_query "select coalesce(max(_id),0) from sms;" | tail -n 1
+}
+
+# phone_max_pdu_id — current highest MMS `pdu._id` (0 when the table is empty).
+phone_max_pdu_id() {
+	sqlite_query "select coalesce(max(_id),0) from pdu;" | tail -n 1
+}
+
+# phone_sms_rows_newer_than SMS_ID [TYPE] — rows
+# (`_id|thread_id|date|type|address|body_len|sub_id`) newer than SMS_ID,
+# oldest first; TYPE (1 inbox, 2 sent) filters when given.
+phone_sms_rows_newer_than() {
+	require_int "SMS_ID" "$1"
+	local type_filter=""
+	if [ "${2:-}" != "" ]; then
+		require_int "TYPE" "$2"
+		type_filter=" and type = $2"
+	fi
+	sqlite_query "select _id,thread_id,date,type,address,length(body),sub_id from sms where _id > $1${type_filter} order by _id asc;"
+}
+
+# phone_pdu_rows_newer_than PDU_ID — MMS rows (`_id|thread_id|date|msg_box`)
+# newer than PDU_ID, oldest first.
+phone_pdu_rows_newer_than() {
+	require_int "PDU_ID" "$1"
+	sqlite_query "select _id,thread_id,date,msg_box from pdu where _id > $1 order by _id asc;"
+}
+
+# phone_sms_body_hex SMS_ID — hex of one SMS row's body ('' when absent).
+phone_sms_body_hex() {
+	require_int "SMS_ID" "$1"
+	sqlite_query "select coalesce(hex(body),'') from sms where _id = $1;" | tail -n 1
+}
+
+# phone_sms_body_sha256 SMS_ID — SHA-256 of one SMS row's body bytes.
+phone_sms_body_sha256() {
+	local hex
+	hex="$(phone_sms_body_hex "$1")" || return $?
+	printf '%s' "$hex" | xxd -r -p | sha256sum | cut -d ' ' -f 1
+}
+
 # ---------------------------------------------------------------------------
 # App control surface (intent broadcasts)
 # ---------------------------------------------------------------------------
@@ -576,6 +684,7 @@ CONTROL_RECEIVER_CLASS="${CONTROL_RECEIVER_CLASS:-org.fossify.messages.control.C
 
 # drive_app CMD [args...] — one control command against $APP_PACKAGE.
 drive_app() {
+	require_env ADB_SERIAL
 	local cmd="${1:-}"
 	if [ -z "$cmd" ]; then
 		die "drive_app requires a command (status|config|pair|unpair|send|sync)"
@@ -682,6 +791,83 @@ app_default_sms_role() {
 	jq -r 'if .default_sms_role == null then empty else (.default_sms_role | tostring) end' <<<"$verdict"
 }
 
+# random_hex [BYTES] — N random bytes as lowercase hex (default 32). Used for
+# generated control/app tokens; the value is never logged by the harness.
+random_hex() {
+	od -An -tx1 -N "${1:-32}" /dev/urandom | tr -d ' \n'
+}
+
+# adb_forward PORT — forward localhost:PORT on the adb host (local machine or
+# $ADB_SSH) to the same port on the device.
+adb_forward() {
+	require_env ADB_SERIAL
+	local port="$1"
+	require_int "PORT" "$port"
+	local -a args=()
+	while IFS= read -r arg; do
+		[ -n "$arg" ] && args+=("$arg")
+	done < <(adb_serial_args)
+	adb_cmd "${args[@]}" forward "tcp:$port" "tcp:$port" >/dev/null
+}
+
+# adb_forward_remove PORT — drop a forward created by adb_forward (best effort).
+adb_forward_remove() {
+	require_env ADB_SERIAL
+	local port="$1"
+	require_int "PORT" "$port"
+	local -a args=()
+	while IFS= read -r arg; do
+		[ -n "$arg" ] && args+=("$arg")
+	done < <(adb_serial_args)
+	adb_cmd "${args[@]}" forward --remove "tcp:$port" >/dev/null 2>&1 || true
+}
+
+# app_http_request METHOD BASE PATH [BODY_FILE] [TOKEN] — call the app's HTTP
+# API (docs/AGENT_API.md) from the host that owns the adb connection: on
+# $ADB_SSH when set (so an `adb forward` there is reachable), locally otherwise.
+# Prints the response body; RC_UNREACHABLE on transport failure. The token is
+# passed as a header and never logged.
+app_http_request() {
+	local method="$1" base="$2" path="$3" body="${4:-}" token="${5:-}"
+	local url rc=0 remote
+	url="$(url_join "$base" "$path")"
+	if [ -n "$ADB_SSH" ]; then
+		remote="curl --silent --show-error --max-time $CURL_TIMEOUT --request $method $(shell_quote "$url")"
+		if [ -n "$token" ]; then
+			remote="$remote -H $(shell_quote "Authorization: Bearer $token")"
+		fi
+		if [ -n "$body" ]; then
+			remote="$remote --header 'Content-Type: application/json' --data-binary @-"
+			ssh "$ADB_SSH" "$remote" <"$body" || rc=$?
+		else
+			ssh "$ADB_SSH" "$remote" || rc=$?
+		fi
+	else
+		local -a curl_args=(--silent --show-error --max-time "$CURL_TIMEOUT" --request "$method" "$url")
+		if [ -n "$token" ]; then
+			curl_args+=(-H "Authorization: Bearer $token")
+		fi
+		if [ -n "$body" ]; then
+			curl_args+=(--header 'Content-Type: application/json' --data-binary "@$body")
+		fi
+		curl "${curl_args[@]}" || rc=$?
+	fi
+	if [ "$rc" -ne 0 ]; then
+		log "app_http_request: $method $path transport failed (exit $rc)"
+		return "$RC_UNREACHABLE"
+	fi
+}
+
+# app_http_health BASE [TOKEN] — GET {BASE}/v1/health; prints the JSON body.
+# RC_UNREACHABLE when the app HTTP API is not listening at all.
+app_http_health() {
+	local base="$1" token="${2:-}" body rc=0
+	body="$(app_http_request GET "$base" "/v1/health" "" "$token")" || rc=$?
+	[ "$rc" -eq 0 ] || return "$rc"
+	printf '%s\n' "$body" | jq -e . >/dev/null 2>&1 || return "$RC_MISBEHAVING"
+	printf '%s\n' "$body"
+}
+
 # ---------------------------------------------------------------------------
 # Evidence helpers
 # ---------------------------------------------------------------------------
@@ -694,6 +880,12 @@ sha256_16() {
 	else
 		sha256sum | cut -c1-16
 	fi
+}
+
+# sha256_str STRING — full SHA-256 of a string's bytes (printf without a
+# trailing newline). Used to compare probe texts without ever logging them.
+sha256_str() {
+	printf '%s' "$1" | sha256sum | cut -d ' ' -f 1
 }
 
 # sha256_file FILE — full SHA-256 of a file.
@@ -736,6 +928,7 @@ shell_quote() {
 
 # iamb_available — RC_OK when the iamb binary is present on $IAMB_SSH.
 iamb_available() {
+	require_env IAMB_SSH
 	local rc=0
 	ssh -n "$IAMB_SSH" "test -x $IAMB_BIN" >/dev/null 2>&1 || rc=$?
 	if [ "$rc" -ne 0 ]; then
@@ -750,6 +943,7 @@ iamb_available() {
 # passed with --inline/--attach, never stdin.
 # Returns RC_UNREACHABLE when iamb is absent or the ssh transport fails.
 iamb_cmd() {
+	require_env IAMB_SSH
 	local remote="$IAMB_BIN -P $(shell_quote "$IAMB_PROFILE")"
 	if [ "$IAMB_NO_IPC" = "1" ]; then
 		remote="$remote --no-ipc"
@@ -871,6 +1065,7 @@ send_and_wait() {
 # iamb_send_file ROOM LOCAL_FILE [REMOTE_NAME] — copy a local file to the ssh
 # host and send it as an attachment (`send --attach`). Prints the JSON summary.
 iamb_send_file() {
+	require_env IAMB_SSH
 	local room="$1" file="$2" name="${3:-$(basename "$2")}" rc=0 json remote
 	remote="/tmp/validate-$name"
 	[ -f "$file" ] || die "iamb_send_file: $file is not a file"
@@ -901,6 +1096,7 @@ iamb_react() {
 # ROOM from the iamb daemon's archive on $IAMB_SSH. Public-profile files carry
 # a .ndjson suffix; personal-profile files do not — both are tried.
 archive_tail() {
+	require_env IAMB_SSH
 	local room="$1" lines="${2:-50}" base="${room#!}"
 	ssh -n "$IAMB_SSH" "tail -n $lines \"\$HOME/.local/share/iamb/profiles/$IAMB_PROFILE/events/$base.ndjson\" 2>/dev/null || tail -n $lines \"\$HOME/.local/share/iamb/profiles/$IAMB_PROFILE/events/$base\" 2>/dev/null"
 }
@@ -912,6 +1108,22 @@ archive_events_since() {
 	require_int "EPOCH_MS" "$since"
 	archive_tail "$room" "$lines" | jq -c --argjson since "$since" \
 		'select(type == "object") | select(.origin_server_ts >= $since) | {type, event_id, sender, origin_server_ts, room_id}'
+}
+
+# portal_events_since ROOM EPOCH_MS — m.room.message events of ROOM newer than
+# EPOCH_MS as compact JSON lines with bodies dropped:
+# {event_id, sender, origin_server_ts, msgtype, body_len, mimetype, file_name}.
+# Returns RC_UNREACHABLE when iamb cannot fetch the room.
+portal_events_since() {
+	local room="$1" since="$2" json rc=0
+	require_int "EPOCH_MS" "$since"
+	json="$(iamb_cmd message "$room")" || return "$RC_UNREACHABLE"
+	printf '%s' "$json" | jq -c --argjson since "$since" \
+		'select(type == "object") | select(.type == "m.room.message") | select(.origin_server_ts >= $since) |
+		 {event_id, sender, origin_server_ts, msgtype: (.content.msgtype // ""),
+		  body_len: ((.content.body // "") | length),
+		  mimetype: (.content.info.mimetype // ""),
+		  file_name: (if (.content.msgtype // "") == "m.image" or (.content.msgtype // "") == "m.audio" or (.content.msgtype // "") == "m.video" or (.content.msgtype // "") == "m.file" then (.content.body // "") else "" end)}'
 }
 
 # room_member_changes ROOM [LINES] — recent membership events in ROOM

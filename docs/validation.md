@@ -26,13 +26,21 @@ bridge channel ids, room membership, timestamps, SHA-256 hashes).
 | `scripts/validate/t07_membership.sh` | membership in place: one room per channel id, no dupes/own-number ghost |
 | `scripts/validate/t08_tapbacks.sh` | tapbacks both ways (inbound reactions; opt-in outgoing text fallback) |
 | `scripts/validate/t09_read_state.sh` | read state reaches the phone (`read=1 seen=1` on inbound SMS) |
-| `scripts/validate/t10_restart_dedupe.sh` | bridge DB dedupe + optional restart keeps portals/recipients |
+| `scripts/validate/t10_restart_dedupe.sh` | bridge DB dedupe + optional bridge/app restarts keep portals, recipients and phone rows |
 | `scripts/validate/t11_nonroot.sh` | app transport works without root; agent root/non-root report |
 | `scripts/validate/t12_multidevice.sh` | device inventory + 2/3/4-participant group combos |
 | `scripts/validate/t13_group_events.sh` | group reactions/uploads/replies and SMS+MMS fallback evidence |
 | `scripts/validate/t14_invite_join.sh` | no stray invites, management room/portals joined |
+| `scripts/validate/t15_message_types.sh` | SMS message-type matrix: plain, long multipart and unicode/emoji, both directions |
+| `scripts/validate/t16_gif_roundtrip.sh` | animated GIF both directions: content-type + byte-exact SHA-256 |
+| `scripts/validate/t17_multi_attachment.sh` | one multi-attachment send → exactly one MMS with both image parts |
+| `scripts/validate/t18_media_variants.sh` | video (inbound) and audio (both directions) variants with degradation reporting |
+| `scripts/validate/t19_unknown_sender.sh` | unknown-number thread/portal creation, no duplicate threads |
 | `scripts/validate/fixtures/cat.gif` | tiny animated cat for the attachment tests (generated in-house) |
+| `scripts/validate/fixtures/paw.png` | second image for the multi-attachment test (generated in-house) |
+| `scripts/validate/fixtures/tiny.mp4` + `tiny.m4a` + `tiny.ogg` | synthetic video/audio fixtures (generated in-house) |
 | `scripts/validate/fixtures/make-cat-gif.sh` | fixture generator + regeneration docs |
+| `scripts/validate/fixtures/make-media-fixtures.sh` | generator for `paw.png`/`tiny.*` + regeneration docs |
 
 ## Quick start
 
@@ -41,7 +49,7 @@ bridge channel ids, room membership, timestamps, SHA-256 hashes).
 ./scripts/validate/t01_local_rig.sh
 ./scripts/validate/t02_pair.sh
 
-# 2. a deployment from the host the phone is plugged into, e.g. <ssh-host>:
+# 2. a deployment from the host the phone is plugged into (set ADB_SSH):
 #    (t01 SKIPs whatever is unreachable — run it here too if the bridge route works)
 BRIDGE_URL=https://matrix.example.com \
   ./scripts/validate/t01_local_rig.sh
@@ -77,7 +85,7 @@ fails a run: it means the component, the environment or the opt-in live probe is
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `ADB_SERIAL` | `<adb-serial>` | adb serial of the phone under test. |
+| `ADB_SERIAL` | required | adb serial of the phone under test. |
 | `ADB_SSH` | empty | run adb on that host: `ssh $ADB_SSH adb …` (e.g. `<ssh-host>`). |
 | `APP_PACKAGE` | `org.fossify.messages.bridge` | app under test (`.debug` for the debug build). |
 | `CONTROL_TOKEN` | empty | token extra for control broadcasts; never logged. |
@@ -92,10 +100,10 @@ fails a run: it means the component, the environment or the opt-in live probe is
 | `SMSMMS_INFO_PATH` | `/_smsmms/v1/info` | bridge info path (`docs/PAIRING_PROTOCOL.md` §4). |
 | `SMS_MGMT_ROOM` | empty | bridge `!sms` management room id (bot-command checks via iamb). |
 | `AGENT_URL` | `http://127.0.0.1:8093` | adb agent base URL. |
-| `AGENT_TOKEN` | `<agent-token>` | agent bearer token; `/v1/health` is auth-free. |
+| `AGENT_TOKEN` | required | agent bearer token; `/v1/health` is auth-free. |
 | `AGENT_INFO_PATH` | `/v1/health` | agent info path. |
 | `CURL_TIMEOUT` | `10` | seconds per HTTP request. |
-| `IAMB_SSH` | `<ssh-host>` | ssh host running iamb. |
+| `IAMB_SSH` | required | ssh host running iamb. |
 | `IAMB_BIN` | `$HOME/.cargo/bin/iamb` | remote iamb binary (literal `$HOME` expands on the host). |
 | `IAMB_PROFILE` | `public` | iamb profile. |
 | `IAMB_NO_IPC` | `0` | `1` inserts the global `--no-ipc` **before** the subcommand. |
@@ -115,6 +123,18 @@ fails a run: it means the component, the environment or the opt-in live probe is
 | `INVITES_ACCEPT` | `0` | `1` lets t14 accept pending invites instead of failing on them. |
 | `BRIDGE_DB` | local E2E rig's `bridge.db` when present | bridge database for dedupe checks (t10). |
 | `BRIDGE_RESTART_CMD` | empty | command t10 runs to test restart dedupe (never set for production). |
+| `APP_RESTART` | `0` | `1` lets t10 restart the paired app and assert no phone rows are replayed. |
+| `EXPECT_PORTAL_MIRROR` | `1` | `1` makes a live probe whose phone-side message never reaches its Matrix portal a FAIL; `0` downgrades that to a SKIP with evidence (t15–t18). |
+| `PORTAL_MIRROR_WAIT` | `60` | seconds to wait for a portal mirror before failing/skipping. |
+| `SMS_TARGET_NUMBER` | `$JMP_NUMBER` | outbound target for the SMS message-type probes (t15). |
+| `MEDIA_TARGET_NUMBER` | `$SMS_TARGET_NUMBER` | outbound target for the attachment/media probes (t16–t18). |
+| `MEDIA_BYTE_EXACT_INBOUND` | `1` | `1` makes an inbound video/audio hash mismatch a FAIL; `0` documents the transport degradation as a SKIP. |
+| `APP_BRIDGE_URL` / `APP_BRIDGE_TOKEN` | empty | pre-existing app HTTP API base URL + bearer token for t17 (token never logged). |
+| `APP_BRIDGE_PORT` | `8391` | app HTTP API port that t17 forwards over adb when it enables the API itself. |
+| `APP_HTTP_ENABLE_TEMP` | `0` | `1` lets t17 temporarily enable the app's static-token HTTP mode via `control.CONFIG` and restore it afterwards. |
+| `IAMB_NEW_SENDER_ROOM` | empty | iamb room that texts the phone from a genuinely new number (t19 live probe). |
+| `NEW_SENDER_NUMBER` | `$SMS_TARGET_NUMBER` | number whose phone thread/portal t19 inspects. |
+| `MAX_DM_THREADS` | `20` | cap on 1:1 threads t19 walks for portal coverage. |
 | `MAX_GROUP_THREADS` / `MAX_CANDIDATE_ROOMS` | `3` / `6` | caps for slow iamb/portal scans. |
 
 Tokens never belong in committed files; pass them via the environment (or a local,
@@ -125,12 +145,12 @@ gitignored `.env` sourced by your shell).
 - **Local rig** (defaults): bridge pairing API on `http://127.0.0.1:29322`, agent on
   `http://127.0.0.1:8093`, phone on adb. Nothing to set — see
   [testing-e2e-local.md](testing-e2e-local.md) to bring the rig up.
-- **Deployment** (e.g. the test deployment; production is the current production): set
-  `BRIDGE_URL=https://matrix.example.com`. Production `/_smsmms/` is served through the
-  reverse proxy on 443, not on the container's `:29322` listener. The agent and adb checks
-  only mean something on the host the phone is plugged into (the `<ssh-host>` host for the
-  test phone), so set `ADB_SSH=<ssh-host>` and run the tests from a machine that can reach
-  the bridge; `t01` SKIPs whatever is unreachable instead of failing.
+- **Deployment**: set `BRIDGE_URL=https://matrix.example.com` for a deployed bridge (the
+  test deployment; the production deployment works the same way). A deployed `/_smsmms/` is
+  served through the reverse proxy on 443, not on the container's `:29322` listener. The
+  agent and adb checks only mean something on the host the phone is plugged into, so set
+  `ADB_SSH=<ssh-host>` and run the tests from a machine that can reach the bridge;
+  `t01` SKIPs whatever is unreachable instead of failing.
 - Agent deployments that run on a different host than the harness need a tunnel, e.g.
   `ssh -L 8093:127.0.0.1:8093 <ssh-host>` before running the tests.
 
@@ -183,9 +203,15 @@ never as a failure.
 
 `scripts/validate/fixtures/cat.gif` is a 6-frame animated GIF (32070 bytes) generated
 in-house by `scripts/validate/fixtures/make-cat-gif.sh` from ImageMagick drawing
-primitives — no third-party artwork. `t05_attachments.sh` pushes it to the phone, checks
-the shared→device and device→Matrix paths byte-exact (full SHA-256), and asserts it fits
-`MMS_SIZE_LIMIT_BYTES`. `fixtures/README.md` documents provenance and regeneration.
+primitives — no third-party artwork. `t05_attachments.sh` and `t16_gif_roundtrip.sh`
+push it to the phone, check the shared→device and device→Matrix paths byte-exact (full
+SHA-256), and assert it fits `MMS_SIZE_LIMIT_BYTES`.
+
+`scripts/validate/fixtures/make-media-fixtures.sh` generates `paw.png` (second image for
+`t17_multi_attachment.sh`) and the synthetic media fixtures `tiny.mp4` (H.264 video),
+`tiny.m4a` (AAC audio) and `tiny.ogg` (Opus audio) used by `t18_media_variants.sh` — all
+from ImageMagick drawing primitives and ffmpeg `lavfi` sources, no third-party content.
+`fixtures/README.md` documents provenance, sizes, hashes and regeneration.
 
 ## Test map (acceptance matrix, `todo.md` §3)
 
@@ -199,11 +225,16 @@ the shared→device and device→Matrix paths byte-exact (full SHA-256), and ass
 | 6 | Membership in place, same room id, no dupes | `t07_membership.sh` | `IAMB_GROUP_ROOM` |
 | 7 | Tapbacks both ways | `t08_tapbacks.sh` | `IAMB_PORTAL_ROOM` + `IAMB_TAPBACK_EVENT` |
 | 8 | Read state both ways | `t09_read_state.sh` | — (iamb has no receipt command) |
-| 9 | Restart dedupe, recipients persist | `t10_restart_dedupe.sh` | `BRIDGE_RESTART_CMD` |
+| 9 | Restart dedupe, recipients persist | `t10_restart_dedupe.sh` | `BRIDGE_RESTART_CMD`, `APP_RESTART` |
 | 10 | Non-root device run (app transport) | `t11_nonroot.sh` | — |
 | 11 | Multi-device / 2–4-participant combos | `t12_multidevice.sh` | — |
 | 12 | Group reactions/uploads/replies + fallbacks | `t13_group_events.sh` | `IAMB_GROUP_PORTAL` |
 | 13 | Invite→join flows | `t14_invite_join.sh` | `IAMB_GROUP_ROOM` |
+| 14 | SMS message types (plain/long/unicode, both ways) | `t15_message_types.sh` | `IAMB_PHONE_ROOM`, `SMS_TARGET_NUMBER` |
+| 15 | Animated GIF round-trip, byte-exact both ways | `t16_gif_roundtrip.sh` | `IAMB_PHONE_ROOM`, `MEDIA_TARGET_NUMBER` |
+| 16 | Multi-attachment send → one MMS, all parts | `t17_multi_attachment.sh` | `MEDIA_TARGET_NUMBER`, `APP_HTTP_ENABLE_TEMP` (or `APP_BRIDGE_URL`) |
+| 17 | Video/audio variants + degradation reporting | `t18_media_variants.sh` | `IAMB_PHONE_ROOM`, `MEDIA_TARGET_NUMBER` |
+| 18 | Unknown-number thread/portal creation | `t19_unknown_sender.sh` | `IAMB_NEW_SENDER_ROOM` (optional) |
 
 ## Known gaps observed (2026-10-27 acceptance run)
 
@@ -215,7 +246,7 @@ starts from the same baseline:
   and MMS parts are present in the provider, and the app's event cursor advances). `t03`
   FAILs on this; `t13` stays consistent because no uploads were expected yet. The working
   tree carries an uncommitted cursor-reset fix (`connector/network_client.go`,
-  `cursorAfterReset`); the deployed test deployment bridge predates it — re-run t03 after the
+  `cursorAfterReset`); the deployed bridge predates it — re-run t03 after the
   fix is deployed.
 - **Outbound MMS/group sends are refused while the app is not the default SMS app**
   (by design: `BridgeSender.rejectNonDefaultSmsMms`). `t05`/`t06` live probes SKIP with

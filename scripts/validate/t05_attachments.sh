@@ -95,15 +95,30 @@ else
 			case "$rc" in
 			"$RC_OK")
 				mode="$(jq -r '.mode // "?"' "$WORK/out-send.json")"
-				pass "outbound attachment send accepted (mode=$mode, message_id=$(jq -r '.message_id // "?"' "$WORK/out-send.json"))"
+				message_id="$(jq -r '.message_id // empty' "$WORK/out-send.json")"
+				pass "outbound attachment send accepted (mode=$mode, message_id=${message_id:-?})"
 				out_pdu=""
-				wait_for_attempts=0
-				while [ "$wait_for_attempts" -lt 36 ]; do
-					out_pdu="$(phone_mms_rows_since "$before_ms" | tail -n 1)"
-					[ -n "$out_pdu" ] && break
-					wait_for_attempts=$((wait_for_attempts + 1))
-					sleep 5
-				done
+				if [ -n "$message_id" ] && [ "$message_id" -gt 0 ] 2>/dev/null; then
+					# The provider stores second-granularity dates, so an outbound
+					# row created within the same second as before_ms can look
+					# older than the probe. Wait for the exact provider row id the
+					# app reported (pdu id == control.SEND message_id).
+					wait_for_attempts=0
+					while [ "$wait_for_attempts" -lt 36 ]; do
+						out_pdu="$(sqlite_query "select _id,thread_id,date,msg_box from pdu where _id = $message_id;" 2>/dev/null | tail -n 1)"
+						[ -n "$out_pdu" ] && break
+						wait_for_attempts=$((wait_for_attempts + 1))
+						sleep 5
+					done
+				else
+					wait_for_attempts=0
+					while [ "$wait_for_attempts" -lt 36 ]; do
+						out_pdu="$(phone_mms_rows_since "$before_ms" | tail -n 1)"
+						[ -n "$out_pdu" ] && break
+						wait_for_attempts=$((wait_for_attempts + 1))
+						sleep 5
+					done
+				fi
 				if [ -z "$out_pdu" ]; then
 					fail "outbound attachment send: no new MMS row on the phone within 180s"
 				else

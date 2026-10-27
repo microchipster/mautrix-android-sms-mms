@@ -210,53 +210,85 @@ newest_new_thread_id() {
 }
 
 if [ "$VALIDATE_LIVE_SENDS" = "1" ] && [ -n "$IAMB_GROUP_ROOM" ]; then
-	# Snapshot the live portals of the first group thread.
-	first_thread="$(head -n 1 "$WORK/group-threads" | cut -d'|' -f1)"
+	# Snapshot the portal rooms of every known group thread. The probe room may
+	# text a thread that is not the first one, and a pre-existing thread must
+	# not gain a second portal (that is the fracture this test looks for).
+	live_snapshot_rooms() {
+		local t_id p_rc=0
+		: >"$WORK/live-rooms.tsv"
+		while IFS='|' read -r t_id _count; do
+			[ -n "$t_id" ] || continue
+			p_rc=0
+			phone_thread_participants "$t_id" >"$WORK/live-participants" 2>/dev/null || p_rc=$?
+			[ "$p_rc" -eq 0 ] || continue
+			[ -s "$WORK/live-participants" ] || continue
+			mapfile -t numbers <"$WORK/live-participants"
+			candidates_for_numbers "${numbers[@]}" >>"$WORK/live-rooms.tsv"
+		done <"$WORK/group-threads"
+		cut -f1 "$WORK/live-rooms.tsv" | sed '/^$/d' | LC_ALL=C sort -u
+	}
+	before_rooms="$(live_snapshot_rooms)"
+	before_ms="$(now_ms)"
+	LIVE_BEFORE_MS="$before_ms"
+	has_new_phone_rows() {
+		[ -n "$(newest_new_thread_id "$LIVE_BEFORE_MS")" ]
+	}
 	rc=0
-	phone_thread_participants "$first_thread" >"$WORK/live-participants" 2>/dev/null || rc=$?
-	if [ "$rc" -ne 0 ]; then
-		skip_check "live group probe: cannot read participants of thread $first_thread"
-	else
-		mapfile -t numbers <"$WORK/live-participants"
-		candidates_for_numbers "${numbers[@]}" >"$WORK/live-cand-before.tsv"
-		before_rooms="$(cut -f1 "$WORK/live-cand-before.tsv" | sed '/^$/d' | sort)"
-		before_ms="$(now_ms)"
-		LIVE_BEFORE_MS="$before_ms"
-		has_new_phone_rows() {
-			[ -n "$(newest_new_thread_id "$LIVE_BEFORE_MS")" ]
-		}
+	iamb_send "$IAMB_GROUP_ROOM" "validate t04 group probe $before_ms" >"$WORK/live-send.json" 2>"$WORK/live-send.err" || rc=$?
+	case "$rc" in
+	"$RC_OK")
+		pass "live group probe sent from iamb room $IAMB_GROUP_ROOM (at ${before_ms}ms)"
 		rc=0
-		iamb_send "$IAMB_GROUP_ROOM" "validate t04 group probe $before_ms" >"$WORK/live-send.json" 2>"$WORK/live-send.err" || rc=$?
-		case "$rc" in
-		"$RC_OK")
-			pass "live group probe sent from iamb room $IAMB_GROUP_ROOM (at ${before_ms}ms)"
-			rc=0
-			wait_for 240 5 has_new_phone_rows || rc=$?
-			if [ "$rc" -ne 0 ]; then
-				fail "live group probe: no new SMS/MMS row on the phone within 240s"
+		wait_for 240 5 has_new_phone_rows || rc=$?
+		if [ "$rc" -ne 0 ]; then
+			fail "live group probe: no new SMS/MMS row on the phone within 240s"
+		else
+			after_thread_id="$(newest_new_thread_id "$before_ms")"
+			if [ -z "$after_thread_id" ]; then
+				fail "live group probe: new row has no resolvable thread id"
 			else
-				after_thread_id="$(newest_new_thread_id "$before_ms")"
-				if [ "$after_thread_id" = "$first_thread" ]; then
-					pass "live group probe landed in the SAME phone thread $first_thread"
-				elif [ -n "$after_thread_id" ]; then
-					fail "live group probe created/used thread $after_thread_id instead of $first_thread (fracture)"
+				pass "live group probe recorded phone thread $after_thread_id"
+			fi
+			after_rooms="$(live_snapshot_rooms)"
+			new_rooms="$(LC_ALL=C comm -13 <(printf '%s\n' "$before_rooms") <(printf '%s\n' "$after_rooms") | sed '/^$/d')"
+			if [ -n "$new_rooms" ]; then
+				fail "live group probe created new portal room(s) for a known thread: $(printf '%s' "$new_rooms" | tr '\n' ' ')"
+			else
+				pass "live group probe kept the existing portal room set ($(printf '%s\n' "$after_rooms" | sed '/^$/d' | wc -l | tr -d ' ') room(s))"
+			fi
+			# The probe's thread must resolve to exactly one bridge portal:
+			# bridge channel ids end in `-<phone thread id>`. A brand-new
+			# conversation legitimately gets one new room; a fracture gives two.
+			if [ -n "$after_thread_id" ]; then
+				probe_rc=0
+				phone_thread_participants "$after_thread_id" >"$WORK/probe-participants" 2>/dev/null || probe_rc=$?
+				if [ "$probe_rc" -ne 0 ] || [ ! -s "$WORK/probe-participants" ]; then
+					skip_check "live group probe: cannot list participants of thread $after_thread_id"
 				else
-					fail "live group probe: new row has no resolvable thread id"
-				fi
-				candidates_for_numbers "${numbers[@]}" >"$WORK/live-cand-after.tsv"
-				after_rooms="$(cut -f1 "$WORK/live-cand-after.tsv" | sed '/^$/d' | sort)"
-				new_rooms="$(comm -13 <(printf '%s\n' "$before_rooms") <(printf '%s\n' "$after_rooms") | sed '/^$/d')"
-				if [ -n "$new_rooms" ]; then
-					fail "live group probe created new portal room(s): $(printf '%s' "$new_rooms" | tr '\n' ' ')"
-				else
-					pass "live group probe kept the same portal room set ($(printf '%s\n' "$after_rooms" | tr '\n' ' '))"
+					mapfile -t probe_numbers <"$WORK/probe-participants"
+					: >"$WORK/probe-chans"
+					while IFS=$'\t' read -r room _name; do
+						[ -n "$room" ] || continue
+						chan="$(portal_channel_id "$room" 2>/dev/null || true)"
+						[ -n "$chan" ] && printf '%s\n' "$chan" >>"$WORK/probe-chans"
+					done < <(candidates_for_numbers "${probe_numbers[@]}")
+					dup_probe="$(sort "$WORK/probe-chans" | uniq -d)"
+					thread_portals="$(grep -c -- "-$after_thread_id\$" "$WORK/probe-chans" || true)"
+					if [ -n "$dup_probe" ]; then
+						fail "live group probe: channel id(s) mapped to several rooms (fracture): $dup_probe"
+					elif [ "$thread_portals" -ge 1 ]; then
+						probe_chan="$(grep -- "-$after_thread_id\$" "$WORK/probe-chans" | head -n 1)"
+						pass "live group probe: thread $after_thread_id maps to one portal (channel id $probe_chan)"
+					else
+						skip_check "live group probe: no bridge portal found for thread $after_thread_id yet"
+					fi
 				fi
 			fi
-			;;
-		"$RC_UNREACHABLE") skip_check "live group probe send failed: $(tr '\n' ' ' <"$WORK/live-send.err")" ;;
-		*) fail "live group probe send misbehaved: $(tr '\n' ' ' <"$WORK/live-send.err")" ;;
-		esac
-	fi
+		fi
+		;;
+	"$RC_UNREACHABLE") skip_check "live group probe send failed: $(tr '\n' ' ' <"$WORK/live-send.err")" ;;
+	*) fail "live group probe send misbehaved: $(tr '\n' ' ' <"$WORK/live-send.err")" ;;
+	esac
 else
 	skip_check "live group probe disabled (set VALIDATE_LIVE_SENDS=1 and IAMB_GROUP_ROOM)"
 fi
