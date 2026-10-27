@@ -185,6 +185,7 @@ docker build -t mautrix-android-sms-mms .   # container image
 - [`docs/sms-bridge-handoff.md`](docs/sms-bridge-handoff.md) — full project handoff: state, runbooks, testing rig, next goals.
 - [`docs/PAIRING_PROTOCOL.md`](docs/PAIRING_PROTOCOL.md) — app pairing protocol (QR + manual, queue/events API).
 - [`docs/AGENT_API.md`](docs/AGENT_API.md) — HTTP API contract both transports implement.
+- [`docs/CDN_PROTOCOL.md`](docs/CDN_PROTOCOL.md) — zero-knowledge file links (CDN protocol): upload/list/revoke wire model, AES-256-GCM + HKDF crypto, expiry, quotas and wrapper-page rules for third-party endpoints.
 - [`docs/carrier-scoped-stats.md`](docs/carrier-scoped-stats.md) — `!sms stats`, carrier/SIM aggregation and ad-hoc SQL views.
 - [`docs/caller-id-and-labels.md`](docs/caller-id-and-labels.md) — what caller info SMS has, labels, new-contact tagging and anti-spam.
 - [`docs/anti-spam.md`](docs/anti-spam.md) — local anti-spam gate: unknown-sender policy, scoring, URL analysis, duplicates, sender classes, per-contact policies, offline feeds, `spam` commands.
