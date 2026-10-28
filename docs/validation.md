@@ -37,6 +37,7 @@ bridge channel ids, room membership, timestamps, SHA-256 hashes).
 | `scripts/validate/t18_media_variants.sh` | video (inbound) and audio (both directions) variants with degradation reporting |
 | `scripts/validate/t19_unknown_sender.sh` | unknown-number thread/portal creation, no duplicate threads |
 | `scripts/validate/t20_cdn.sh` | bridge CDN file-service contract: crypto round trips, wrapper headers, expiry, quotas, revoke, isolation |
+| `scripts/validate/t21_call_capture.sh` | two-phone SIM call + rooted in-call capture on the callee (precheck → dial → ACTIVE → tinycap → setup-failure evidence) |
 | `scripts/validate/fixtures/cat.gif` | tiny animated cat for the attachment tests (generated in-house) |
 | `scripts/validate/fixtures/paw.png` | second image for the multi-attachment test (generated in-house) |
 | `scripts/validate/fixtures/tiny.mp4` + `tiny.m4a` + `tiny.ogg` | synthetic video/audio fixtures (generated in-house) |
@@ -151,6 +152,15 @@ fails a run: it means the component, the environment or the opt-in live probe is
 | `CDN_CHECK_DISCOVERY` | `1` | `1` asserts bridge `_smsmms/v1/info` advertises a matching `cdn_base_url` (t20). |
 | `CDN_INSECURE` / `CDN_NODE_TLS_INSECURE` | `0` | `1` lets curl / Node accept self-signed staging certificates (t20). |
 | `CDN_PYTHON` / `CDN_NODE` | `python3` / `node` | interpreter overrides for the crypto helpers (t20). |
+| `PHONE_A_SERIAL` / `PHONE_B_SERIAL` | required | adb serials for t21: A = caller, B = callee/capture phone. |
+| `PHONE_A_SSH` / `PHONE_B_SSH` | empty | run adb for that phone on the named ssh host (empty = local adb) (t21). |
+| `PHONE_A_NUMBER` / `PHONE_B_NUMBER` | empty / required | A's own E.164 (matches the SIM row of the "Choose SIM" picker) and the number t21 dials on B. |
+| `PHONE_B_MIXER_DL` / `PHONE_B_MIXER_UL` / `PHONE_B_PCM_DEVICE` | per-device | in-call capture route on B (`VOC_REC` mixer controls + ALSA PCM); defaults for the two lab phones, else derived from the control name (t21). |
+| `E3_DIR` | `/data/local/tmp/e3` | rooted tinyalsa staging on both phones (t21). |
+| `CALL_ACTIVE_TIMEOUT` | `45` | seconds t21 waits for the call to reach ACTIVE. |
+| `CAPTURE_SECONDS` | `10` | tinycap capture length in seconds (t21). |
+| `PICKER_WAIT` | `15` | seconds t21 waits for/handles the "Choose SIM"/account picker (t21). |
+| `KEEP_TMP` | `0` | `1` keeps t21's host work dir and the device WAV for inspection. |
 
 Tokens never belong in committed files; pass them via the environment (or a local,
 gitignored `.env` sourced by your shell).
@@ -196,6 +206,40 @@ Feature-gated notes:
 Local, without a deployment: `go test ./... -run Cdn -count=1` covers the same
 HTTP contract in-process, including the app's AES-256-GCM steps
 (`connector/cdn_appcontract_test.go`).
+
+## Phone-SIM call capture (`t21_call_capture.sh`)
+
+`t21_call_capture.sh` proves the rooted in-call capture path from
+[cell-call-over-matrix-research.md](cell-call-over-matrix-research.md) §6 E2/E3
+end to end: phone A dials `PHONE_B_NUMBER` (`am start … ACTION_CALL`; the
+`cmd telecom set-user-selected-outgoing-phone-account` default account when the
+build supports it, else the "Choose SIM" picker is tapped via uiautomator), B
+answers, and the script waits `CALL_ACTIVE_TIMEOUT` for ACTIVE. On an ACTIVE
+call it flips B's `VOC_REC_DL` mixer route On, captures `CAPTURE_SECONDS` with
+the staged `/data/local/tmp/e3/tinycap` (single channel, 48 kHz, 16-bit),
+verifies the WAV size and non-silence (sox stat, else a python3 RMS helper) and
+restores the mixer. A setup failure FAILs with the exact carrier/IMS evidence
+(telecom `ImsReasonInfo`, radio reason codes, callee-never-rang verdict) instead
+of timing out silently; every run ends with mixers Off and calls ended.
+
+```sh
+PHONE_A_SERIAL=<caller-adb-serial>  PHONE_A_SSH=<host> PHONE_A_NUMBER='+1…' \
+PHONE_B_SERIAL=<callee-adb-serial>  PHONE_B_SSH=<host> PHONE_B_NUMBER='+1…' \
+./scripts/validate/t21_call_capture.sh
+```
+
+Live invocation notes: the capture phone must carry the `$E3_DIR` staging
+(tinycap/tinymix) and root; route defaults exist for the two lab devices
+(OnePlus 9 Pro → `MultiMedia9 Mixer VOC_REC_DL/UL`, PCM 23; Pixel 2 XL →
+`MultiMedia1 Mixer VOC_REC_DL/UL`, PCM 0) and can be overridden with
+`PHONE_B_MIXER_DL`/`PHONE_B_MIXER_UL`/`PHONE_B_PCM_DEVICE`. Audio never leaves
+the devices: only ids, sizes, timestamps and level/rms numbers are logged, and
+the temporary host copy is removed unless `KEEP_TMP=1`.
+
+Acceptance run 2026-10-27: both lines reproduce a carrier/IMS setup cancellation
+(`339 CODE_SIP_REQUEST_CANCELLED`, SIP 487, "ocs terminated the call"; callee
+never rings) — the script FAILs there by design and will complete the capture
+automatically once a call connects.
 
 ## Pointing at the local rig vs a deployment
 
