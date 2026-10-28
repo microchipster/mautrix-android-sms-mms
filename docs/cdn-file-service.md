@@ -28,7 +28,8 @@ an album.
 
 The bridge uses the same service for its **own outgoing attachments**: when
 the service is active in `link` mode, media the bridge sends from Matrix to the
-phone above `send_threshold` is encrypted and uploaded by the bridge, and the
+phone is encrypted and uploaded by the bridge (every attachment by default;
+a positive `send_threshold` keeps smaller media on the carrier), and the
 phone receives the link as message text instead of an MMS attachment (see
 [Outgoing attachments as links](#outgoing-attachments-as-links)).
 
@@ -248,13 +249,15 @@ IMG_0001.jpg: https://cdn.example.com/f/<id>#<key>
 ```
 
 - **When**: `send_mode: link` (the default while the service is active) and
-  the attachment is larger than `send_threshold`. The default threshold is the
-  bridge's MMS attachment limit (`max_attachment_size_mb`, 50 MB).
-  App-paired logins inline an attachment as base64 in the queue command and
-  reject payloads above 10 MiB (about 7 MiB of media), so operators who want
-  those attachments linked too should lower `send_threshold` accordingly.
-  Attachments at or below the threshold, and every attachment in
-  `send_mode: never`, still travel as MMS.
+  the attachment has content. The default `send_threshold` is `0`, so every
+  attachment takes the link path and the carrier is not involved at all.
+  Carrier MMS is a poor transport for media in practice: real caps sit around
+  1 MB (the app-side `max_attachment_size_mb` is only a local limit), anything
+  that fits is recompressed and loses fidelity, and it costs a message. Links
+  keep the original bytes.
+  A positive `send_threshold` restricts the link path to larger attachments
+  and sends everything at or below it as MMS; `send_mode: never` keeps every
+  attachment on the carrier. Both are ordinary `cdn` keys.
 - **Fallback**: any encryption or storage failure logs a warning and falls
   back to the ordinary attachment path, so a send is never lost because the
   service is down. An attachment that then exceeds the MMS limit fails with
@@ -314,15 +317,15 @@ network:
     gc_interval: 1h
 
     # Outgoing attachments (Matrix -> phone): "link" uploads an attachment
-    # above send_threshold and sends its link as text, "never" always sends
-    # the attachment as MMS. Defaults to "link" while the service is enabled.
+    # and sends its link as text, "never" always sends the attachment as MMS.
+    # Defaults to "link" while the service is enabled.
     send_mode: link
 
     # Plaintext size above which an outgoing attachment becomes a link, in
-    # bytes. Defaults to the carrier MMS limit (max_attachment_size_mb, 50 MB
-    # by default). App-paired logins cap the inline base64 payload of a queue
-    # command at 10 MiB (about 7 MiB of media), so lower this to link those.
-    send_threshold: 52428800
+    # bytes. The default 0 links every attachment: carrier MMS caps are far
+    # smaller (~1 MB) and recompress the media. Set a positive value to keep
+    # attachments at or below it on the carrier.
+    send_threshold: 0
 
     # Lifetime of links the bridge creates for its own outgoing attachments
     # (default: default_expiry).
@@ -411,7 +414,7 @@ matrix_bridge_mautrix_android_sms_mms_cdn_default_expiry: "30d"
 matrix_bridge_mautrix_android_sms_mms_cdn_max_expiry: "365d"
 matrix_bridge_mautrix_android_sms_mms_cdn_gc_interval: "1h"
 matrix_bridge_mautrix_android_sms_mms_cdn_send_mode: "link"
-matrix_bridge_mautrix_android_sms_mms_cdn_send_threshold: 52428800
+matrix_bridge_mautrix_android_sms_mms_cdn_send_threshold: 0
 matrix_bridge_mautrix_android_sms_mms_cdn_send_expiry: "30d"
 
 matrix_bridge_mautrix_android_sms_mms_container_labels_cdn_enabled: "{{ matrix_bridge_mautrix_android_sms_mms_cdn_enabled }}"

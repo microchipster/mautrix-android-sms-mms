@@ -319,16 +319,13 @@ func (c *MyConnector) cdnSendMode() string {
 }
 
 // cdnSendThresholdBytes returns the plaintext size above which an outgoing
-// attachment becomes a link. An unset threshold means the carrier MMS limit
-// (max_attachment_size_mb).
+// attachment becomes a link. Zero (the default) links every attachment; a
+// positive value is the operator's explicit threshold.
 func (c *MyConnector) cdnSendThresholdBytes() int64 {
 	if c == nil {
 		return 0
 	}
-	if threshold := c.cdnConfig().SendThresholdBytes; threshold > 0 {
-		return threshold
-	}
-	return c.maxAttachmentSizeBytes()
+	return c.cdnConfig().SendThresholdBytes
 }
 
 // cdnPlaintextCapacityBytes returns the largest plaintext one file-service

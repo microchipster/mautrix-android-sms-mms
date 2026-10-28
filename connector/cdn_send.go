@@ -6,12 +6,13 @@ package connector
 
 // This file implements the bridge's own outgoing-attachment route through the
 // file service described in docs/cdn-file-service.md. When the service is
-// active in "link" mode, an outgoing Matrix attachment above the configured
-// threshold is encrypted (AES-256-GCM, exactly like the app's uploader) and
-// stored in the service, and the phone receives the link as message text
-// instead of the MMS attachment. Any encryption or storage failure falls back
-// to the ordinary attachment path, so a send is never lost because the
-// service is down.
+// active in "link" mode, an outgoing Matrix attachment is encrypted
+// (AES-256-GCM, exactly like the app's uploader) and stored in the service,
+// and the phone receives the link as message text instead of the MMS
+// attachment. Every attachment takes the link path by default; a positive
+// send_threshold keeps smaller media on the carrier. Any encryption or storage
+// failure falls back to the ordinary attachment path, so a send is never lost
+// because the service is down.
 //
 // Unlike the app, the bridge holds the plaintext before it encrypts it (it
 // downloads the media from Matrix), so the fragment key exists in bridge
@@ -29,17 +30,22 @@ import (
 
 // Outgoing-attachment modes of the file service (cdn.send_mode).
 const (
-	// cdnSendModeLink uploads outgoing attachments above the threshold to
-	// the file service and sends their link as text.
+	// cdnSendModeLink uploads outgoing attachments to the file service and
+	// sends their link as text (above send_threshold when one is set).
 	cdnSendModeLink = "link"
 	// cdnSendModeNever always sends attachments through the phone.
 	cdnSendModeNever = "never"
 )
 
-// cdnSendViaLink is the pure routing decision: link mode with a positive
-// threshold and a plaintext size above it.
+// cdnSendViaLink is the pure routing decision: in link mode a non-empty
+// plaintext is linked. A positive threshold restricts the link path to
+// attachments above it; zero (the default) links every attachment, and mode
+// "never" links none.
 func cdnSendViaLink(mode string, thresholdBytes, plaintextBytes int64) bool {
-	return mode == cdnSendModeLink && thresholdBytes > 0 && plaintextBytes > thresholdBytes
+	if mode != cdnSendModeLink || plaintextBytes <= 0 {
+		return false
+	}
+	return thresholdBytes <= 0 || plaintextBytes > thresholdBytes
 }
 
 // cdnEncryptObject encrypts one plaintext for the file service exactly like

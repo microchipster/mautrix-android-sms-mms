@@ -104,7 +104,10 @@ func TestCdnSendDecisionMatrix(t *testing.T) {
 		{"link mode below the threshold", cdnSendModeLink, 1024, 1023, false},
 		{"link mode exactly at the threshold", cdnSendModeLink, 1024, 1024, false},
 		{"link mode one byte above the threshold", cdnSendModeLink, 1024, 1025, true},
-		{"link mode with a zero threshold never links", cdnSendModeLink, 0, 1 << 20, false},
+		{"link mode with a zero threshold links every attachment", cdnSendModeLink, 0, 1 << 20, true},
+		{"link mode with a zero threshold links even a tiny attachment", cdnSendModeLink, 0, 1, true},
+		{"link mode with a zero threshold still skips an empty attachment", cdnSendModeLink, 0, 0, false},
+		{"never mode with a zero threshold links nothing", cdnSendModeNever, 0, 1 << 20, false},
 		{"an empty mode never links", "", 1024, 1 << 20, false},
 		{"an empty attachment never links", cdnSendModeLink, 1024, 0, false},
 	}
@@ -171,8 +174,8 @@ func TestCdnSendConfigDefaultsAndValidation(t *testing.T) {
 
 func TestCdnSendConnectorAccessors(t *testing.T) {
 	client, _ := testCdnSendClient(t, nil)
-	if got := client.connector.cdnSendThresholdBytes(); got != int64(1)<<20 {
-		t.Errorf("default threshold = %d, want the 1 MiB carrier limit", got)
+	if got := client.connector.cdnSendThresholdBytes(); got != 0 {
+		t.Errorf("default threshold = %d, want 0 (link every attachment)", got)
 	}
 	if !client.cdnLinkMode() {
 		t.Error("an active service in default mode must enable link mode")
@@ -446,6 +449,33 @@ func TestCdnSendOutgoingAttachmentBecomesLink(t *testing.T) {
 	}
 	if neverLinked || len(neverAttachments) != 1 {
 		t.Fatalf("never-mode result = (%d attachment(s), linked=%v), want the attachment path", len(neverAttachments), neverLinked)
+	}
+}
+
+func TestCdnSendDefaultLinksEveryAttachment(t *testing.T) {
+	// The shipped default has no threshold: even an attachment far below the
+	// carrier MMS limit takes the link path while the service is active,
+	// because the link keeps the original bytes instead of a carrier-optimised
+	// copy.
+	client, service := testCdnSendClient(t, nil)
+	data := append([]byte{0xff, 0xd8, 0xff}, bytes.Repeat([]byte{0x21}, 100)...)
+
+	text, attachments, linked, err := client.prepareOutgoingAttachment("", data, "image/jpeg", "small.jpg", true)
+	if err != nil {
+		t.Fatalf("prepareOutgoingAttachment: %v", err)
+	}
+	if !linked || len(attachments) != 0 {
+		t.Fatalf("linked = %v with %d attachment(s), want the default to link every attachment", linked, len(attachments))
+	}
+	if !strings.HasPrefix(text, "small.jpg: https://cdn.example.com"+cdnPathPrefix+"/") {
+		t.Fatalf("link text = %q, want the labeled link", text)
+	}
+	entries, err := service.List(cdnSendTestMXID)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("stored entries = %d, want the one linked attachment", len(entries))
 	}
 }
 

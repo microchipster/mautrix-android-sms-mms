@@ -169,14 +169,16 @@ type CdnConfig struct {
 	// GCInterval is how often the expiry cleanup runs.
 	GCInterval cdnDuration `yaml:"gc_interval,omitempty"`
 	// SendMode controls what the bridge does with the media of its own
-	// outgoing messages: "link" uploads an attachment above
-	// SendThresholdBytes to the service and sends the link as text,
-	// "never" always sends the attachment through the phone. Empty means
-	// "link" while the service is active.
+	// outgoing messages: "link" uploads an attachment to the service and
+	// sends the link as text (restricted to attachments above
+	// SendThresholdBytes when that is positive), "never" always sends the
+	// attachment through the phone. Empty means "link" while the service is
+	// active.
 	SendMode string `yaml:"send_mode,omitempty"`
 	// SendThresholdBytes is the plaintext size above which an outgoing
-	// attachment is sent as a link, in bytes. Zero means the carrier MMS
-	// attachment limit (max_attachment_size_mb).
+	// attachment is sent as a link, in bytes. Zero (the default) links
+	// every attachment; set a positive value to keep smaller media on the
+	// carrier.
 	SendThresholdBytes int64 `yaml:"send_threshold,omitempty"`
 	// SendExpiry is the lifetime of links the bridge creates for its own
 	// outgoing attachments. Zero means DefaultExpiry.
@@ -185,7 +187,8 @@ type CdnConfig struct {
 
 // DefaultCdnConfig returns the file service defaults: disabled, 512 MiB per
 // file, 20 items and 500 MiB per album, 10 GiB per user, one month links,
-// cleanup hourly.
+// cleanup hourly, and outgoing attachments linked in link mode (no size
+// threshold, so every attachment takes the link path).
 func DefaultCdnConfig() CdnConfig {
 	return CdnConfig{
 		MaxFileBytes:    cdnDefaultMaxFileBytes,
