@@ -300,6 +300,61 @@ func (c *MyConnector) cdnConfig() CdnConfig {
 	return c.config.CDN
 }
 
+// cdnService returns the active file service, or nil when the feature is off.
+func (c *MyConnector) cdnService() *CdnService {
+	if c == nil {
+		return nil
+	}
+	return c.cdn
+}
+
+// cdnSendMode returns the effective outgoing-attachment mode: "link" while
+// the file service is active and no mode is configured, otherwise the
+// configured mode (and "never" without a service).
+func (c *MyConnector) cdnSendMode() string {
+	if c == nil || c.cdn == nil {
+		return cdnSendModeNever
+	}
+	return c.cdnConfig().EffectiveSendMode()
+}
+
+// cdnSendThresholdBytes returns the plaintext size above which an outgoing
+// attachment becomes a link. An unset threshold means the carrier MMS limit
+// (max_attachment_size_mb).
+func (c *MyConnector) cdnSendThresholdBytes() int64 {
+	if c == nil {
+		return 0
+	}
+	if threshold := c.cdnConfig().SendThresholdBytes; threshold > 0 {
+		return threshold
+	}
+	return c.maxAttachmentSizeBytes()
+}
+
+// cdnPlaintextCapacityBytes returns the largest plaintext one file-service
+// object can hold (the ciphertext cap minus the GCM framing), or 0 when the
+// service is not active.
+func (c *MyConnector) cdnPlaintextCapacityBytes() int64 {
+	if c == nil || c.cdn == nil {
+		return 0
+	}
+	capacity := c.cdnConfig().MaxFileBytes - cdnObjectOverheadBytes
+	if capacity <= 0 {
+		return 0
+	}
+	return capacity
+}
+
+// cdnSendExpiry returns the configured lifetime of links the bridge creates
+// for its own outgoing attachments; zero means the service default
+// (cdn.default_expiry).
+func (c *MyConnector) cdnSendExpiry() time.Duration {
+	if c == nil {
+		return 0
+	}
+	return c.cdnConfig().SendExpiry.Duration()
+}
+
 // homeserverPublicURL returns the homeserver address the app should use. The
 // public address wins so reverse-proxied setups do not leak the internal one;
 // the pairing public URL is a good stand-in when it is not configured, because

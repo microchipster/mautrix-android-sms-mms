@@ -86,6 +86,12 @@ const (
 	// item; it is not configurable.
 	cdnMaxManifestBytes = int64(64) << 10
 
+	// cdnObjectOverheadBytes is the AES-GCM framing every stored object
+	// carries: a 12-byte nonce plus a 16-byte authentication tag. A
+	// plaintext fits an upload cap only while it is at most the cap minus
+	// this overhead.
+	cdnObjectOverheadBytes = 12 + 16
+
 	// cdnWrapperCSP locks the wrapper page down to inline script + blob
 	// rendering, and sandboxes it so a payload can never navigate or reach
 	// the network beyond the ciphertext fetch.
@@ -162,6 +168,19 @@ type CdnConfig struct {
 	MaxExpiry cdnDuration `yaml:"max_expiry,omitempty"`
 	// GCInterval is how often the expiry cleanup runs.
 	GCInterval cdnDuration `yaml:"gc_interval,omitempty"`
+	// SendMode controls what the bridge does with the media of its own
+	// outgoing messages: "link" uploads an attachment above
+	// SendThresholdBytes to the service and sends the link as text,
+	// "never" always sends the attachment through the phone. Empty means
+	// "link" while the service is active.
+	SendMode string `yaml:"send_mode,omitempty"`
+	// SendThresholdBytes is the plaintext size above which an outgoing
+	// attachment is sent as a link, in bytes. Zero means the carrier MMS
+	// attachment limit (max_attachment_size_mb).
+	SendThresholdBytes int64 `yaml:"send_threshold,omitempty"`
+	// SendExpiry is the lifetime of links the bridge creates for its own
+	// outgoing attachments. Zero means DefaultExpiry.
+	SendExpiry cdnDuration `yaml:"send_expiry,omitempty"`
 }
 
 // DefaultCdnConfig returns the file service defaults: disabled, 512 MiB per
@@ -193,6 +212,9 @@ func (c *CdnConfig) UnmarshalYAML(unmarshal func(any) error) error {
 		DefaultExpiry   *cdnDuration `yaml:"default_expiry"`
 		MaxExpiry       *cdnDuration `yaml:"max_expiry"`
 		GCInterval      *cdnDuration `yaml:"gc_interval"`
+		SendMode        *string      `yaml:"send_mode"`
+		SendThreshold   *int64       `yaml:"send_threshold"`
+		SendExpiry      *cdnDuration `yaml:"send_expiry"`
 	}
 	if err := unmarshal(&raw); err != nil {
 		return err
@@ -227,6 +249,15 @@ func (c *CdnConfig) UnmarshalYAML(unmarshal func(any) error) error {
 	}
 	if raw.GCInterval != nil {
 		cfg.GCInterval = *raw.GCInterval
+	}
+	if raw.SendMode != nil {
+		cfg.SendMode = strings.TrimSpace(*raw.SendMode)
+	}
+	if raw.SendThreshold != nil {
+		cfg.SendThresholdBytes = *raw.SendThreshold
+	}
+	if raw.SendExpiry != nil {
+		cfg.SendExpiry = *raw.SendExpiry
 	}
 	*c = cfg
 	return nil
@@ -287,7 +318,35 @@ func (c CdnConfig) Validate() error {
 	if c.GCInterval.Duration() < 0 {
 		return fmt.Errorf("cdn.gc_interval cannot be negative")
 	}
+	switch strings.ToLower(strings.TrimSpace(c.SendMode)) {
+	case "", cdnSendModeLink, cdnSendModeNever:
+	default:
+		return fmt.Errorf("cdn.send_mode must be %q or %q, got %q", cdnSendModeLink, cdnSendModeNever, c.SendMode)
+	}
+	if c.SendThresholdBytes < 0 {
+		return fmt.Errorf("cdn.send_threshold cannot be negative")
+	}
+	sendExpiry := c.SendExpiry.Duration()
+	if sendExpiry < 0 {
+		return fmt.Errorf("cdn.send_expiry cannot be negative")
+	}
+	if sendExpiry > 0 && sendExpiry > maxExpiry {
+		return fmt.Errorf("cdn.send_expiry cannot exceed cdn.max_expiry")
+	}
 	return nil
+}
+
+// EffectiveSendMode returns the outgoing-attachment policy: the configured
+// mode, defaulting to "link" while the service is active and to "never" when
+// it is not running.
+func (c CdnConfig) EffectiveSendMode() string {
+	if !c.Active() {
+		return cdnSendModeNever
+	}
+	if strings.EqualFold(strings.TrimSpace(c.SendMode), cdnSendModeNever) {
+		return cdnSendModeNever
+	}
+	return cdnSendModeLink
 }
 
 // CdnAuthFunc resolves the owner key of an authenticated file-service
@@ -524,26 +583,117 @@ func (s *CdnService) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	entry, err := s.publishCiphertext(owner, id, tempName, written, expiry)
+	if err != nil {
+		s.log.Warn().Err(err).Msg("Failed to store a CDN upload")
+		writeCdnError(w, http.StatusInternalServerError, "internal", "failed to store the upload")
+		return
+	}
+	writeCdnJSON(w, http.StatusCreated, cdnUploadResponse{
+		ID:          entry.ID,
+		Size:        entry.Size,
+		ExpiresAtMS: entry.ExpiresAt.UnixMilli(),
+	})
+}
+
+// CdnUpload is the result of an in-process store: the id a link embeds, the
+// stored ciphertext size and the absolute expiry.
+type CdnUpload struct {
+	ID        string
+	Size      int64
+	ExpiresAt time.Time
+}
+
+// Store publishes one already-encrypted payload and reports the entry a link
+// points at. It is the in-process equivalent of POST /f for the bridge's own
+// uploads, which have no device bearer token to present: the same size caps,
+// expiry rules and per-user FIFO pruning apply, and owner is the Matrix user
+// id that owns the entry. The bridge never needs to see the key: callers
+// encrypt, keep the fragment key and pass the ciphertext only.
+func (s *CdnService) Store(owner string, ciphertext []byte, expiry time.Duration) (*CdnUpload, error) {
+	if s == nil {
+		return nil, fmt.Errorf("the cdn file service is not active")
+	}
+	owner = strings.TrimSpace(owner)
+	if owner == "" {
+		return nil, fmt.Errorf("store cdn object: an owner is required")
+	}
+	size := int64(len(ciphertext))
+	if size == 0 {
+		return nil, fmt.Errorf("store cdn object: the encrypted payload is empty")
+	}
+	if size > s.cfg.MaxFileBytes {
+		return nil, fmt.Errorf("the encrypted payload exceeds the %d byte upload limit", s.cfg.MaxFileBytes)
+	}
+	if size > s.cfg.PerUserCapBytes {
+		return nil, fmt.Errorf("the encrypted payload exceeds the %d byte storage quota", s.cfg.PerUserCapBytes)
+	}
+	linkExpiry, err := s.resolveStoreExpiry(expiry)
+	if err != nil {
+		return nil, err
+	}
+	id, err := newCdnID()
+	if err != nil {
+		return nil, err
+	}
+	temp, err := os.CreateTemp(s.objectDir(), ".tmp-store-*")
+	if err != nil {
+		return nil, fmt.Errorf("store cdn object: %w", err)
+	}
+	tempName := temp.Name()
+	if _, err := temp.Write(ciphertext); err != nil {
+		_ = temp.Close()
+		_ = os.Remove(tempName)
+		return nil, fmt.Errorf("store cdn object: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		_ = os.Remove(tempName)
+		return nil, fmt.Errorf("store cdn object: %w", err)
+	}
+	entry, err := s.publishCiphertext(owner, id, tempName, size, linkExpiry)
+	if err != nil {
+		return nil, err
+	}
+	return &CdnUpload{ID: entry.ID, Size: entry.Size, ExpiresAt: entry.ExpiresAt}, nil
+}
+
+// resolveStoreExpiry normalizes the requested lifetime of an in-process
+// store: zero or negative means the configured default, and anything above
+// max_expiry is rejected.
+func (s *CdnService) resolveStoreExpiry(requested time.Duration) (time.Duration, error) {
+	if requested <= 0 {
+		return s.cfg.DefaultExpiry.Duration(), nil
+	}
+	if max := s.cfg.MaxExpiry.Duration(); max > 0 && requested > max {
+		return 0, fmt.Errorf("requested expiry %s is above the %s maximum",
+			formatTTLDuration(requested), formatTTLDuration(max))
+	}
+	return requested, nil
+}
+
+// publishCiphertext commits one staged ciphertext file: it renames the
+// temporary object into place, writes the metadata sidecar and prunes the
+// owner's oldest entries until the per-user cap holds. All three steps run
+// under the service lock, so no reader sees a half-published entry. The
+// temporary file is removed when the commit fails.
+func (s *CdnService) publishCiphertext(owner, id, tempPath string, size int64, expiry time.Duration) (*CdnEntry, error) {
 	now := time.Now().UTC()
 	entry := CdnEntry{
 		ID:        id,
 		Owner:     owner,
-		Size:      written,
+		Size:      size,
 		CreatedAt: now,
 		ExpiresAt: now.Add(expiry),
 	}
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := os.Rename(tempName, s.objectPath(id)); err != nil {
-		_ = os.Remove(tempName)
-		writeCdnError(w, http.StatusInternalServerError, "internal", "failed to store the upload")
-		return
+	if err := os.Rename(tempPath, s.objectPath(id)); err != nil {
+		_ = os.Remove(tempPath)
+		return nil, fmt.Errorf("store cdn object: %w", err)
 	}
 	if err := s.writeMetaLocked(entry); err != nil {
 		_ = os.Remove(s.objectPath(id))
-		writeCdnError(w, http.StatusInternalServerError, "internal", "failed to store the upload metadata")
-		return
+		return nil, fmt.Errorf("store cdn metadata: %w", err)
 	}
 	pruned, err := s.pruneOwnerLocked(owner, id)
 	if err != nil {
@@ -552,11 +702,7 @@ func (s *CdnService) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if pruned > 0 {
 		s.log.Info().Str("owner", owner).Int("pruned", pruned).Msg("Pruned oldest CDN files over the per-user quota")
 	}
-	writeCdnJSON(w, http.StatusCreated, cdnUploadResponse{
-		ID:          id,
-		Size:        written,
-		ExpiresAtMS: entry.ExpiresAt.UnixMilli(),
-	})
+	return &entry, nil
 }
 
 // handleDownload serves the stored ciphertext of one file. The URL is the

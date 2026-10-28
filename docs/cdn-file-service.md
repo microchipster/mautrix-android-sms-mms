@@ -26,6 +26,12 @@ a gallery page that decrypts and renders each item client-side. The link
 shape is identical, so the URL does not reveal whether it points at a file or
 an album.
 
+The bridge uses the same service for its **own outgoing attachments**: when
+the service is active in `link` mode, media the bridge sends from Matrix to the
+phone above `send_threshold` is encrypted and uploaded by the bridge, and the
+phone receives the link as message text instead of an MMS attachment (see
+[Outgoing attachments as links](#outgoing-attachments-as-links)).
+
 The feature is **fully configuration-gated**: without `cdn.enabled` and a
 `cdn.domain` there is no service (no listener routes, no management command
 backing, nothing).
@@ -220,6 +226,54 @@ external assets) with the file wrapper's CSP/nosniff discipline plus
   the manifest's `type` field can never make the browser execute or render
   HTML/SVG/JS.
 
+## Outgoing attachments as links
+
+The service also carries the bridge's own Matrix-to-phone media. When link mode
+applies, a picture, video, audio or file sent from Matrix in an existing phone
+thread is encrypted and uploaded to the file service by the bridge, which then
+sends the link to the phone as plain text instead of an MMS attachment. The
+upload reuses the single-file contract exactly: a fresh 32-byte AES-256 key
+and 12-byte nonce, AES-256-GCM with no AAD, and the stored body
+`nonce || ciphertext || tag`. The app's uploader and the bridge uploader are
+interchangeable clients; the bridge stores its ciphertext through the
+in-process `CdnService.Store` API, so no bearer token is involved (the bridge
+is the service).
+
+The message the phone posts is the Matrix caption (when there was one) plus
+one labeled link line:
+
+```
+Look at this
+IMG_0001.jpg: https://cdn.example.com/f/<id>#<key>
+```
+
+- **When**: `send_mode: link` (the default while the service is active) and
+  the attachment is larger than `send_threshold`. The default threshold is the
+  bridge's MMS attachment limit (`max_attachment_size_mb`, 50 MB).
+  App-paired logins inline an attachment as base64 in the queue command and
+  reject payloads above 10 MiB (about 7 MiB of media), so operators who want
+  those attachments linked too should lower `send_threshold` accordingly.
+  Attachments at or below the threshold, and every attachment in
+  `send_mode: never`, still travel as MMS.
+- **Fallback**: any encryption or storage failure logs a warning and falls
+  back to the ordinary attachment path, so a send is never lost because the
+  service is down. An attachment that then exceeds the MMS limit fails with
+  the usual size error, and a backend without MMS support fails with the
+  MMS-unavailable error.
+- **Size caps**: while link mode can carry bigger media, the bridge downloads
+  up to `max_file_bytes - 28` bytes (the ciphertext cap minus GCM framing);
+  the upload itself is bounded by `max_file_bytes` and `per_user_cap_bytes`
+  like any other upload.
+- **Expiry and quota**: links use `send_expiry` (default `default_expiry`)
+  and count against the user's `per_user_cap_bytes`; they appear in
+  `cdn list` owned by the sender's Matrix user id, and the oldest entries are
+  pruned first, exactly like app uploads.
+- **Key handling**: the bridge had the plaintext anyway (it received the
+  Matrix media), and it holds the key only while building the link; the
+  service never sees it. Unlike an app upload, though, the fragment key is
+  part of the sent message, so the text stored by the phone and the bridge
+  message row contain the full link — treat those messages as secret.
+
 ## Configuration
 
 All keys live under `cdn` in the bridge's network config
@@ -258,16 +312,33 @@ network:
 
     # How often expired entries are removed (default 1h).
     gc_interval: 1h
+
+    # Outgoing attachments (Matrix -> phone): "link" uploads an attachment
+    # above send_threshold and sends its link as text, "never" always sends
+    # the attachment as MMS. Defaults to "link" while the service is enabled.
+    send_mode: link
+
+    # Plaintext size above which an outgoing attachment becomes a link, in
+    # bytes. Defaults to the carrier MMS limit (max_attachment_size_mb, 50 MB
+    # by default). App-paired logins cap the inline base64 payload of a queue
+    # command at 10 MiB (about 7 MiB of media), so lower this to link those.
+    send_threshold: 52428800
+
+    # Lifetime of links the bridge creates for its own outgoing attachments
+    # (default: default_expiry).
+    send_expiry: 30d
 ```
 
 Validation runs at startup: enabling the feature without a domain/data
 directory, non-positive size caps, an album item cap above 255, an expiry
-above 365d, a default expiry above the maximum, or a domain containing a
-scheme/path stops the bridge with an actionable error instead of starting a
-broken service. A disabled `cdn` section is always valid. The album caps are
-ordinary `cdn` keys: the playbook's `simple-config.yaml` template needs
-matching role variables to override the bridge defaults (follow-up on the
-playbook side; the defaults apply until then).
+above 365d, a default expiry above the maximum, a domain containing a
+scheme/path, an unknown `send_mode`, a negative `send_threshold` or
+`send_expiry`, or a `send_expiry` above `max_expiry` stops the bridge with an
+actionable error instead of starting a broken service. A disabled `cdn`
+section is always valid. The album and send caps are ordinary `cdn` keys: the
+playbook's `simple-config.yaml` template needs matching role variables to
+override the bridge defaults (follow-up on the playbook side; the defaults
+apply until then).
 
 ## HTTP API
 
@@ -339,6 +410,9 @@ matrix_bridge_mautrix_android_sms_mms_cdn_per_user_cap_bytes: 10737418240
 matrix_bridge_mautrix_android_sms_mms_cdn_default_expiry: "30d"
 matrix_bridge_mautrix_android_sms_mms_cdn_max_expiry: "365d"
 matrix_bridge_mautrix_android_sms_mms_cdn_gc_interval: "1h"
+matrix_bridge_mautrix_android_sms_mms_cdn_send_mode: "link"
+matrix_bridge_mautrix_android_sms_mms_cdn_send_threshold: 52428800
+matrix_bridge_mautrix_android_sms_mms_cdn_send_expiry: "30d"
 
 matrix_bridge_mautrix_android_sms_mms_container_labels_cdn_enabled: "{{ matrix_bridge_mautrix_android_sms_mms_cdn_enabled }}"
 matrix_bridge_mautrix_android_sms_mms_container_labels_cdn_traefik_rule: "Host(`{{ matrix_bridge_mautrix_android_sms_mms_cdn_domain }}`)"
@@ -369,6 +443,9 @@ cdn:
     default_expiry: {{ matrix_bridge_mautrix_android_sms_mms_cdn_default_expiry | to_json }}
     max_expiry: {{ matrix_bridge_mautrix_android_sms_mms_cdn_max_expiry | to_json }}
     gc_interval: {{ matrix_bridge_mautrix_android_sms_mms_cdn_gc_interval | to_json }}
+    send_mode: {{ matrix_bridge_mautrix_android_sms_mms_cdn_send_mode | to_json }}
+    send_threshold: {{ matrix_bridge_mautrix_android_sms_mms_cdn_send_threshold | to_json }}
+    send_expiry: {{ matrix_bridge_mautrix_android_sms_mms_cdn_send_expiry | to_json }}
 ```
 
 ### Traefik route
@@ -572,6 +649,12 @@ against an RFC 5869 reference and the file helpers), partial item fetches,
 gallery-page headers/escaping, quota/FIFO accounting, expiry and whole-album
 revocation. Live album probes in `t20_cdn.sh` are a follow-up.
 
+The same run covers the bridge-side outgoing-link path: the pure
+mode/threshold decision matrix, config defaults and validation, the encryption
+format (cross-checked against the app-contract helper), the in-process
+`CdnService.Store` API over HTTP, the link text format and the upload-failure
+fallback.
+
 ## Caveats
 
 - There is no per-file password beyond the fragment key; a leaked link is a
@@ -590,6 +673,10 @@ revocation. Live album probes in `t20_cdn.sh` are a follow-up.
 - Quota pruning silently removes the oldest entries of that user; a pruned
   album loses all of its items. The app should show remaining quota
   (`used_bytes`/`cap_bytes`) before uploading.
+- Outgoing links travel as ordinary message text, so the fragment key sits in
+  the sent message and in the bridge's message store (the service still never
+  sees it). Anyone who can read those messages can fetch the file until it
+  expires or is revoked.
 - `data_dir` is under the bridge data volume, so bridge backups include the
   ciphertext (still useless without the keys).
 
@@ -603,6 +690,9 @@ revocation. Live album probes in `t20_cdn.sh` are a follow-up.
 - Playbook role variables and `simple-config.yaml` lines for
   `max_album_items` / `max_album_bytes`; the bridge defaults apply until they
   land.
+- Live validation of the bridge-side outgoing-link path in
+  `scripts/validate/` (the app contract in `t20_cdn.sh` does not exercise it;
+  the Go tests do, in-process).
 - Playbook role variables, simple-config template, Traefik router and DNS
   (patch plan above).
 - Command help text in `managementRoomHelpText()` and the parent playbook

@@ -193,6 +193,16 @@ func attachmentDataURIless(data []byte) string {
 	return base64.StdEncoding.EncodeToString(data)
 }
 
+// sendAttachmentFromData packages downloaded attachment bytes for the agent
+// send API.
+func sendAttachmentFromData(data []byte, contentType, fileName string) SendAttachment {
+	return SendAttachment{
+		ContentType: contentType,
+		FileName:    fileName,
+		Base64:      attachmentDataURIless(data),
+	}
+}
+
 // uploadAttachmentData uploads bytes to the portal room and returns the mxc
 // URI, the optional encryption info and the FileInfo to attach to the event.
 // It returns an error when the upload fails, and the error can be used to

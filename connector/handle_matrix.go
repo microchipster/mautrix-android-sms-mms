@@ -27,6 +27,11 @@ var (
 	_ bridgev2.ReadReceiptHandlingNetworkAPI = (*MyNetworkClient)(nil)
 )
 
+// errMMSNeedsAppBackend is returned when an attachment cannot be sent because
+// neither the file service link path nor the phone's MMS backend can carry
+// it.
+var errMMSNeedsAppBackend = errors.New("MMS sending needs the app backend (not available on the shell backend yet)")
+
 var htmlTagRegex = regexp.MustCompile(`<[^>]+>`)
 
 // HandleMatrixMessage handles messages sent from Matrix to the phone.
@@ -74,15 +79,27 @@ func (nc *MyNetworkClient) HandleMatrixMessage(ctx context.Context, msg *bridgev
 
 	var attachments []SendAttachment
 	if isAttachment {
-		if !health.Backend.SendMMS {
-			return nil, bridgev2.WrapErrorInStatus(fmt.Errorf("MMS sending needs the app backend (not available on the shell backend yet)")).
-				WithSendNotice(true)
+		// The file service can turn an attachment into a text link, so MMS
+		// support is only required when the media has to travel as an MMS.
+		if !health.Backend.SendMMS && !nc.cdnLinkMode() {
+			return nil, bridgev2.WrapErrorInStatus(errMMSNeedsAppBackend).WithSendNotice(true)
 		}
-		attachment, err := nc.downloadMatrixAttachment(ctx, msg)
+		data, contentType, fileName, err := nc.downloadMatrixAttachment(ctx, msg, nc.outgoingAttachmentLimitBytes())
 		if err != nil {
 			return nil, bridgev2.WrapErrorInStatus(err).WithSendNotice(true)
 		}
-		attachments = append(attachments, attachment)
+		linked := false
+		text, attachments, linked, err = nc.prepareOutgoingAttachment(text, data, contentType, fileName, health.Backend.SendMMS)
+		if err != nil {
+			return nil, bridgev2.WrapErrorInStatus(err).WithSendNotice(true)
+		}
+		if linked {
+			nc.log.Info().
+				Str("portal_id", string(msg.Portal.ID)).
+				Int("bytes", len(data)).
+				Str("file_name", fileName).
+				Msg("Stored an outgoing attachment in the file service; sending its link as text")
+		}
 	}
 	if text == "" && len(attachments) == 0 {
 		return nil, bridgev2.WrapErrorInStatus(fmt.Errorf("message is empty")).WithSendNotice(true)
@@ -228,29 +245,38 @@ func (nc *MyNetworkClient) recordOutgoingSend(resp SendResponse, sendID string) 
 }
 
 // downloadMatrixAttachment downloads the media of an outgoing Matrix message
-// and packages it for the agent send API.
-func (nc *MyNetworkClient) downloadMatrixAttachment(ctx context.Context, msg *bridgev2.MatrixMessage) (SendAttachment, error) {
+// and returns its bytes, MIME type and display filename. maxBytes caps the
+// accepted plaintext (0 disables the cap); the cap is raised for attachments
+// that can travel through the file service instead of MMS.
+func (nc *MyNetworkClient) downloadMatrixAttachment(ctx context.Context, msg *bridgev2.MatrixMessage, maxBytes int64) ([]byte, string, string, error) {
 	contentURL := msg.Content.URL
 	if contentURL == "" && msg.Content.File != nil {
 		contentURL = msg.Content.File.URL
 	}
 	if contentURL == "" {
-		return SendAttachment{}, fmt.Errorf("media event is missing its content URL")
+		return nil, "", "", fmt.Errorf("media event is missing its content URL")
 	}
 	if nc.bridge == nil || nc.bridge.Bot == nil {
-		return SendAttachment{}, fmt.Errorf("bridge bot is not available for media download")
+		return nil, "", "", fmt.Errorf("bridge bot is not available for media download")
+	}
+	// The event carries the plaintext size; reject an oversized attachment
+	// before pulling its bytes over the network.
+	if maxBytes > 0 && msg.Content.Info != nil && int64(msg.Content.Info.Size) > maxBytes {
+		return nil, "", "", fmt.Errorf(
+			"attachment is too large (%d bytes); the limit is %d MB",
+			msg.Content.Info.Size, maxBytes/(1024*1024))
 	}
 	data, err := nc.bridge.Bot.DownloadMedia(ctx, contentURL, msg.Content.File)
 	if err != nil {
-		return SendAttachment{}, fmt.Errorf("failed to download media from Matrix: %w", err)
+		return nil, "", "", fmt.Errorf("failed to download media from Matrix: %w", err)
 	}
 	if len(data) == 0 {
-		return SendAttachment{}, fmt.Errorf("downloaded media is empty")
+		return nil, "", "", fmt.Errorf("downloaded media is empty")
 	}
-	if maxSize := nc.connector.maxAttachmentSizeBytes(); maxSize > 0 && int64(len(data)) > maxSize {
-		return SendAttachment{}, fmt.Errorf(
+	if maxBytes > 0 && int64(len(data)) > maxBytes {
+		return nil, "", "", fmt.Errorf(
 			"attachment is too large (%d bytes); the limit is %d MB",
-			len(data), maxSize/(1024*1024))
+			len(data), maxBytes/(1024*1024))
 	}
 	contentType := ""
 	if msg.Content.Info != nil {
@@ -263,11 +289,7 @@ func (nc *MyNetworkClient) downloadMatrixAttachment(ctx context.Context, msg *br
 	if fileName == "" {
 		fileName = "attachment" + extensionForContentType(contentType)
 	}
-	return SendAttachment{
-		ContentType: contentType,
-		FileName:    fileName,
-		Base64:      attachmentDataURIless(data),
-	}, nil
+	return data, contentType, fileName, nil
 }
 
 func mapAgentSendError(err error) error {
