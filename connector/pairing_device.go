@@ -289,6 +289,7 @@ func (d *pairedDevice) applyHeartbeatSubscriptions(ctx context.Context, subs []a
 	if err := runtime.login.Save(ctx); err != nil {
 		runtime.log.Warn().Err(err).Str("device_id", d.deviceID).Msg("Failed to persist app device subscriptions")
 	}
+	runtime.maybePromptNumberLabels(ctx)
 }
 
 // healthSnapshot synthesizes the agent Health shape for an app login so the

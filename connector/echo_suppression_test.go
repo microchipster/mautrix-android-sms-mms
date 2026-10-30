@@ -308,7 +308,7 @@ func TestWithStoredRecipientsBackfillsEchoThread(t *testing.T) {
 	}
 
 	chatInfo := client.chatInfoForThread(ctx, thread)
-	if chatInfo.Name == nil || *chatInfo.Name != echoBob {
+	if chatInfo.Name == nil || *chatInfo.Name != echoBob+" "+RoomNameSuffixDefault {
 		t.Fatalf("room name = %v, want the phone-reported participant", chatInfo.Name)
 	}
 }

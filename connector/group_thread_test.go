@@ -241,7 +241,7 @@ func TestChatInfoForGroupThread(t *testing.T) {
 	if group.Type == nil || *group.Type != database.RoomTypeDefault {
 		t.Fatalf("group room type = %v, want default", group.Type)
 	}
-	if group.Name == nil || *group.Name != groupTestAlice+", "+groupTestCarol {
+	if group.Name == nil || *group.Name != groupTestAlice+", "+groupTestCarol+" "+RoomNameSuffixDefault {
 		t.Fatalf("group room name = %v, want the sorted participants", group.Name)
 	}
 	if group.Members == nil || !group.Members.IsFull || group.Members.OtherUserID != "" {
@@ -262,7 +262,7 @@ func TestChatInfoForGroupThread(t *testing.T) {
 	if dm.Type == nil || *dm.Type != database.RoomTypeDM {
 		t.Fatalf("DM room type = %v, want DM", dm.Type)
 	}
-	if dm.Name == nil || *dm.Name != groupTestBob {
+	if dm.Name == nil || *dm.Name != groupTestBob+" "+RoomNameSuffixDefault {
 		t.Fatalf("DM room name = %v, want %q", dm.Name, groupTestBob)
 	}
 	if dm.Members.OtherUserID != MakeUserID(groupTestBob) {
@@ -275,7 +275,7 @@ func TestChatInfoForGroupThread(t *testing.T) {
 	// A self-thread keeps the own number as the only counterpart, otherwise
 	// the room would be unsendable and named "Unknown conversation".
 	self := client.chatInfoForThread(ctx, agentapi.Thread{ID: 44, SubID: 1, Recipients: []string{"15550100100"}})
-	if self.Type == nil || *self.Type != database.RoomTypeDM || self.Name == nil || *self.Name != groupTestOwn {
+	if self.Type == nil || *self.Type != database.RoomTypeDM || self.Name == nil || *self.Name != groupTestOwn+" "+RoomNameSuffixDefault {
 		t.Fatalf("self-thread room = %+v (name %v)", self, self.Name)
 	}
 	if self.Members.OtherUserID != MakeUserID(groupTestOwn) {
@@ -321,7 +321,7 @@ func TestGroupMergedAddressNeverBecomesGhost(t *testing.T) {
 		ID: 46, SubID: 1,
 		Recipients: []string{groupTestAlice + "|" + groupTestBob},
 	})
-	if want := groupTestAlice + ", " + groupTestBob; info.Name == nil || *info.Name != want {
+	if want := groupTestAlice + ", " + groupTestBob + " " + RoomNameSuffixDefault; info.Name == nil || *info.Name != want {
 		t.Fatalf("room name = %v, want %q", info.Name, want)
 	}
 	wantMembers := []networkid.UserID{MakeUserID(groupTestAlice), MakeUserID(groupTestBob)}

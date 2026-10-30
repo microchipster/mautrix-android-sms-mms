@@ -1074,6 +1074,10 @@ func (nc *MyNetworkClient) chatInfoForThread(ctx context.Context, thread agentap
 	if name == "" {
 		name = PortalName("", recipients)
 	}
+	// Every phone-conversation room ends with a suffix ((sms) by default,
+	// (sms-<label>) once the number is labeled) so SMS/MMS rooms are easy
+	// to tell apart from the other bridges' rooms.
+	name = strings.TrimSpace(name + " " + nc.roomNameSuffix(thread.SubID))
 	return &bridgev2.ChatInfo{
 		Name:        &name,
 		Type:        &roomType,

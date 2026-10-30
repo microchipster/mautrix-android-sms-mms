@@ -112,6 +112,8 @@ func (c *MyConnector) Init(br *bridgev2.Bridge) {
 		proc.AddHandler(CommandStats)
 		proc.AddHandler(CommandLabel)
 		proc.AddHandler(CommandLabels)
+		proc.AddHandler(CommandNumberLabel)
+		proc.AddHandler(CommandNumberLabels)
 		proc.AddHandler(CommandTTL)
 		proc.AddHandler(CommandSpam)
 		proc.AddHandler(CommandMerge)

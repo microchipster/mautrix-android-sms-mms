@@ -60,6 +60,15 @@ type LoginMetadata struct {
 	// SIM subscriptions: sub_id -> display name/number (dual-SIM support).
 	Subscriptions map[int]SubscriptionInfo `json:"subscriptions,omitempty"`
 
+	// NumberLabels maps the phone's own numbers (canonical E.164) to short
+	// labels used in room-name suffixes, e.g. "(sms-personal)". Assigned with
+	// the number-label command; empty means every room just ends in "(sms)".
+	NumberLabels map[string]string `json:"number_labels,omitempty"`
+
+	// NumberLabelsPrompted records that the bridge has already asked the user
+	// to assign number labels (so the prompt is only sent once per login).
+	NumberLabelsPrompted bool `json:"number_labels_prompted,omitempty"`
+
 	LastSyncAt *time.Time `json:"last_sync_at,omitempty"`
 }
 
