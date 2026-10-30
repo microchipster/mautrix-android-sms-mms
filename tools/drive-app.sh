@@ -57,10 +57,18 @@ PREFIX="${ACTION_PREFIX:-org.fossify.messages.bridge.control}"
 # `$PKG.control.ControlReceiver`, which is not an installed class.
 RECEIVER="$PKG/org.fossify.messages.control.ControlReceiver"
 
+# sh_quote single-quotes its argument for the device shell: `adb shell` joins
+# its arguments into one command string, so values with spaces, quotes or
+# newlines (JSON configs, message texts) must be quoted for the shell that
+# parses it.
+sh_quote() {
+	printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
 run() {
 	local args=(shell am broadcast -n "$RECEIVER")
 	if [ -n "${CONTROL_TOKEN:-}" ]; then
-		args+=(--es control_token "$CONTROL_TOKEN")
+		args+=(--es control_token "$(sh_quote "$CONTROL_TOKEN")")
 	fi
 	adb -s "$SERIAL" "${args[@]}" "$@"
 }
@@ -74,14 +82,14 @@ config)
 		echo "config needs a JSON argument" >&2
 		exit 2
 	fi
-	run -a "$PREFIX.CONFIG" --es config "$1"
+	run -a "$PREFIX.CONFIG" --es config "$(sh_quote "$1")"
 	;;
 pair)
 	if [ "$#" -lt 1 ]; then
 		echo "pair needs a JSON argument" >&2
 		exit 2
 	fi
-	run -a "$PREFIX.PAIR" --es pair "$1"
+	run -a "$PREFIX.PAIR" --es pair "$(sh_quote "$1")"
 	;;
 unpair)
 	run -a "$PREFIX.UNPAIR"
@@ -94,9 +102,9 @@ send)
 	to="$1"
 	text="$2"
 	shift 2
-	args=(-a "$PREFIX.SEND" --es to "$to" --es text "$text")
+	args=(-a "$PREFIX.SEND" --es to "$(sh_quote "$to")" --es text "$(sh_quote "$text")")
 	if [ "$#" -ge 1 ]; then
-		args+=(--es file "$1")
+		args+=(--es file "$(sh_quote "$1")")
 	fi
 	run "${args[@]}"
 	;;
