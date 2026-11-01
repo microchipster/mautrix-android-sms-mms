@@ -70,11 +70,11 @@ func TestPairLoginStartPayload(t *testing.T) {
 	if parsed.Query().Get("v") != "1" {
 		t.Fatalf("payload version = %q, want 1", parsed.Query().Get("v"))
 	}
-	if !strings.Contains(step.Instructions, session.code) {
-		t.Fatalf("instructions do not include the manual code: %q", step.Instructions)
+	if strings.Contains(step.Instructions, session.code) {
+		t.Fatalf("instructions must not include the manual code: %q", step.Instructions)
 	}
-	if !strings.Contains(step.Instructions, payload) {
-		t.Fatalf("instructions do not include the payload: %q", step.Instructions)
+	if strings.Contains(step.Instructions, payload) {
+		t.Fatalf("instructions must not include the payload: %q", step.Instructions)
 	}
 	if login.Main.pairingServer().sessionByID(session.id) == nil {
 		t.Fatal("session was not registered on the pairing server")

@@ -210,6 +210,33 @@ func buildPairingPayload(homeserverURL, bridgeURL, code string) string {
 	return (&url.URL{Scheme: "smsmms", Host: "pair", RawQuery: query.Encode()}).String()
 }
 
+// buildPairingLink renders the https App Link variant of the pairing payload:
+// https://<host>/_smsmms/pair?hs=...&b=...&code=...&v=1
+// The host comes from the homeserver URL, falling back to the bridge URL.
+func buildPairingLink(homeserverURL, bridgeURL, code string) string {
+	query := url.Values{}
+	query.Set("v", "1")
+	base := ""
+	if homeserverURL = strings.TrimSpace(homeserverURL); homeserverURL != "" {
+		query.Set("hs", homeserverURL)
+		base = homeserverURL
+	}
+	if bridgeURL = strings.TrimSpace(bridgeURL); bridgeURL != "" {
+		query.Set("b", bridgeURL)
+		if base == "" {
+			base = bridgeURL
+		}
+	}
+	query.Set("code", code)
+	parsed, err := url.Parse(base)
+	if err != nil || parsed.Host == "" {
+		return ""
+	}
+	parsed.Path = "/_smsmms/pair"
+	parsed.RawQuery = query.Encode()
+	return parsed.String()
+}
+
 // remoteEvent is the agent Event shape the protocol reuses, plus the extra
 // payloads the pairing API adds: the full message for message.* events, and
 // the outcome fields of a send.result.

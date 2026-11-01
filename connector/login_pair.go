@@ -16,6 +16,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/bridgev2/status"
+	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 )
 
@@ -37,6 +38,10 @@ type PairLogin struct {
 
 	mu      sync.Mutex
 	session *pairingSession
+
+	// secretEventID is the id of the temporary management-room message that
+	// holds the pairing code and payload; it is redacted when the flow ends.
+	secretEventID id.EventID
 }
 
 // Ensure PairLogin implements the required interface.
@@ -61,11 +66,13 @@ func (pl *PairLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error) {
 	pl.mu.Unlock()
 
 	payload := buildPairingPayload(pl.Main.homeserverPublicURL(), pl.Main.pairingBridgeURL(), session.code)
+	secretEventID := pl.sendPairingSecret(session, payload)
+	pl.mu.Lock()
+	pl.secretEventID = secretEventID
+	pl.mu.Unlock()
 	instructions := strings.Join([]string{
 		"Scan the QR code with the Fossify Messages bridge app (Settings -> Bridge pairing).",
-		fmt.Sprintf("Or enter the pairing code manually: %s", session.code),
-		fmt.Sprintf("Pairing code expires at %s.", session.expiresAt.UTC().Format("2006-01-02 15:04:05 MST")),
-		fmt.Sprintf("Pairing payload: %s", payload),
+		"The pairing code, payload and https link are in a separate message.",
 	}, "\n")
 	pl.Log.Info().
 		Str("pairing_id", session.id).
@@ -96,12 +103,14 @@ func (pl *PairLogin) Wait(ctx context.Context) (*bridgev2.LoginStep, error) {
 	result, err := session.waitResult(ctx)
 	if err != nil {
 		if errors.Is(err, bridgev2.ErrLoginStepCancelled) {
+			pl.redactPairingSecret("pairing cancelled")
 			return nil, bridgev2.ErrLoginStepCancelled
 		}
 		if errors.Is(err, errPairingExpired) {
 			// The session expired; drop it so its code cannot be reused.
 			pl.Main.pairingServer().releaseSession(session)
 			session.abandon()
+			pl.redactPairingSecret("pairing code expired")
 		}
 		return nil, err
 	}
@@ -110,8 +119,10 @@ func (pl *PairLogin) Wait(ctx context.Context) (*bridgev2.LoginStep, error) {
 		// The token was handed to the app already; revoke it so a failed
 		// login cannot leave an authorized device behind.
 		pl.Main.pairingServer().revokeDevice(result.DeviceID)
+		pl.redactPairingSecret("pairing failed")
 		return nil, err
 	}
+	pl.redactPairingSecret("pairing completed")
 	pl.announcePairing(ul, result)
 	step := &bridgev2.LoginStep{
 		Type:   bridgev2.LoginStepTypeComplete,
@@ -133,12 +144,58 @@ func (pl *PairLogin) Cancel() {
 	session := pl.session
 	pl.session = nil
 	pl.mu.Unlock()
+	pl.redactPairingSecret("pairing cancelled")
 	if session == nil {
 		return
 	}
 	pl.Main.pairingServer().releaseSession(session)
 	session.abandon()
 	pl.Log.Debug().Str("pairing_id", session.id).Msg("App pairing login process cancelled")
+}
+
+// sendPairingSecret sends the management-room notice that carries the pairing
+// code, payload and links; its event id is redacted when the flow ends. It is
+// a no-op without a bridge and a management room.
+func (pl *PairLogin) sendPairingSecret(session *pairingSession, payload string) id.EventID {
+	if pl.Main == nil || pl.Main.bridge == nil || pl.Main.bridge.Bot == nil ||
+		pl.User == nil || pl.User.ManagementRoom == "" {
+		return ""
+	}
+	body := fmt.Sprintf("Pairing code: %s\nPairing code expires at %s.\nPairing payload: %s",
+		session.code, session.expiresAt.UTC().Format("2006-01-02 15:04:05 MST"), payload)
+	if link := buildPairingLink(pl.Main.homeserverPublicURL(), pl.Main.pairingBridgeURL(), session.code); link != "" {
+		body += fmt.Sprintf("\nPairing link: %s", link)
+	}
+	body += fmt.Sprintf("\nScripted pairing: tools/drive-app.sh <adb-serial> pair '%s'", payload)
+	content := event.MessageEventContent{
+		MsgType: event.MsgNotice,
+		Body:    body,
+	}
+	resp, err := pl.Main.bridge.Bot.SendMessage(context.Background(), pl.User.ManagementRoom, event.EventMessage, &event.Content{Parsed: &content}, nil)
+	if err != nil {
+		pl.Log.Warn().Err(err).Msg("Failed to send the pairing code message")
+		return ""
+	}
+	return resp.EventID
+}
+
+// redactPairingSecret redacts the pairing code/payload notice (once).
+func (pl *PairLogin) redactPairingSecret(reason string) {
+	pl.mu.Lock()
+	evID := pl.secretEventID
+	pl.secretEventID = ""
+	pl.mu.Unlock()
+	if evID == "" || pl.Main == nil || pl.Main.bridge == nil || pl.Main.bridge.Bot == nil ||
+		pl.User == nil || pl.User.ManagementRoom == "" {
+		return
+	}
+	content := event.RedactionEventContent{
+		Redacts: evID,
+		Reason:  reason,
+	}
+	if _, err := pl.Main.bridge.Bot.SendMessage(context.Background(), pl.User.ManagementRoom, event.EventRedaction, &event.Content{Parsed: &content}, nil); err != nil {
+		pl.Log.Warn().Err(err).Msg("Failed to redact the pairing code message")
+	}
 }
 
 // createPairedLogin builds the bridgev2 login for a completed pairing. The

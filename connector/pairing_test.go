@@ -522,3 +522,27 @@ func TestBuildPairingPayload(t *testing.T) {
 		t.Fatalf("expected hs/b to be omitted, got %q", noBridge)
 	}
 }
+
+func TestBuildPairingLink(t *testing.T) {
+	link := buildPairingLink("https://matrix.example.com", "https://bridge.example.com", "ABCD1234")
+	parsed, err := url.Parse(link)
+	if err != nil {
+		t.Fatalf("link is not a valid URL: %v", err)
+	}
+	if parsed.Scheme != "https" || parsed.Host != "matrix.example.com" || parsed.Path != "/_smsmms/pair" {
+		t.Fatalf("link = %q, want https://matrix.example.com/_smsmms/pair?...", link)
+	}
+	query := parsed.Query()
+	if query.Get("hs") != "https://matrix.example.com" || query.Get("b") != "https://bridge.example.com" {
+		t.Fatalf("unexpected link query: %v", query)
+	}
+	if query.Get("code") != "ABCD1234" || query.Get("v") != "1" {
+		t.Fatalf("unexpected link code/version: %v", query)
+	}
+	if fallback := buildPairingLink("", "https://bridge.example.com", "ABCD1234"); fallback == "" {
+		t.Fatal("link with only a bridge URL should not be empty")
+	}
+	if buildPairingLink("", "", "ABCD1234") != "" {
+		t.Fatal("link without any URL should be empty")
+	}
+}
