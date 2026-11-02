@@ -40,9 +40,6 @@ backing, nothing).
 ## Security model
 
 - **Zero-knowledge uploads**: the bridge stores and serves ciphertext only.
-- **First-view links**: a link can be restricted to the first browser that
-  opens it; the claim is fingerprinted and persisted, and the decryption key
-  never leaves the URL fragment.
   It never sees the AES key, the plaintext, or the original filename/type.
 - **URL is the secret**: `GET /f/<id>` and the ciphertext routes need no
   headers and no cookies. Whoever has the full link has the file (or the whole
@@ -346,12 +343,24 @@ playbook's `simple-config.yaml` template needs matching role variables to
 override the bridge defaults (follow-up on the playbook side; the defaults
 apply until then).
 
-## First-view links
+## Management room
 
-New links default to `first` view: the first browser that fetches the
-ciphertext claims the link and later fingerprints are refused. Set
-`cdn.default_view: public` to default to links anyone with the link can
-open, or let clients override per upload with `view=first|public`.
+The bridge records every file-service link that passes through an
+account's messages (sent and received) plus the links it creates itself,
+so the management room can manage both sides:
+
+- `cdn list` - the account's active uploads (id, size, expiry) and the
+  links it received (id, sender, date),
+- `cdn view <id>` - one item's metadata and the recorded link, including
+  the fragment key,
+- `cdn expire <id>` - deletes a file the account owns, or a received link
+  that lives on this file service,
+- `cdn revoke <id>` - the owner-checked single-item delete,
+- `cdn stats` / `cdn gc` - storage usage (global for admins) and cleanup.
+
+The URL fragment key and the entry TTL remain the only access controls on
+the service itself; the management-room records are a convenience for the
+account, stored alongside the service data.
 
 Trusted services that upload on their own behalf (for example the jmpchat
 bridge sending outbound attachments) present `cdn.upload_token` as a bearer

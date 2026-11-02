@@ -1477,11 +1477,7 @@ func NewCdnCommand(service *CdnService) *commands.FullHandler {
 					ce.Reply("Failed to list your file links: %v", err)
 					return
 				}
-				if len(entries) == 0 {
-					ce.Reply("No active file links or albums uploaded by you.")
-					return
-				}
-				lines := make([]string, 0, len(entries)+2)
+				lines := make([]string, 0, len(entries)+6)
 				for _, entry := range entries {
 					if entry.isAlbum() {
 						lines = append(lines, fmt.Sprintf("- `%s` — album: %d item(s), %s, expires %s",
@@ -1491,9 +1487,28 @@ func NewCdnCommand(service *CdnService) *commands.FullHandler {
 					lines = append(lines, fmt.Sprintf("- `%s` — %s, expires %s",
 						entry.ID, formatCdnBytes(entry.Size), formatCdnTime(entry.ExpiresAt)))
 				}
-				lines = append(lines, fmt.Sprintf("Storage: %s used of %s.",
-					formatCdnBytes(used), formatCdnBytes(service.cfg.PerUserCapBytes)))
-				ce.Reply("Your file links and albums (%d):\n%s\n\nRevoke with `$cmdprefix cdn revoke <id>`.",
+				if len(entries) == 0 {
+					lines = append(lines, "No active file links or albums uploaded by you.")
+				} else {
+					lines = append(lines, fmt.Sprintf("Storage: %s used of %s.",
+						formatCdnBytes(used), formatCdnBytes(service.cfg.PerUserCapBytes)))
+				}
+				received := make([]string, 0)
+				for _, ref := range service.Refs(owner) {
+					if ref.Direction != cdnRefDirectionReceived {
+						continue
+					}
+					party := ref.Party
+					if party == "" {
+						party = "unknown sender"
+					}
+					received = append(received, fmt.Sprintf("- `%s` — from %s, %s", ref.ID, party, formatCdnTime(ref.CreatedAt)))
+				}
+				if len(received) > 0 {
+					lines = append(lines, "", fmt.Sprintf("Received links (%d):", len(received)))
+					lines = append(lines, received...)
+				}
+				ce.Reply("Your file links and albums (%d):\n%s\n\nInspect or expire any recorded link with `$cmdprefix cdn view|expire <id>`.",
 					len(entries), strings.Join(lines, "\n"))
 			case "revoke":
 				if len(ce.Args) < 2 {
@@ -1510,6 +1525,90 @@ func NewCdnCommand(service *CdnService) *commands.FullHandler {
 				default:
 					ce.Reply("Revoked `%s`. The link is dead now.", id)
 				}
+			case "view":
+				if len(ce.Args) < 2 {
+					ce.Reply("Usage: $cmdprefix cdn view <id>")
+					return
+				}
+				id := strings.TrimSpace(ce.Args[1])
+				entry, err := service.readMeta(id)
+				if err != nil {
+					ce.Reply("Failed to read file `%s`: %v", id, err)
+					return
+				}
+				ref, hasRef := service.Ref(owner, id)
+				if entry == nil && !hasRef {
+					ce.Reply("Nothing with id `%s`: no active file and no link recorded for you.", id)
+					return
+				}
+				lines := make([]string, 0, 3)
+				if entry == nil {
+					lines = append(lines, fmt.Sprintf("- `%s`: the stored object is gone (expired or removed).", id))
+				} else {
+					kind := "file"
+					detail := formatCdnBytes(entry.Size)
+					if entry.isAlbum() {
+						kind = "album"
+						detail = fmt.Sprintf("%d item(s), %s", entry.ItemCount, formatCdnBytes(entry.Size))
+					}
+					state := "expires " + formatCdnTime(entry.ExpiresAt)
+					if !entry.ExpiresAt.After(time.Now()) {
+						state = "expired (awaiting cleanup)"
+					}
+					lines = append(lines, fmt.Sprintf("- `%s`: %s, %s, owned by %s, %s",
+						entry.ID, kind, detail, entry.Owner, state))
+				}
+				if hasRef {
+					party := ref.Party
+					switch {
+					case party == "" && ref.Direction == cdnRefDirectionSent:
+						party = "unknown recipient"
+					case party == "":
+						party = "unknown sender"
+					}
+					lines = append(lines, fmt.Sprintf("- link %s %s, %s: %s",
+						ref.Direction, party, formatCdnTime(ref.CreatedAt), ref.URL))
+				}
+				lines = append(lines, "", fmt.Sprintf("Expire it with `$cmdprefix cdn expire %s`.", id))
+				ce.Reply("%s", strings.Join(lines, "\n"))
+			case "expire":
+				if len(ce.Args) < 2 {
+					ce.Reply("Usage: $cmdprefix cdn expire <id>")
+					return
+				}
+				id := strings.TrimSpace(ce.Args[1])
+				ok, err := service.Revoke(owner, id)
+				if err != nil {
+					ce.Reply("Failed to expire `%s`: %v", id, err)
+					return
+				}
+				if ok {
+					ce.Reply("Expired `%s`. The link is dead now.", id)
+					return
+				}
+				if _, hasRef := service.Ref(owner, id); hasRef {
+					deleted, err := service.Delete(id)
+					if err != nil {
+						ce.Reply("Failed to expire `%s`: %v", id, err)
+						return
+					}
+					_ = service.ForgetRef(owner, id)
+					if deleted {
+						ce.Reply("Expired `%s` and removed it from the file service.", id)
+						return
+					}
+					ce.Reply("`%s` was already gone from the file service; removed it from your records.", id)
+					return
+				}
+				if entry, err := service.readMeta(id); err == nil && entry != nil && entry.Owner == owner {
+					if _, err := service.Delete(id); err != nil {
+						ce.Reply("Failed to expire `%s`: %v", id, err)
+						return
+					}
+					ce.Reply("Expired `%s` (it had already expired and was awaiting cleanup).", id)
+					return
+				}
+				ce.Reply("No active file with id `%s` is owned by you and no link with that id is recorded for you.", id)
 			case "stats":
 				if ce.User.Permissions.Admin {
 					stats := service.Stats()
@@ -1556,17 +1655,19 @@ func NewCdnCommand(service *CdnService) *commands.FullHandler {
 		Aliases: []string{"files"},
 		Help: commands.HelpMeta{
 			Section:     commands.HelpSectionAdmin,
-			Description: "List, revoke, and inspect bridge-hosted encrypted file links and albums",
-			Args:        "list | revoke <id> | stats | gc",
+			Description: "List, inspect, and expire bridge-hosted encrypted file links and albums",
+			Args:        "list | view <id> | expire <id> | revoke <id> | stats | gc",
 		},
 	}
 }
 
 // cdnCommandHelpText is the `cdn` command usage shown in the management room.
 func cdnCommandHelpText() string {
-	return "Usage: $cmdprefix cdn <list|revoke <id>|stats|gc>\n" +
-		"- list: show your active file links and albums (id, size, expiry)\n" +
-		"- revoke <id>: delete one of your file links or albums\n" +
+	return "Usage: $cmdprefix cdn <list|view <id>|expire <id>|revoke <id>|stats|gc>\n" +
+		"- list: show your active file links and albums plus the links you received\n" +
+		"- view <id>: show one file's details and its recorded link\n" +
+		"- expire <id>: delete a file you own, or a received link on this service\n" +
+		"- revoke <id>: delete one of your own file links or albums\n" +
 		"- stats: show storage usage (global for admins, yours otherwise)\n" +
 		"- gc: run expiry cleanup now (admins only)"
 }

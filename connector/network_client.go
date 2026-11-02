@@ -866,6 +866,11 @@ func (nc *MyNetworkClient) bridgeAgentMessage(ctx context.Context, msg agentapi.
 		},
 	}
 	nc.bridge.QueueRemoteEvent(nc.login, evt)
+	refDirection := cdnRefDirectionReceived
+	if fromMe {
+		refDirection = cdnRefDirectionSent
+	}
+	nc.recordCdnRefsFromText(refDirection, msg.Sender, string(homeKey.ID), msg.Body, timestamp)
 	nc.indexMessage(homeKey, indexedMessage{
 		ID:            networkid.MessageID(msg.ID),
 		Body:          msg.Body,

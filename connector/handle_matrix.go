@@ -121,6 +121,7 @@ func (nc *MyNetworkClient) HandleMatrixMessage(ctx context.Context, msg *bridgev
 	// echo can reach the event loop before the matching send.result is
 	// processed, so the echo suppression must not depend on which of the two
 	// arrives first.
+	nc.recordCdnRefsFromText(cdnRefDirectionSent, strings.Join(recipients, ", "), string(msg.Portal.MXID), text, time.Now().UTC())
 	nc.trackOutboundSend(sendID)
 	req := SendRequest{
 		SendID:      sendID,
