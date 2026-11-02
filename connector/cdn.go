@@ -192,6 +192,14 @@ type CdnConfig struct {
 	// the link decrypt it. Empty means "first". Uploads may override it with
 	// the `view` query parameter.
 	DefaultView string `yaml:"default_view,omitempty"`
+
+	// UploadToken is an optional static bearer token for trusted clients that
+	// cannot hold a paired-device token (for example the jmpchat bridge).
+	// When set, UploadTokenOwner must be set too.
+	UploadToken string `yaml:"upload_token,omitempty"`
+	// UploadTokenOwner is the Matrix user id that owns uploads made with
+	// UploadToken.
+	UploadTokenOwner string `yaml:"upload_token_owner,omitempty"`
 }
 
 // DefaultCdnConfig returns the file service defaults: disabled, 512 MiB per
@@ -214,20 +222,22 @@ func DefaultCdnConfig() CdnConfig {
 // wipes the size or expiry defaults.
 func (c *CdnConfig) UnmarshalYAML(unmarshal func(any) error) error {
 	var raw struct {
-		Enabled         *bool        `yaml:"enabled"`
-		Domain          *string      `yaml:"domain"`
-		DataDir         *string      `yaml:"data_dir"`
-		MaxFileBytes    *int64       `yaml:"max_file_bytes"`
-		MaxAlbumItems   *int         `yaml:"max_album_items"`
-		MaxAlbumBytes   *int64       `yaml:"max_album_bytes"`
-		PerUserCapBytes *int64       `yaml:"per_user_cap_bytes"`
-		DefaultExpiry   *cdnDuration `yaml:"default_expiry"`
-		MaxExpiry       *cdnDuration `yaml:"max_expiry"`
-		GCInterval      *cdnDuration `yaml:"gc_interval"`
-		SendMode        *string      `yaml:"send_mode"`
-		SendThreshold   *int64       `yaml:"send_threshold"`
-		SendExpiry      *cdnDuration `yaml:"send_expiry"`
-		DefaultView     *string      `yaml:"default_view"`
+		Enabled          *bool        `yaml:"enabled"`
+		Domain           *string      `yaml:"domain"`
+		DataDir          *string      `yaml:"data_dir"`
+		MaxFileBytes     *int64       `yaml:"max_file_bytes"`
+		MaxAlbumItems    *int         `yaml:"max_album_items"`
+		MaxAlbumBytes    *int64       `yaml:"max_album_bytes"`
+		PerUserCapBytes  *int64       `yaml:"per_user_cap_bytes"`
+		DefaultExpiry    *cdnDuration `yaml:"default_expiry"`
+		MaxExpiry        *cdnDuration `yaml:"max_expiry"`
+		GCInterval       *cdnDuration `yaml:"gc_interval"`
+		SendMode         *string      `yaml:"send_mode"`
+		SendThreshold    *int64       `yaml:"send_threshold"`
+		SendExpiry       *cdnDuration `yaml:"send_expiry"`
+		DefaultView      *string      `yaml:"default_view"`
+		UploadToken      *string      `yaml:"upload_token"`
+		UploadTokenOwner *string      `yaml:"upload_token_owner"`
 	}
 	if err := unmarshal(&raw); err != nil {
 		return err
@@ -274,6 +284,12 @@ func (c *CdnConfig) UnmarshalYAML(unmarshal func(any) error) error {
 	}
 	if raw.DefaultView != nil {
 		cfg.DefaultView = strings.TrimSpace(*raw.DefaultView)
+	}
+	if raw.UploadToken != nil {
+		cfg.UploadToken = strings.TrimSpace(*raw.UploadToken)
+	}
+	if raw.UploadTokenOwner != nil {
+		cfg.UploadTokenOwner = strings.TrimSpace(*raw.UploadTokenOwner)
 	}
 	*c = cfg
 	return nil
@@ -343,6 +359,12 @@ func (c CdnConfig) Validate() error {
 	case "", cdnViewFirst, cdnViewPublic:
 	default:
 		return fmt.Errorf("cdn.default_view must be %q or %q, got %q", cdnViewFirst, cdnViewPublic, c.DefaultView)
+	}
+	if (c.UploadToken == "") != (c.UploadTokenOwner == "") {
+		return fmt.Errorf("cdn.upload_token and cdn.upload_token_owner must be set together")
+	}
+	if c.UploadTokenOwner != "" && !strings.HasPrefix(c.UploadTokenOwner, "@") {
+		return fmt.Errorf("cdn.upload_token_owner must be a Matrix user id")
 	}
 	if c.SendThresholdBytes < 0 {
 		return fmt.Errorf("cdn.send_threshold cannot be negative")
@@ -449,6 +471,20 @@ func NewCdnService(log zerolog.Logger, cfg CdnConfig, auth CdnAuthFunc) (*CdnSer
 	if !cfg.Active() {
 		return nil, nil
 	}
+	if cfg.UploadToken != "" {
+		inner := auth
+		token := cfg.UploadToken
+		owner := cfg.UploadTokenOwner
+		auth = func(r *http.Request) (string, bool) {
+			if presented, ok := cdnBearerToken(r); ok && subtle.ConstantTimeCompare([]byte(presented), []byte(token)) == 1 {
+				return owner, true
+			}
+			if inner == nil {
+				return "", false
+			}
+			return inner(r)
+		}
+	}
 	service := &CdnService{
 		log:  log.With().Str("component", "cdn-file-service").Logger(),
 		cfg:  cfg,
@@ -458,6 +494,20 @@ func NewCdnService(log zerolog.Logger, cfg CdnConfig, auth CdnAuthFunc) (*CdnSer
 		return nil, fmt.Errorf("create cdn data dir: %w", err)
 	}
 	return service, nil
+}
+
+// cdnBearerToken extracts the bearer token of a request, if any.
+func cdnBearerToken(r *http.Request) (string, bool) {
+	const prefix = "Bearer "
+	header := r.Header.Get("Authorization")
+	if len(header) <= len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
+		return "", false
+	}
+	token := strings.TrimSpace(header[len(prefix):])
+	if token == "" {
+		return "", false
+	}
+	return token, true
 }
 
 // FileURL returns the public wrapper URL of a file. The decryption key is
