@@ -6,6 +6,9 @@
 # drive-app.sh — drive the bridge app from a computer over adb using the
 # control intents documented in the app's docs/bridge-mode.md.
 #
+# `pair` also stops local adb agents that serve the phone, so app pairing
+# does not duplicate the adb-based bridging.
+#
 # Usage:
 #   tools/drive-app.sh <adb-serial> status
 #   tools/drive-app.sh <adb-serial> config '<json>'
@@ -34,7 +37,7 @@ Usage: tools/drive-app.sh <adb-serial> <command> [args...]
 Commands:
   status                        show bridge/control status JSON
   config <json>                 apply configuration JSON
-  pair <json>                   pair headlessly with a pairing payload
+  pair <json|payload>           pair headlessly (also stops local adb agents for the phone)
   unpair                        remove the pairing
   send <to[,to...]> <text> [file]   one group-aware send
   sync                          heartbeat + queue poll now
@@ -73,6 +76,37 @@ run() {
 	adb -s "$SERIAL" "${args[@]}" "$@"
 }
 
+# stop_adb_agents stops local adb agents (android-sms-mms-adb-agent, or the
+# sms-agent dev binary) whose configuration serves <serial>, so switching the
+# phone to app pairing cannot leave it bridged twice. Agents for other phones
+# are left alone.
+stop_adb_agents() {
+	local serial="$1" pid cmd config stopped=0
+	for pid in $(pgrep -f 'android-sms-mms-adb-agent|sms-agent' 2>/dev/null || true); do
+		cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+		[ -z "$cmd" ] && continue
+		config="$(printf '%s' "$cmd" | sed -n 's/.*-c \([^ ]*\).*/\1/p')"
+		case "$cmd" in
+		*"$serial"*)
+			;;
+		*)
+			if [ -z "$config" ] || [ ! -r "$config" ] || ! grep -q "$serial" "$config" 2>/dev/null; then
+				continue
+			fi
+			;;
+		esac
+		if kill "$pid" 2>/dev/null; then
+			echo "stopped the adb agent (pid $pid) that serves $serial"
+			stopped=1
+		fi
+	done
+	if [ "$stopped" = "0" ]; then
+		echo "no local adb agent serving $serial is running"
+	else
+		echo "note: if the bridge still lists an agent login for this phone, remove it with 'unpair <device_id>' in the management room"
+	fi
+}
+
 case "$CMD" in
 status)
 	run -a "$PREFIX.STATUS"
@@ -89,6 +123,7 @@ pair)
 		echo "pair needs a JSON argument" >&2
 		exit 2
 	fi
+	stop_adb_agents "$SERIAL"
 	run -a "$PREFIX.PAIR" --es pair "$(sh_quote "$1")"
 	;;
 unpair)
