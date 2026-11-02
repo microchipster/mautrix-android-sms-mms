@@ -219,8 +219,8 @@ routes need no credentials: the URL is the secret.
 
 | Route | Auth | Purpose |
 |---|---|---|
-| `POST /f[?expires=30d]` | bearer | Upload one ciphertext object. Returns `{"id","size","expires_at_ms"}` (201). |
-| `POST /f/albums[?expires=30d]` | bearer | Upload one album container (items + manifest). Returns `{"id","size","items","expires_at_ms"}` (201). |
+| `POST /f[?expires=30d][&view=first|public]` | bearer | Upload one ciphertext object. Returns `{"id","size","expires_at_ms","view"}` (201). |
+| `POST /f/albums[?expires=30d][&view=first|public]` | bearer | Upload one album container. Returns `{"id","size","items","expires_at_ms","view"}` (201). |
 | `GET /f/{id}` | none | Wrapper page: file viewer or album gallery, chosen from the stored kind. |
 | `GET /f/{id}/raw` | none | Ciphertext of a single file (404 for album ids, unknown or expired ids). |
 | `GET /f/{id}/manifest` | none | Album manifest ciphertext (404 for files, unknown or expired ids). |
@@ -229,6 +229,12 @@ routes need no credentials: the URL is the secret.
 | `DELETE /f/{id}` | bearer | Revoke a file or a whole album (204, or 404 for unknown/foreign/expired ids). |
 
 ### 5.1 Authentication
+
+The bridge may also be configured with a static upload token
+(`cdn.upload_token` plus `cdn.upload_token_owner`): trusted clients that
+cannot hold a paired-device token (for example another bridge sending its
+outbound attachments through this file service) present it as a bearer
+token and their uploads are recorded under the configured owner.
 
 - Upload, list and revoke requests MUST carry
   `Authorization: Bearer <token>`. The implementation chooses how tokens are
@@ -379,6 +385,29 @@ API errors use a JSON envelope:
 `404` responses for unknown/expired/foreign entries are plain (the reference
 sends `text/plain`); clients MUST rely on the status code, not on an error
 envelope, for them.
+
+### 5.8 First-view links
+
+Every upload records a view policy: `first` (the default, controlled by
+`cdn.default_view`) or `public`. The policy can be overridden per upload
+with the `view` query parameter and is echoed in the upload response.
+
+A `first` link stores its decryption key in the URL fragment, so only the
+first browser that opens it can decrypt the file. The wrapper page
+computes a coarse viewer fingerprint (user agent, platform, screen,
+language, time zone and a per-origin random secret) and sends it as the
+`X-CDN-FP` header on the ciphertext, manifest and item fetches. The first
+anonymous fingerprint to fetch the ciphertext claims the link (the hash
+and timestamp are persisted in the entry metadata); the same fingerprint
+may open it again, any other fingerprint is refused with `403`:
+
+- `viewer_fingerprint_required` — the request carried no `X-CDN-FP` header,
+- `already_viewed` — another fingerprint claimed the link earlier.
+
+Authenticated fetches by the uploader's own paired devices (presenting a
+device token) are exempt and never consume the view, so inline previews in
+the app do not use up the link. An album is one link: its manifest and all
+items share the same claim.
 
 ## 6. Expiry, quotas and lifecycle
 

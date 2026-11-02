@@ -40,6 +40,9 @@ backing, nothing).
 ## Security model
 
 - **Zero-knowledge uploads**: the bridge stores and serves ciphertext only.
+- **First-view links**: a link can be restricted to the first browser that
+  opens it; the claim is fingerprinted and persisted, and the decryption key
+  never leaves the URL fragment.
   It never sees the AES key, the plaintext, or the original filename/type.
 - **URL is the secret**: `GET /f/<id>` and the ciphertext routes need no
   headers and no cookies. Whoever has the full link has the file (or the whole
@@ -342,6 +345,17 @@ section is always valid. The album and send caps are ordinary `cdn` keys: the
 playbook's `simple-config.yaml` template needs matching role variables to
 override the bridge defaults (follow-up on the playbook side; the defaults
 apply until then).
+
+## First-view links
+
+New links default to `first` view: the first browser that fetches the
+ciphertext claims the link and later fingerprints are refused. Set
+`cdn.default_view: public` to default to links anyone with the link can
+open, or let clients override per upload with `view=first|public`.
+
+Trusted services that upload on their own behalf (for example the jmpchat
+bridge sending outbound attachments) present `cdn.upload_token` as a bearer
+token; their uploads are owned by `cdn.upload_token_owner`.
 
 ## HTTP API
 
