@@ -278,6 +278,7 @@ type cdnAlbumUploadResponse struct {
 	ID          string `json:"id"`
 	Size        int64  `json:"size"`
 	Items       int    `json:"items"`
+	View        string `json:"view,omitempty"`
 	ExpiresAtMS int64  `json:"expires_at_ms"`
 }
 
@@ -292,6 +293,11 @@ func (s *CdnService) handleAlbumUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	expiry, err := s.resolveUploadExpiry(r)
+	if err != nil {
+		writeCdnError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	view, err := s.resolveUploadView(r)
 	if err != nil {
 		writeCdnError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
@@ -325,6 +331,7 @@ func (s *CdnService) handleAlbumUpload(w http.ResponseWriter, r *http.Request) {
 		Owner:     owner,
 		Kind:      cdnKindAlbum,
 		Size:      upload.size,
+		View:      view,
 		ItemCount: upload.items,
 		CreatedAt: now,
 		ExpiresAt: now.Add(expiry),
@@ -353,6 +360,7 @@ func (s *CdnService) handleAlbumUpload(w http.ResponseWriter, r *http.Request) {
 		ID:          id,
 		Size:        upload.size,
 		Items:       upload.items,
+		View:        entry.View,
 		ExpiresAtMS: entry.ExpiresAt.UnixMilli(),
 	})
 }
@@ -369,6 +377,9 @@ func (s *CdnService) handleAlbumManifest(w http.ResponseWriter, r *http.Request)
 	}
 	if entry == nil {
 		http.NotFound(w, r)
+		return
+	}
+	if !s.enforceViewClaim(w, r, entry) {
 		return
 	}
 	s.writeCdnObject(w, r, s.albumManifestPath(id), id+"-manifest.bin")
@@ -390,6 +401,9 @@ func (s *CdnService) handleAlbumItem(w http.ResponseWriter, r *http.Request) {
 	index, ok := validCdnAlbumIndex(r.PathValue("index"), entry.ItemCount)
 	if !ok {
 		http.NotFound(w, r)
+		return
+	}
+	if !s.enforceViewClaim(w, r, entry) {
 		return
 	}
 	s.writeCdnObject(w, r, s.albumItemPath(id, strconv.Itoa(index)), fmt.Sprintf("%s-%d.bin", id, index))
@@ -493,8 +507,8 @@ async function deriveItemKey(fragmentKey, info) {
 }
 
 async function fetchDecrypt(url, aesKey) {
-	const response = await fetch(url, { cache: "no-store" });
-	if (!response.ok) throw new Error("HTTP " + response.status);
+	const response = await fetch(url, { cache: "no-store", headers: { "X-CDN-FP": await viewerFingerprint() } });
+	if (!response.ok) throw new Error(await claimRefusal(response));
 	const ciphertext = new Uint8Array(await response.arrayBuffer());
 	if (ciphertext.length <= 12) throw new Error("ciphertext is too short");
 	return new Uint8Array(await crypto.subtle.decrypt(
@@ -644,6 +658,52 @@ function parseManifest(raw) {
 	if (!Array.isArray(manifest.items) || manifest.items.length === 0) throw new Error("the manifest has no items");
 	if (manifest.items.length > MAX_ITEMS) throw new Error("the manifest has too many items");
 	return manifest.items;
+}
+
+const FP_STORAGE_KEY = "cdn_fv_secret_v1";
+function viewerSecret() {
+\ttry {
+\t\tlet secret = window.localStorage.getItem(FP_STORAGE_KEY);
+\t\tif (!secret) {
+\t\t\tconst bytes = new Uint8Array(16);
+\t\t\tcrypto.getRandomValues(bytes);
+\t\t\tsecret = Array.from(bytes).map(function (b) { return b.toString(16).padStart(2, "0"); }).join("");
+\t\t\twindow.localStorage.setItem(FP_STORAGE_KEY, secret);
+\t\t}
+\t\treturn secret;
+\t} catch (error) {
+\t\treturn "no-storage";
+\t}
+}
+async function viewerFingerprint() {
+\tconst parts = [
+\t\tnavigator.userAgent || "",
+\t\tnavigator.platform || "",
+\t\tString(navigator.hardwareConcurrency || 0),
+\t\tString(navigator.maxTouchPoints || 0),
+\t\tString(screen.width) + "x" + String(screen.height),
+\t\tString(Math.round(window.devicePixelRatio || 0)),
+\t\tString(screen.colorDepth || 0),
+\t\t(navigator.languages || []).join(","),
+\t\t(Intl.DateTimeFormat().resolvedOptions().timeZone || ""),
+\t\tString(new Date().getTimezoneOffset()),
+\t\tviewerSecret()
+\t];
+\tconst digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(parts.join("|")));
+\treturn Array.from(new Uint8Array(digest)).map(function (b) { return b.toString(16).padStart(2, "0"); }).join("");
+}
+async function claimRefusal(response) {
+\ttry {
+\t\tconst body = await response.json();
+\t\tif (body && body.error === "already_viewed") {
+\t\t\treturn "This link was already opened in another browser; one-time links can only be viewed once.";
+\t\t}
+\t\tif (body && body.error === "viewer_fingerprint_required") {
+\t\t\treturn "This browser could not be identified for a one-time link.";
+\t\t}
+\t} catch (error) {
+\t}
+\treturn "Access denied (HTTP " + response.status + ").";
 }
 
 async function main() {

@@ -29,6 +29,9 @@ func testCdnConfig(t *testing.T, mutate func(*CdnConfig)) CdnConfig {
 	cfg.Enabled = true
 	cfg.Domain = "cdn.example.com"
 	cfg.DataDir = t.TempDir()
+	// Pre-existing tests exercise plain links; first-view behavior has its
+	// own tests in cdn_view_test.go.
+	cfg.DefaultView = cdnViewPublic
 	if mutate != nil {
 		mutate(&cfg)
 	}

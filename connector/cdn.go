@@ -7,7 +7,10 @@ package connector
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -183,6 +186,12 @@ type CdnConfig struct {
 	// SendExpiry is the lifetime of links the bridge creates for its own
 	// outgoing attachments. Zero means DefaultExpiry.
 	SendExpiry cdnDuration `yaml:"send_expiry,omitempty"`
+
+	// DefaultView is the view policy for new uploads: "first" lets only the
+	// first browser that opens a link decrypt it, "public" lets anyone with
+	// the link decrypt it. Empty means "first". Uploads may override it with
+	// the `view` query parameter.
+	DefaultView string `yaml:"default_view,omitempty"`
 }
 
 // DefaultCdnConfig returns the file service defaults: disabled, 512 MiB per
@@ -218,6 +227,7 @@ func (c *CdnConfig) UnmarshalYAML(unmarshal func(any) error) error {
 		SendMode        *string      `yaml:"send_mode"`
 		SendThreshold   *int64       `yaml:"send_threshold"`
 		SendExpiry      *cdnDuration `yaml:"send_expiry"`
+		DefaultView     *string      `yaml:"default_view"`
 	}
 	if err := unmarshal(&raw); err != nil {
 		return err
@@ -261,6 +271,9 @@ func (c *CdnConfig) UnmarshalYAML(unmarshal func(any) error) error {
 	}
 	if raw.SendExpiry != nil {
 		cfg.SendExpiry = *raw.SendExpiry
+	}
+	if raw.DefaultView != nil {
+		cfg.DefaultView = strings.TrimSpace(*raw.DefaultView)
 	}
 	*c = cfg
 	return nil
@@ -326,6 +339,11 @@ func (c CdnConfig) Validate() error {
 	default:
 		return fmt.Errorf("cdn.send_mode must be %q or %q, got %q", cdnSendModeLink, cdnSendModeNever, c.SendMode)
 	}
+	switch strings.ToLower(strings.TrimSpace(c.DefaultView)) {
+	case "", cdnViewFirst, cdnViewPublic:
+	default:
+		return fmt.Errorf("cdn.default_view must be %q or %q, got %q", cdnViewFirst, cdnViewPublic, c.DefaultView)
+	}
 	if c.SendThresholdBytes < 0 {
 		return fmt.Errorf("cdn.send_threshold cannot be negative")
 	}
@@ -352,6 +370,14 @@ func (c CdnConfig) EffectiveSendMode() string {
 	return cdnSendModeLink
 }
 
+// EffectiveDefaultView returns the configured view policy (default "first").
+func (c CdnConfig) EffectiveDefaultView() string {
+	if strings.EqualFold(strings.TrimSpace(c.DefaultView), cdnViewPublic) {
+		return cdnViewPublic
+	}
+	return cdnViewFirst
+}
+
 // CdnAuthFunc resolves the owner key of an authenticated file-service
 // request (upload, list, revoke). Returning ok=false rejects the request. The
 // wiring maps the app's paired-device bearer token to the Matrix user ID, so
@@ -370,6 +396,14 @@ type CdnEntry struct {
 	ItemCount int       `json:"item_count,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 	ExpiresAt time.Time `json:"expires_at"`
+
+	// View is the view policy of the entry (cdnViewFirst or cdnViewPublic).
+	View string `json:"view,omitempty"`
+	// ViewClaimSHA256 is the hex SHA-256 of the first anonymous viewer's
+	// fingerprint; empty until someone claims a first-view entry.
+	ViewClaimSHA256 string `json:"view_claim_sha256,omitempty"`
+	// ViewClaimedAtMS is when that first view happened, in unix millis.
+	ViewClaimedAtMS int64 `json:"view_claimed_at_ms,omitempty"`
 }
 
 // isAlbum reports whether the entry is a multi-item album.
@@ -490,6 +524,9 @@ func (s *CdnService) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET "+cdnPathPrefix+"/{id}/raw", s.handleDownload)
 	mux.HandleFunc("GET "+cdnPathPrefix+"/{id}/manifest", s.handleAlbumManifest)
 	mux.HandleFunc("GET "+cdnPathPrefix+"/{id}/items/{index}", s.handleAlbumItem)
+	mux.HandleFunc("OPTIONS "+cdnPathPrefix+"/{id}/raw", s.handleCdnPreflight)
+	mux.HandleFunc("OPTIONS "+cdnPathPrefix+"/{id}/manifest", s.handleCdnPreflight)
+	mux.HandleFunc("OPTIONS "+cdnPathPrefix+"/{id}/items/{index}", s.handleCdnPreflight)
 }
 
 // Handler returns the file service HTTP handler (auth-required upload,
@@ -533,6 +570,92 @@ type cdnUploadResponse struct {
 	ID          string `json:"id"`
 	Size        int64  `json:"size"`
 	ExpiresAtMS int64  `json:"expires_at_ms"`
+	View        string `json:"view,omitempty"`
+}
+
+const (
+	// cdnViewFirst means only the first browser that opens a link can decrypt
+	// it; later browsers are refused. cdnViewPublic means anyone with the link
+	// can decrypt it.
+	cdnViewFirst  = "first"
+	cdnViewPublic = "public"
+	// cdnViewerHeader carries the browser fingerprint that claims a
+	// first-view link.
+	cdnViewerHeader = "X-CDN-FP"
+)
+
+// resolveUploadView returns the view policy for a new upload: the `view`
+// query parameter when present, otherwise the configured default.
+func (s *CdnService) resolveUploadView(r *http.Request) (string, error) {
+	raw := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("view")))
+	if raw == "" {
+		return s.cfg.EffectiveDefaultView(), nil
+	}
+	switch raw {
+	case cdnViewFirst, cdnViewPublic:
+		return raw, nil
+	default:
+		return "", fmt.Errorf("invalid view value %q (use %q or %q)", raw, cdnViewFirst, cdnViewPublic)
+	}
+}
+
+// enforceViewClaim applies the first-view policy of an entry to a ciphertext
+// request and reports whether the request may proceed. Authenticated
+// (paired-device) fetches and "public" entries always proceed. For a "first"
+// entry, the first anonymous request claims it with the viewer fingerprint
+// from the X-CDN-FP header; later requests are only allowed for the same
+// fingerprint.
+func (s *CdnService) enforceViewClaim(w http.ResponseWriter, r *http.Request, entry *CdnEntry) bool {
+	if entry == nil || entry.View != cdnViewFirst {
+		return true
+	}
+	if owner, ok := s.authenticate(r); ok && owner == entry.Owner {
+		return true
+	}
+	fingerprint := strings.TrimSpace(r.Header.Get(cdnViewerHeader))
+	if fingerprint == "" {
+		writeCdnError(w, http.StatusForbidden, "viewer_fingerprint_required", "this is a one-time link; a browser viewer fingerprint is required")
+		return false
+	}
+	sum := sha256.Sum256([]byte(fingerprint))
+	hash := hex.EncodeToString(sum[:])
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, err := s.loadEntry(entry.ID)
+	if err != nil {
+		writeCdnError(w, http.StatusInternalServerError, "internal", "failed to read the file metadata")
+		return false
+	}
+	if current == nil || current.View != cdnViewFirst {
+		return true
+	}
+	if current.ViewClaimSHA256 == "" {
+		current.ViewClaimSHA256 = hash
+		current.ViewClaimedAtMS = time.Now().UTC().UnixMilli()
+		if err := s.writeMetaLocked(*current); err != nil {
+			writeCdnError(w, http.StatusInternalServerError, "internal", "failed to record the first view")
+			return false
+		}
+		return true
+	}
+	if subtle.ConstantTimeCompare([]byte(current.ViewClaimSHA256), []byte(hash)) == 1 {
+		return true
+	}
+	writeCdnError(w, http.StatusForbidden, "already_viewed", "this link was already viewed in another browser")
+	return false
+}
+
+// handleCdnPreflight answers CORS preflights for the wrapper page's
+// fingerprint-header fetches. The wrapper runs in a sandboxed (opaque)
+// origin, so the browser preflights the X-CDN-FP header before sending it.
+func (s *CdnService) handleCdnPreflight(w http.ResponseWriter, r *http.Request) {
+	header := w.Header()
+	header.Set("Access-Control-Allow-Origin", "*")
+	header.Set("Access-Control-Allow-Methods", "GET")
+	header.Set("Access-Control-Allow-Headers", cdnViewerHeader)
+	header.Set("Access-Control-Max-Age", "600")
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // handleUpload stores one ciphertext body. The body is read before the
@@ -544,6 +667,11 @@ func (s *CdnService) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	expiry, err := s.resolveUploadExpiry(r)
+	if err != nil {
+		writeCdnError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	view, err := s.resolveUploadView(r)
 	if err != nil {
 		writeCdnError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
@@ -586,7 +714,7 @@ func (s *CdnService) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	entry, err := s.publishCiphertext(owner, id, tempName, written, expiry)
+	entry, err := s.publishCiphertext(owner, id, tempName, written, expiry, view)
 	if err != nil {
 		s.log.Warn().Err(err).Msg("Failed to store a CDN upload")
 		writeCdnError(w, http.StatusInternalServerError, "internal", "failed to store the upload")
@@ -595,6 +723,7 @@ func (s *CdnService) handleUpload(w http.ResponseWriter, r *http.Request) {
 	writeCdnJSON(w, http.StatusCreated, cdnUploadResponse{
 		ID:          entry.ID,
 		Size:        entry.Size,
+		View:        entry.View,
 		ExpiresAtMS: entry.ExpiresAt.UnixMilli(),
 	})
 }
@@ -653,7 +782,7 @@ func (s *CdnService) Store(owner string, ciphertext []byte, expiry time.Duration
 		_ = os.Remove(tempName)
 		return nil, fmt.Errorf("store cdn object: %w", err)
 	}
-	entry, err := s.publishCiphertext(owner, id, tempName, size, linkExpiry)
+	entry, err := s.publishCiphertext(owner, id, tempName, size, linkExpiry, s.cfg.EffectiveDefaultView())
 	if err != nil {
 		return nil, err
 	}
@@ -679,12 +808,13 @@ func (s *CdnService) resolveStoreExpiry(requested time.Duration) (time.Duration,
 // owner's oldest entries until the per-user cap holds. All three steps run
 // under the service lock, so no reader sees a half-published entry. The
 // temporary file is removed when the commit fails.
-func (s *CdnService) publishCiphertext(owner, id, tempPath string, size int64, expiry time.Duration) (*CdnEntry, error) {
+func (s *CdnService) publishCiphertext(owner, id, tempPath string, size int64, expiry time.Duration, view string) (*CdnEntry, error) {
 	now := time.Now().UTC()
 	entry := CdnEntry{
 		ID:        id,
 		Owner:     owner,
 		Size:      size,
+		View:      view,
 		CreatedAt: now,
 		ExpiresAt: now.Add(expiry),
 	}
@@ -720,6 +850,9 @@ func (s *CdnService) handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 	if entry == nil || entry.isAlbum() {
 		http.NotFound(w, r)
+		return
+	}
+	if !s.enforceViewClaim(w, r, entry) {
 		return
 	}
 	s.writeCdnObject(w, r, s.objectPath(id), id+".bin")
@@ -1361,6 +1494,52 @@ function sniffType(bytes) {
 	return "";
 }
 
+const FP_STORAGE_KEY = "cdn_fv_secret_v1";
+function viewerSecret() {
+\ttry {
+\t\tlet secret = window.localStorage.getItem(FP_STORAGE_KEY);
+\t\tif (!secret) {
+\t\t\tconst bytes = new Uint8Array(16);
+\t\t\tcrypto.getRandomValues(bytes);
+\t\t\tsecret = Array.from(bytes).map(function (b) { return b.toString(16).padStart(2, "0"); }).join("");
+\t\t\twindow.localStorage.setItem(FP_STORAGE_KEY, secret);
+\t\t}
+\t\treturn secret;
+\t} catch (error) {
+\t\treturn "no-storage";
+\t}
+}
+async function viewerFingerprint() {
+\tconst parts = [
+\t\tnavigator.userAgent || "",
+\t\tnavigator.platform || "",
+\t\tString(navigator.hardwareConcurrency || 0),
+\t\tString(navigator.maxTouchPoints || 0),
+\t\tString(screen.width) + "x" + String(screen.height),
+\t\tString(Math.round(window.devicePixelRatio || 0)),
+\t\tString(screen.colorDepth || 0),
+\t\t(navigator.languages || []).join(","),
+\t\t(Intl.DateTimeFormat().resolvedOptions().timeZone || ""),
+\t\tString(new Date().getTimezoneOffset()),
+\t\tviewerSecret()
+\t];
+\tconst digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(parts.join("|")));
+\treturn Array.from(new Uint8Array(digest)).map(function (b) { return b.toString(16).padStart(2, "0"); }).join("");
+}
+async function claimRefusal(response) {
+\ttry {
+\t\tconst body = await response.json();
+\t\tif (body && body.error === "already_viewed") {
+\t\t\treturn "This link was already opened in another browser; one-time links can only be viewed once.";
+\t\t}
+\t\tif (body && body.error === "viewer_fingerprint_required") {
+\t\t\treturn "This browser could not be identified for a one-time link.";
+\t\t}
+\t} catch (error) {
+\t}
+\treturn "Access denied (HTTP " + response.status + ").";
+}
+
 async function main() {
 	const keyText = location.hash.slice(1);
 	if (!keyText) { fail("Missing decryption key: the part of the link after # is required."); return; }
@@ -1370,7 +1549,8 @@ async function main() {
 
 	let ciphertext;
 	try {
-		const response = await fetch(rawURL, { cache: "no-store" });
+		const response = await fetch(rawURL, { cache: "no-store", headers: { "X-CDN-FP": await viewerFingerprint() } });
+		if (response.status === 403) { fail(await claimRefusal(response)); return; }
 		if (!response.ok) { fail("File not found or expired (HTTP " + response.status + ")."); return; }
 		ciphertext = new Uint8Array(await response.arrayBuffer());
 	} catch { fail("Failed to download the encrypted file."); return; }
