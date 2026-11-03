@@ -139,6 +139,12 @@ type PortalMetadata struct {
 	// ReadState is the last telephony message ID we consider read on the phone.
 	ReadState string `json:"read_state,omitempty"`
 
+	// AutoName is the last room name the bridge generated for this portal
+	// (without the "(sms...)" suffix). It lets later contact changes keep
+	// updating rooms the bridge named, even when their current name no
+	// longer matches a plain number list.
+	AutoName string `json:"auto_name,omitempty"`
+
 	// MergedInto is set when this portal was merged into another portal (the
 	// target). Incoming events for the merged-away thread are then routed to
 	// the target room; the source portal keeps its own identity and metadata.

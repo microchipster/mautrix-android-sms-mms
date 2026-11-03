@@ -146,3 +146,22 @@ func TestGroupDisplayNameFallbacks(t *testing.T) {
 		t.Fatalf("number collapse = %q", got)
 	}
 }
+
+func TestNameTokensLookGenerated(t *testing.T) {
+	known := []string{"+15550100202", "+15550100201", "TestOffice", "Test"}
+	if !nameTokensLookGenerated("TestOffice, +15550100202, +15550100201", known) {
+		t.Fatal("mixed stale + known list should be recognized")
+	}
+	if !nameTokensLookGenerated("+15550100202, +15550100201", known) {
+		t.Fatal("plain number list should be recognized")
+	}
+	if nameTokensLookGenerated("My Vacation Plans", known) {
+		t.Fatal("custom name must not be recognized")
+	}
+	if nameTokensLookGenerated("Alice, +15550100202", []string{"+15550100202"}) {
+		t.Fatal("single known token among two must not be enough")
+	}
+	if !nameTokensLookGenerated("TestOffice", []string{"TestOffice"}) {
+		t.Fatal("single known token alone should be recognized")
+	}
+}

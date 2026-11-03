@@ -278,18 +278,15 @@ func (nc *MyNetworkClient) portalLooksAutoNamed(ctx context.Context, portal *bri
 	if len(recipients) == 0 {
 		return false
 	}
+	if meta != nil && meta.AutoName != "" && name == meta.AutoName {
+		return true
+	}
+
 	if desired := strings.TrimSpace(nc.nameForRecipients(ctx, recipients)); desired != "" && name == desired {
 		return true
 	}
 	if len(recipients) == 1 {
-		number := CanonicalAddress(recipients[0])
-		if number == "" {
-			number = recipients[0]
-		}
-		if name == number || name == recipients[0] {
-			return true
-		}
-		return initialsLikeName(name, 1)
+		return true
 	}
 	if strings.ContainsAny(name, "@;") {
 		return true
@@ -298,7 +295,16 @@ func (nc *MyNetworkClient) portalLooksAutoNamed(ctx context.Context, portal *bri
 	if name == groupName(numbers) || name == strings.Join(numbers, ", ") {
 		return true
 	}
-	return initialsLikeName(name, len(recipients)+1)
+	if initialsLikeName(name, len(recipients)+1) {
+		return true
+	}
+	known := make([]string, 0, len(recipients)*4)
+	for _, recipient := range recipients {
+		known = append(known, recipient, CanonicalAddress(recipient))
+		label := nc.dmDisplayName(ctx, recipient)
+		known = append(known, label, firstWord(label))
+	}
+	return nameTokensLookGenerated(name, known)
 }
 
 // refreshAutoNamedPortals queues a room name update for every auto-named room
@@ -325,12 +331,13 @@ func (nc *MyNetworkClient) refreshAutoNamedPortals(ctx context.Context, login *b
 		if !nc.portalLooksAutoNamed(ctx, portal) {
 			continue
 		}
-		desired := strings.TrimSpace(nc.nameForRecipients(ctx, recipients))
-		if desired == "" {
+		generated := strings.TrimSpace(nc.nameForRecipients(ctx, recipients))
+		if generated == "" {
 			continue
 		}
-		desired = strings.TrimSpace(desired + " " + nc.roomNameSuffix(meta.SubID))
+		desired := strings.TrimSpace(generated + " " + nc.roomNameSuffix(meta.SubID))
 		if desired == strings.TrimSpace(portal.Name) {
+			nc.rememberAutoName(ctx, portal, meta, generated)
 			continue
 		}
 		name := desired
@@ -342,6 +349,7 @@ func (nc *MyNetworkClient) refreshAutoNamedPortals(ctx context.Context, login *b
 			},
 			ChatInfoChange: &bridgev2.ChatInfoChange{ChatInfo: &bridgev2.ChatInfo{Name: &name}},
 		})
+		nc.rememberAutoName(ctx, portal, meta, generated)
 		changed++
 	}
 	return changed, nil
@@ -421,4 +429,52 @@ func refreshAutoNamedPortalsForUser(ctx context.Context, bridge *bridgev2.Bridge
 		total += changed
 	}
 	return total, nil
+}
+
+// nameTokensLookGenerated reports whether a comma-separated room name consists
+// of participant labels or numbers the bridge generated, tolerating a few
+// stale labels left over from earlier contact data.
+func nameTokensLookGenerated(name string, known []string) bool {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return false
+	}
+	if index := strings.Index(trimmed, ", and "); index >= 0 && strings.HasSuffix(trimmed, " more") {
+		trimmed = trimmed[:index]
+	}
+	tokens := 0
+	matches := 0
+	for _, part := range strings.Split(trimmed, ",") {
+		token := strings.TrimSpace(part)
+		if token == "" {
+			continue
+		}
+		tokens++
+		for _, candidate := range known {
+			if candidate != "" && strings.EqualFold(candidate, token) {
+				matches++
+				break
+			}
+		}
+	}
+	if tokens == 0 {
+		return false
+	}
+	if matches == tokens {
+		return true
+	}
+	return tokens >= 2 && matches >= 2
+}
+
+// rememberAutoName stores the generated room name on the portal metadata so a
+// later contact change can still recognize and update the room.
+func (nc *MyNetworkClient) rememberAutoName(ctx context.Context, portal *bridgev2.Portal, meta *PortalMetadata, generated string) {
+	if portal == nil || meta == nil || generated == "" || meta.AutoName == generated {
+		return
+	}
+	meta.AutoName = generated
+	portal.Metadata = meta
+	if err := portal.Save(ctx); err != nil {
+		nc.log.Warn().Err(err).Str("portal_id", string(portal.ID)).Msg("Failed to remember the generated room name")
+	}
 }
