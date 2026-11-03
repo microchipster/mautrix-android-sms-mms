@@ -70,6 +70,9 @@ type LoginMetadata struct {
 	NumberLabelsPrompted bool `json:"number_labels_prompted,omitempty"`
 
 	LastSyncAt *time.Time `json:"last_sync_at,omitempty"`
+
+	// CardDAV stores the address book credentials and sync state for this login.
+	CardDAV *CardDAVCredentials `json:"carddav,omitempty"`
 }
 
 // SubscriptionInfo describes one SIM slot.
@@ -89,10 +92,12 @@ func (m *LoginMetadata) New() any {
 // GhostMetadata stores additional remote metadata for a Matrix ghost
 // (a phone number / short code / sender ID that talks to the phone).
 type GhostMetadata struct {
-	RemoteUserID string `json:"remote_user_id,omitempty"` // E.164, short code or alphanumeric sender ID
-	RemoteName   string `json:"remote_name,omitempty"`    // contact name as known by the phone
-	AvatarURL    string `json:"avatar_url,omitempty"`
-	CustomName   string `json:"custom_name,omitempty"`
+	RemoteUserID     string `json:"remote_user_id,omitempty"` // E.164, short code or alphanumeric sender ID
+	RemoteName       string `json:"remote_name,omitempty"`    // contact name as known by the phone
+	AvatarURL        string `json:"avatar_url,omitempty"`
+	CustomName       string `json:"custom_name,omitempty"`
+	CardDAVName      string `json:"carddav_name,omitempty"`
+	CardDAVPhotoHash string `json:"carddav_photo_hash,omitempty"`
 	// Labels are free-form tags assigned with the `label` command (or the
 	// automatic "new contact" label). They are metadata-only and never sent
 	// to the phone.

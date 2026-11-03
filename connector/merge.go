@@ -433,7 +433,13 @@ func mergeTargetName(participants []string, displayName func(address string) str
 		}
 		return participants[0]
 	default:
-		return groupName(participants)
+		labels := make([]string, len(participants))
+		for index, participant := range participants {
+			if displayName != nil {
+				labels[index] = strings.TrimSpace(displayName(participant))
+			}
+		}
+		return groupDisplayName(participants, labels)
 	}
 }
 

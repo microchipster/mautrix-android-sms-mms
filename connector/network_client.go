@@ -1051,12 +1051,7 @@ func (nc *MyNetworkClient) chatInfoForThread(ctx context.Context, thread agentap
 		roomType = database.RoomTypeDefault
 	}
 
-	var name string
-	if len(recipients) == 1 {
-		name = nc.dmDisplayName(ctx, recipients[0])
-	} else {
-		name = PortalName("", recipients, nc.ownNumbers()...)
-	}
+	name := nc.nameForRecipients(ctx, recipients)
 
 	members := &bridgev2.ChatMemberList{
 		IsFull: true,

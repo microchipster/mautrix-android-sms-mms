@@ -448,8 +448,8 @@ func TestMergeNameAndTopicRendering(t *testing.T) {
 	if got := mergeTargetName([]string{mergeBob}, displayName); got != mergeBob {
 		t.Fatalf("single-participant name = %q, want the address fallback", got)
 	}
-	if got := mergeTargetName([]string{mergeAlice, mergeBob}, displayName); got != mergeAlice+", "+mergeBob {
-		t.Fatalf("group name = %q, want the participant list", got)
+	if got := mergeTargetName([]string{mergeAlice, mergeBob}, displayName); got != "Alice, "+mergeBob {
+		t.Fatalf("group name = %q, want the label list (contact names where known)", got)
 	}
 	if got := mergeTargetName(nil, displayName); got != "Unknown conversation" {
 		t.Fatalf("empty name = %q", got)

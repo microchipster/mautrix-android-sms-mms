@@ -116,7 +116,8 @@ type SimpleConfig struct {
 	// Pairing configures the public app pairing API.
 	Pairing PairingConfig `yaml:"pairing,omitempty"`
 	// CDN configures the bridge-hosted encrypted file service.
-	CDN CdnConfig `yaml:"cdn,omitempty"`
+	CDN     CdnConfig     `yaml:"cdn,omitempty"`
+	CardDAV CardDAVConfig `yaml:"carddav,omitempty"`
 }
 
 // UnmarshalYAML accepts both an inline mapping and a scalar path to a YAML
@@ -171,6 +172,7 @@ func NewSimpleConfig() *SimpleConfig {
 		AntiSpam:             DefaultAntiSpamConfig(),
 		Pairing:              DefaultPairingConfig(),
 		CDN:                  DefaultCdnConfig(),
+		CardDAV:              DefaultCardDAVConfig(),
 	}
 }
 
