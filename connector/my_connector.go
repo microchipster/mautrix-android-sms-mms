@@ -119,6 +119,7 @@ func (c *MyConnector) Init(br *bridgev2.Bridge) {
 		proc.AddHandler(CommandMerge)
 		proc.AddHandler(CommandMerges)
 		proc.AddHandler(CommandUnmerge)
+		proc.AddHandler(CommandMergeCleanup)
 		proc.AddHandler(NewCdnCommand(c.cdn))
 		c.log.Info().Msg("Registered custom commands")
 	} else {

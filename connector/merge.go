@@ -852,6 +852,13 @@ func executeMerge(ctx context.Context, br *bridgev2.Bridge, user *bridgev2.User,
 		}
 	}
 
+	// The target is active, so a tombstone left from an earlier merge must go
+	// and its topic must match the current merge metadata.
+	if targetMeta, _ := target.Portal.Metadata.(*PortalMetadata); targetMeta != nil {
+		clearMergeTombstone(ctx, br, target.RoomID)
+		syncMergeTargetTopic(ctx, br, target.RoomID, targetMeta)
+	}
+
 	ownerLogin := mergeOwnerLogin(ctx, br, user, target.Portal.PortalKey)
 	if ownerLogin == nil {
 		ownerLogin = login
@@ -1091,8 +1098,8 @@ var CommandMerges = &commands.FullHandler{
 	RequiresAdmin: true,
 }
 
-// CommandUnmerge undoes the routing of one merged source. The tombstone and the
-// target's participant union stay as they were.
+// CommandUnmerge undoes the routing of one merged source. The source's tombstone
+// is cleared and the target's topic is recomputed from the merge metadata.
 var CommandUnmerge = &commands.FullHandler{
 	Func: func(ce *commands.Event) {
 		if len(ce.Args) != 1 {
@@ -1123,7 +1130,12 @@ var CommandUnmerge = &commands.FullHandler{
 			ce.Reply("Unmerged %s, but failed to update the target's merge list: %v", mergeEntryRoomLabel(room), err)
 			return
 		}
-		ce.Reply("Unmerged %s. Its thread is bridged into its own room again; the tombstone and the target's participants stay as they were.",
+		clearMergeTombstone(ce.Ctx, ce.Bridge, room.RoomID)
+		if targetRow, err := ce.Bridge.DB.Portal.GetByIDWithUncertainReceiver(ce.Ctx, networkid.PortalKey{ID: targetID}); err == nil && targetRow != nil && targetRow.MXID != "" {
+			targetMeta, _ := targetRow.Metadata.(*PortalMetadata)
+			syncMergeTargetTopic(ce.Ctx, ce.Bridge, targetRow.MXID, targetMeta)
+		}
+		ce.Reply("Unmerged %s. Its thread is bridged into its own room again; the merge tombstone was cleared and the target's topic updated.",
 			mergeEntryRoomLabel(room))
 	},
 	Name: "unmerge",
@@ -1131,6 +1143,104 @@ var CommandUnmerge = &commands.FullHandler{
 		Section:     commands.HelpSectionAdmin,
 		Description: "Undo the merge routing of one room (usage: unmerge <room-id>)",
 		Args:        "<room-id>",
+	},
+	RequiresLogin: true,
+	RequiresAdmin: true,
+}
+
+// clearMergeTombstone removes a tombstone left on a room that is active again.
+// Sending empty content clears the state.
+func clearMergeTombstone(ctx context.Context, br *bridgev2.Bridge, roomID id.RoomID) {
+	if br == nil || br.Bot == nil || roomID == "" {
+		return
+	}
+	if _, err := br.Bot.SendState(ctx, roomID, event.StateTombstone, "", &event.Content{}, time.Now()); err != nil {
+		br.Log.Warn().Err(err).Str("room_id", string(roomID)).Msg("Failed to clear merge tombstone")
+	}
+}
+
+// mergeTopicForMeta renders the topic a room's merge metadata wants. An empty
+// string means the room should not carry a merged-conversation topic.
+func mergeTopicForMeta(meta *PortalMetadata) string {
+	if meta == nil || len(meta.MergedFrom) == 0 {
+		return ""
+	}
+	return mergeTargetTopic(len(meta.MergedFrom)+1, meta.Recipients)
+}
+
+// syncMergeTargetTopic pushes the topic implied by the merge metadata to the
+// room, clearing a stale merged-conversation topic when none is due.
+func syncMergeTargetTopic(ctx context.Context, br *bridgev2.Bridge, roomID id.RoomID, meta *PortalMetadata) {
+	if br == nil || br.Bot == nil || roomID == "" {
+		return
+	}
+	content := &event.Content{}
+	if topic := mergeTopicForMeta(meta); topic != "" {
+		content.Parsed = &event.TopicEventContent{Topic: topic}
+	}
+	if _, err := br.Bot.SendState(ctx, roomID, event.StateTopic, "", content, time.Now()); err != nil {
+		br.Log.Warn().Err(err).Str("room_id", string(roomID)).Msg("Failed to update merged topic")
+	}
+}
+
+// CommandMergeCleanup repairs merge artifacts left in room state: stale
+// tombstones on rooms that are not merged away, and merged-conversation topics
+// that no longer match the merge metadata.
+var CommandMergeCleanup = &commands.FullHandler{
+	Func: func(ce *commands.Event) {
+		if ce.Bridge == nil || ce.Bridge.DB == nil {
+			ce.Reply("The bridge database is not available.")
+			return
+		}
+		stateAPI, ok := ce.Bridge.Matrix.(bridgev2.MatrixConnectorWithArbitraryRoomState)
+		if !ok {
+			ce.Reply("Room state access is not available.")
+			return
+		}
+		login := ce.User.GetDefaultLogin()
+		if login == nil {
+			ce.Reply("No login to clean up.")
+			return
+		}
+		userPortals, err := ce.Bridge.DB.UserPortal.GetAllForLogin(ce.Ctx, login.UserLogin)
+		if err != nil {
+			ce.Reply("Failed to list portals: %v", err)
+			return
+		}
+		clearedTombstones := 0
+		fixedTopics := 0
+		for _, up := range userPortals {
+			row, err := ce.Bridge.DB.Portal.GetByIDWithUncertainReceiver(ce.Ctx, up.Portal)
+			if err != nil || row == nil || row.MXID == "" {
+				continue
+			}
+			meta, _ := row.Metadata.(*PortalMetadata)
+			if meta != nil && meta.MergedInto != "" {
+				continue
+			}
+			if evt, err := stateAPI.GetStateEvent(ce.Ctx, row.MXID, event.StateTombstone, ""); err == nil && evt != nil {
+				clearMergeTombstone(ce.Ctx, ce.Bridge, row.MXID)
+				clearedTombstones++
+			}
+			want := mergeTopicForMeta(meta)
+			if want == "" {
+				if evt, err := stateAPI.GetStateEvent(ce.Ctx, row.MXID, event.StateTopic, ""); err == nil && evt != nil {
+					if topic := evt.Content.AsTopic(); topic != nil && strings.HasPrefix(topic.Topic, "Merged phone conversation") {
+						syncMergeTargetTopic(ce.Ctx, ce.Bridge, row.MXID, nil)
+						fixedTopics++
+					}
+				}
+			} else if row.Topic != want {
+				syncMergeTargetTopic(ce.Ctx, ce.Bridge, row.MXID, meta)
+				fixedTopics++
+			}
+		}
+		ce.Reply("Merge cleanup done: cleared %d stale tombstone(s), fixed %d topic(s).", clearedTombstones, fixedTopics)
+	},
+	Name: "merge-cleanup",
+	Help: commands.HelpMeta{
+		Section:     commands.HelpSectionAdmin,
+		Description: "Repair stale merge tombstones and merged-room topics",
 	},
 	RequiresLogin: true,
 	RequiresAdmin: true,
