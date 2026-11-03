@@ -182,13 +182,13 @@ var CommandCardDAVSync = &commands.FullHandler{
 			return
 		}
 		lines := []string{
-			fmt.Sprintf("CardDAV sync done: %d contact(s), %d phone number(s), %d added, %d already imported, %d photo(s).",
-				result.Contacts, result.Numbers, result.Added, result.Skipped, result.Photos),
+			fmt.Sprintf("CardDAV sync done: %d contact(s), %d phone number(s), %d added, %d updated, %d already imported, %d photo(s).",
+				result.Contacts, result.Numbers, result.Added, result.Updated, result.Skipped, result.Photos),
 		}
 		if result.Conflicts > 0 {
 			lines = append(lines, fmt.Sprintf("%d contact(s) keep an explicit name from `set-contact-name`; use `clear-contact-names --source explicit` to let CardDAV win.", result.Conflicts))
 		}
-		if result.Added > 0 || force {
+		if result.Added > 0 || result.Updated > 0 || force {
 			changed, err := client.refreshAutoNamedPortals(ce.Ctx, login)
 			if err != nil {
 				lines = append(lines, fmt.Sprintf("Room name refresh failed: %v", err))

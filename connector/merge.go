@@ -421,7 +421,7 @@ func formatMergePlanSummary(plan *mergePlan) string {
 }
 
 // mergeTargetName renders the room name for a merged target.
-func mergeTargetName(participants []string, displayName func(address string) string) string {
+func mergeTargetName(participants []string, displayName func(address string) string, ownInitial string) string {
 	switch len(participants) {
 	case 0:
 		return "Unknown conversation"
@@ -439,7 +439,7 @@ func mergeTargetName(participants []string, displayName func(address string) str
 				labels[index] = strings.TrimSpace(displayName(participant))
 			}
 		}
-		return groupDisplayName(participants, labels)
+		return groupDisplayName(participants, labels, ownInitial)
 	}
 }
 
@@ -457,7 +457,7 @@ func mergeTargetTopic(threadCount int, participants []string) string {
 }
 
 // mergedChatInfo builds the full desired room state for a merged target.
-func mergedChatInfo(ctx context.Context, br *bridgev2.Bridge, participants []string, topic string) *bridgev2.ChatInfo {
+func mergedChatInfo(ctx context.Context, br *bridgev2.Bridge, participants []string, topic string, ownInitial string) *bridgev2.ChatInfo {
 	roomType := database.RoomTypeDefault
 	if len(participants) == 1 {
 		roomType = database.RoomTypeDM
@@ -472,7 +472,7 @@ func mergedChatInfo(ctx context.Context, br *bridgev2.Bridge, participants []str
 		}
 		meta, _ := ghost.Metadata.(*GhostMetadata)
 		return GhostDisplayName(meta, address)
-	})
+	}, ownInitial)
 	members := &bridgev2.ChatMemberList{
 		IsFull: true,
 		Members: []bridgev2.ChatMember{{
@@ -870,7 +870,11 @@ func executeMerge(ctx context.Context, br *bridgev2.Bridge, user *bridgev2.User,
 		ownerLogin = login
 	}
 	if ownerLogin != nil && ownerLogin.Client != nil {
-		chatInfo := mergedChatInfo(ctx, br, plan.Participants, mergeTargetTopic(len(plan.Rooms), plan.Participants))
+		ownInitial := ""
+		if client, ok := ownerLogin.Client.(*MyNetworkClient); ok {
+			ownInitial = client.ownContactInitial(ctx)
+		}
+		chatInfo := mergedChatInfo(ctx, br, plan.Participants, mergeTargetTopic(len(plan.Rooms), plan.Participants), ownInitial)
 		br.QueueRemoteEvent(ownerLogin, &simplevent.ChatInfoChange{
 			EventMeta: simplevent.EventMeta{
 				Type:      bridgev2.RemoteEventChatInfoChange,

@@ -442,21 +442,21 @@ func TestMergeNameAndTopicRendering(t *testing.T) {
 		return ""
 	}
 
-	if got := mergeTargetName([]string{mergeAlice}, displayName); got != "Alice" {
+	if got := mergeTargetName([]string{mergeAlice}, displayName, ""); got != "Alice" {
 		t.Fatalf("single-participant name = %q, want the contact name", got)
 	}
-	if got := mergeTargetName([]string{mergeBob}, displayName); got != mergeBob {
+	if got := mergeTargetName([]string{mergeBob}, displayName, ""); got != mergeBob {
 		t.Fatalf("single-participant name = %q, want the address fallback", got)
 	}
-	if got := mergeTargetName([]string{mergeAlice, mergeBob}, displayName); got != "Alice, "+mergeBob {
+	if got := mergeTargetName([]string{mergeAlice, mergeBob}, displayName, ""); got != "Alice, "+mergeBob {
 		t.Fatalf("group name = %q, want the label list (contact names where known)", got)
 	}
-	if got := mergeTargetName(nil, displayName); got != "Unknown conversation" {
+	if got := mergeTargetName(nil, displayName, ""); got != "Unknown conversation" {
 		t.Fatalf("empty name = %q", got)
 	}
 
 	many := []string{"+15551110001", "+15551110002", "+15551110003", "+15551110004", "+15551110005", "+15551110006"}
-	if got := mergeTargetName(many, nil); !strings.HasSuffix(got, "and 1 more") {
+	if got := mergeTargetName(many, nil, ""); !strings.HasSuffix(got, "and 1 more") {
 		t.Fatalf("long group name = %q, want the collapsed suffix", got)
 	}
 

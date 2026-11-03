@@ -29,7 +29,8 @@ const (
 	cardDAVFetchTimeout       = 60 * time.Second
 	cardDAVSyncMaxAdds        = 500
 	cardDAVSyncAddInterval    = 200 * time.Millisecond // 5 adds/s
-	maxVCardAvatarSize        = 1 << 20                // 1 MiB
+	cardDAVAutoSyncInterval   = 6 * time.Hour
+	maxVCardAvatarSize        = 1 << 20 // 1 MiB
 )
 
 // defaultCardDAVCountryCode is used for phone numbers without a country code.
@@ -432,6 +433,7 @@ type cardDAVSyncResult struct {
 	Numbers    int
 	Candidates int
 	Added      int
+	Updated    int
 	Skipped    int
 	Conflicts  int
 	Photos     int
@@ -474,25 +476,29 @@ func (nc *MyNetworkClient) syncCardDAV(ctx context.Context, apply bool) (*cardDA
 		if len(addresses) == 0 {
 			continue
 		}
-		alreadyImported := true
+		known := true
+		changed := false
 		for _, address := range addresses {
 			ghost, err := nc.bridge.GetExistingGhostByID(ctx, MakeUserID(address))
 			if err != nil || ghost == nil {
-				alreadyImported = false
+				known = false
 				break
 			}
 			meta, _ := ghost.Metadata.(*GhostMetadata)
 			if meta == nil || strings.TrimSpace(meta.CardDAVName) == "" {
-				alreadyImported = false
+				known = false
 				break
 			}
+			if meta.CardDAVName != contact.Name {
+				changed = true
+			}
 		}
-		if alreadyImported {
+		if known && !changed {
 			result.Skipped++
 			continue
 		}
 		result.Candidates++
-		if !apply || result.Added >= cardDAVSyncMaxAdds {
+		if !apply || (!known && result.Added >= cardDAVSyncMaxAdds) {
 			continue
 		}
 		for _, address := range addresses {
@@ -500,10 +506,14 @@ func (nc *MyNetworkClient) syncCardDAV(ctx context.Context, apply bool) (*cardDA
 				result.Conflicts++
 			}
 		}
+		if known {
+			result.Updated++
+		} else {
+			result.Added++
+		}
 		if len(contact.Photo) > 0 {
 			result.Photos += nc.applyCardDAVPhoto(ctx, addresses, contact.Photo)
 		}
-		result.Added++
 		time.Sleep(cardDAVSyncAddInterval)
 	}
 	return result, nil
@@ -588,4 +598,34 @@ func portalMatchesContactAddress(portal *bridgev2.Portal, key string) bool {
 		}
 	}
 	return CanonicalAddress(UnescapeAddress(string(portal.ID))) == key
+}
+
+// cardDAVAutoSyncLoop refreshes the address book import in the background so
+// contact names added anywhere (for example in a phone's contacts app synced
+// to CardDAV) reach the auto-named rooms without a manual `carddav-sync`.
+func (nc *MyNetworkClient) cardDAVAutoSyncLoop(ctx context.Context, stopCh <-chan struct{}) {
+	timer := time.NewTimer(30 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-stopCh:
+			return
+		case <-timer.C:
+		}
+		if creds := nc.cardDAVCredentials(); creds != nil && strings.TrimSpace(creds.URL) != "" {
+			result, err := nc.syncCardDAV(ctx, true)
+			if err != nil {
+				nc.log.Warn().Err(err).Msg("Background CardDAV sync failed")
+			} else if result.Added > 0 || result.Updated > 0 || result.Photos > 0 {
+				if changed, err := nc.refreshAutoNamedPortals(ctx, nc.login); err != nil {
+					nc.log.Warn().Err(err).Msg("Background room name refresh failed")
+				} else if changed > 0 {
+					nc.log.Info().Int("rooms", changed).Msg("Renamed auto-named rooms after a background CardDAV sync")
+				}
+			}
+		}
+		timer.Reset(cardDAVAutoSyncInterval)
+	}
 }

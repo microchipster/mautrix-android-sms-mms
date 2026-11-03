@@ -4,7 +4,10 @@
 
 package connector
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestNormalizeCardDAVPhoneNumber(t *testing.T) {
 	cases := []struct {
@@ -82,16 +85,16 @@ func TestValidateCardDAVURL(t *testing.T) {
 }
 
 func TestGroupDisplayName(t *testing.T) {
-	if got := groupDisplayName([]string{"+1", "+2"}, []string{"Alice", "Bob"}); got != "AB" {
+	if got := groupDisplayName([]string{"+1", "+2"}, []string{"Alice", "Bob"}, ""); got != "Alice, Bob" {
 		t.Fatalf("all named = %q, want AB", got)
 	}
-	if got := groupDisplayName([]string{"+1", "+2"}, []string{"Alice", ""}); got != "Alice, +2" {
+	if got := groupDisplayName([]string{"+1", "+2"}, []string{"Alice", ""}, ""); got != "Alice, +2" {
 		t.Fatalf("mixed = %q", got)
 	}
-	if got := groupDisplayName([]string{"+1", "+2", "+3"}, []string{"", "", ""}); got != "+1, +2, +3" {
+	if got := groupDisplayName([]string{"+1", "+2", "+3"}, []string{"", "", ""}, ""); got != "+1, +2, +3" {
 		t.Fatalf("numbers = %q", got)
 	}
-	if got := groupDisplayName([]string{"+1"}, []string{"Alice"}); got != "Alice" {
+	if got := groupDisplayName([]string{"+1"}, []string{"Alice"}, ""); got != "Alice" {
 		t.Fatalf("single = %q", got)
 	}
 }
@@ -129,5 +132,17 @@ func TestParseContactNameSource(t *testing.T) {
 	}
 	if source, ok := parseContactNameSource(""); !ok || source != "" {
 		t.Fatal("empty must mean all sources")
+	}
+}
+
+func TestGroupDisplayNameFallbacks(t *testing.T) {
+	if got := groupDisplayName([]string{"+1", "+2"}, []string{"Alexandra Thompson", "Benjamin Franklin"}, ""); got != "Alexandra, Benjamin" {
+		t.Fatalf("first-name fallback = %q", got)
+	}
+	if got := groupDisplayName([]string{"+1", "+2", "+3"}, []string{"Alexandra Thompson", "Benjamin Franklin", "Christopher Lee"}, "D"); got != "ABCD" {
+		t.Fatalf("initials fallback = %q", got)
+	}
+	if got := groupDisplayName([]string{"+15550100204", "+15550100205", "+15550100206", "+15550100207", "+15550100208", "+15550100209"}, []string{"", "", "", "", "", ""}, ""); !strings.HasSuffix(got, "and 1 more") {
+		t.Fatalf("number collapse = %q", got)
 	}
 }

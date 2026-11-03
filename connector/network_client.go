@@ -67,6 +67,10 @@ type MyNetworkClient struct {
 
 	portalMetaMu sync.Mutex
 
+	ownInitialMu    sync.Mutex
+	ownInitialCache string
+	ownInitialAt    time.Time
+
 	msgIndexMu sync.Mutex
 	msgIndex   map[networkid.PortalKey][]indexedMessage
 
@@ -170,6 +174,7 @@ func (nc *MyNetworkClient) Start() {
 		return
 	}
 	go nc.eventLoop(loopCtx, stopCh, loopDone)
+	go nc.cardDAVAutoSyncLoop(loopCtx, stopCh)
 }
 
 func (nc *MyNetworkClient) eventLoop(ctx context.Context, stopCh <-chan struct{}, loopDone chan<- struct{}) {
