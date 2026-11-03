@@ -1156,13 +1156,32 @@ var CommandUnmerge = &commands.FullHandler{
 
 // clearMergeTombstone removes a tombstone left on a room that is active again.
 // Sending empty content clears the state.
-func clearMergeTombstone(ctx context.Context, br *bridgev2.Bridge, roomID id.RoomID) {
+func clearMergeTombstone(ctx context.Context, br *bridgev2.Bridge, roomID id.RoomID) bool {
 	if br == nil || br.Bot == nil || roomID == "" {
-		return
+		return false
 	}
-	if _, err := br.Bot.SendState(ctx, roomID, event.StateTombstone, "", &event.Content{}, time.Now()); err != nil {
+	stateAPI, ok := br.Matrix.(bridgev2.MatrixConnectorWithArbitraryRoomState)
+	if !ok {
+		return false
+	}
+	evt, err := stateAPI.GetStateEvent(ctx, roomID, event.StateTombstone, "")
+	if err != nil || evt == nil {
+		return false
+	}
+	tombstone := evt.Content.AsTombstone()
+	if tombstone == nil || tombstone.ReplacementRoom == "" {
+		return false
+	}
+	matrixConnector, ok := br.Matrix.(*matrix.Connector)
+	if !ok || matrixConnector.Bot == nil {
+		br.Log.Warn().Str("room_id", string(roomID)).Msg("Bridge bot intent is not available; leaving the merge tombstone")
+		return false
+	}
+	if _, err := matrixConnector.Bot.RedactEvent(ctx, roomID, evt.ID); err != nil {
 		br.Log.Warn().Err(err).Str("room_id", string(roomID)).Msg("Failed to clear merge tombstone")
+		return false
 	}
+	return true
 }
 
 // mergeTopicForMeta renders the topic a room's merge metadata wants. An empty
@@ -1175,18 +1194,18 @@ func mergeTopicForMeta(meta *PortalMetadata) string {
 }
 
 // syncMergeTargetTopic pushes the topic implied by the merge metadata to the
-// room, clearing a stale merged-conversation topic when none is due.
-func syncMergeTargetTopic(ctx context.Context, br *bridgev2.Bridge, roomID id.RoomID, meta *PortalMetadata) {
+// room, clearing a stale merged-conversation topic when none is due. Returns
+// true when the state event was accepted.
+func syncMergeTargetTopic(ctx context.Context, br *bridgev2.Bridge, roomID id.RoomID, meta *PortalMetadata) bool {
 	if br == nil || br.Bot == nil || roomID == "" {
-		return
+		return false
 	}
-	content := &event.Content{}
-	if topic := mergeTopicForMeta(meta); topic != "" {
-		content.Parsed = &event.TopicEventContent{Topic: topic}
-	}
+	content := &event.Content{Parsed: &event.TopicEventContent{Topic: mergeTopicForMeta(meta)}}
 	if _, err := br.Bot.SendState(ctx, roomID, event.StateTopic, "", content, time.Now()); err != nil {
 		br.Log.Warn().Err(err).Str("room_id", string(roomID)).Msg("Failed to update merged topic")
+		return false
 	}
+	return true
 }
 
 // CommandMergeCleanup repairs merge artifacts left in room state: stale
@@ -1224,21 +1243,22 @@ var CommandMergeCleanup = &commands.FullHandler{
 			if meta != nil && meta.MergedInto != "" {
 				continue
 			}
-			if evt, err := stateAPI.GetStateEvent(ce.Ctx, row.MXID, event.StateTombstone, ""); err == nil && evt != nil {
-				clearMergeTombstone(ce.Ctx, ce.Bridge, row.MXID)
+			if clearMergeTombstone(ce.Ctx, ce.Bridge, row.MXID) {
 				clearedTombstones++
 			}
 			want := mergeTopicForMeta(meta)
 			if want == "" {
 				if evt, err := stateAPI.GetStateEvent(ce.Ctx, row.MXID, event.StateTopic, ""); err == nil && evt != nil {
 					if topic := evt.Content.AsTopic(); topic != nil && strings.HasPrefix(topic.Topic, "Merged phone conversation") {
-						syncMergeTargetTopic(ce.Ctx, ce.Bridge, row.MXID, nil)
-						fixedTopics++
+						if syncMergeTargetTopic(ce.Ctx, ce.Bridge, row.MXID, nil) {
+							fixedTopics++
+						}
 					}
 				}
 			} else if row.Topic != want {
-				syncMergeTargetTopic(ce.Ctx, ce.Bridge, row.MXID, meta)
-				fixedTopics++
+				if syncMergeTargetTopic(ce.Ctx, ce.Bridge, row.MXID, meta) {
+					fixedTopics++
+				}
 			}
 		}
 		ce.Reply("Merge cleanup done: cleared %d stale tombstone(s), fixed %d topic(s).", clearedTombstones, fixedTopics)
