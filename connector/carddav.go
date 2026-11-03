@@ -619,7 +619,7 @@ func (nc *MyNetworkClient) cardDAVAutoSyncLoop(ctx context.Context, stopCh <-cha
 			if err != nil {
 				nc.log.Warn().Err(err).Msg("Background CardDAV sync failed")
 			} else if result.Added > 0 || result.Updated > 0 || result.Photos > 0 {
-				if changed, err := nc.refreshAutoNamedPortals(ctx, nc.login); err != nil {
+				if changed, err := refreshAutoNamedPortalsForUser(ctx, nc.bridge, nc.login.User); err != nil {
 					nc.log.Warn().Err(err).Msg("Background room name refresh failed")
 				} else if changed > 0 {
 					nc.log.Info().Int("rooms", changed).Msg("Renamed auto-named rooms after a background CardDAV sync")

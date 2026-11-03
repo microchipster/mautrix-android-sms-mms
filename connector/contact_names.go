@@ -247,7 +247,7 @@ var CommandSetContactName = &commands.FullHandler{
 			ghost.Metadata = meta
 			fallback := strings.TrimSpace(GhostDisplayName(meta, address))
 			ghost.UpdateInfo(ce.Ctx, &bridgev2.UserInfo{Name: &fallback})
-			changed, err := client.refreshAutoNamedPortals(ce.Ctx, login)
+			changed, err := refreshAutoNamedPortalsForUser(ce.Ctx, ce.Bridge, ce.User)
 			if err != nil {
 				ce.Reply("Cleared custom display name for %s, but room refresh failed: %v", address, err)
 				return
@@ -263,7 +263,7 @@ var CommandSetContactName = &commands.FullHandler{
 		meta.CustomName = name
 		ghost.Metadata = meta
 		ghost.UpdateInfo(ce.Ctx, &bridgev2.UserInfo{Name: &name})
-		changed, err := client.refreshAutoNamedPortals(ce.Ctx, login)
+		changed, err := refreshAutoNamedPortalsForUser(ce.Ctx, ce.Bridge, ce.User)
 		if err != nil {
 			ce.Reply("Set display name for %s, but room refresh failed: %v", address, err)
 			return
@@ -293,7 +293,7 @@ var CommandRefreshNames = &commands.FullHandler{
 			ce.Reply("This command is only available on the SMS connection.")
 			return
 		}
-		changed, err := client.refreshAutoNamedPortals(ce.Ctx, login)
+		changed, err := refreshAutoNamedPortalsForUser(ce.Ctx, ce.Bridge, ce.User)
 		if err != nil {
 			ce.Reply("Room name refresh failed: %v", err)
 			return

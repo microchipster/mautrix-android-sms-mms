@@ -167,7 +167,7 @@ var CommandCardDAVSync = &commands.FullHandler{
 			ce.Reply("Usage: carddav-sync [--no-apply] [--force-names]")
 			return
 		}
-		login, client, ok := cardDAVClientFromEvent(ce)
+		_, client, ok := cardDAVClientFromEvent(ce)
 		if !ok {
 			return
 		}
@@ -189,7 +189,7 @@ var CommandCardDAVSync = &commands.FullHandler{
 			lines = append(lines, fmt.Sprintf("%d contact(s) keep an explicit name from `set-contact-name`; use `clear-contact-names --source explicit` to let CardDAV win.", result.Conflicts))
 		}
 		if result.Added > 0 || result.Updated > 0 || force {
-			changed, err := client.refreshAutoNamedPortals(ce.Ctx, login)
+			changed, err := refreshAutoNamedPortalsForUser(ce.Ctx, ce.Bridge, ce.User)
 			if err != nil {
 				lines = append(lines, fmt.Sprintf("Room name refresh failed: %v", err))
 			} else {
