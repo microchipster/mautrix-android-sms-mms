@@ -26,7 +26,7 @@ type snapshot struct {
 type Echo struct {
 	SendID   string `json:"send_id"`
 	Address  string `json:"address"`
-	Body     string `json:"body,omitempty"`
+	BodyHash string `json:"body_hash,omitempty"`
 	TS       int64  `json:"ts"`
 	ThreadID int64  `json:"thread_id,omitempty"`
 	SentMS   int64  `json:"sent_ms,omitempty"`
@@ -181,7 +181,7 @@ func (s *State) MatchEcho(body string, timestampMS int64, recipients []string) (
 		if echo.Resolved != "" {
 			continue
 		}
-		if body != "" && echo.Body != "" && echo.Body != body {
+		if body != "" && echo.BodyHash != "" && echo.BodyHash != sha256Hex(body) {
 			continue
 		}
 		delta := timestampMS - echo.TS

@@ -106,7 +106,7 @@ func (s *Sender) SendSMS(ctx context.Context, sendID string, subID int, recipien
 		subID = -1
 	}
 	sendTS := time.Now().UnixMilli()
-	s.state.AddEcho(Echo{SendID: sendID, Address: dest, Body: text, TS: sendTS, ThreadID: 0})
+	s.state.AddEcho(Echo{SendID: sendID, Address: dest, BodyHash: sha256Hex(text), TS: sendTS, ThreadID: 0})
 
 	for i, part := range parts {
 		if err := s.sendPart(ctx, subID, dest, part); err != nil {
