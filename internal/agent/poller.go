@@ -114,7 +114,7 @@ func (s *Sweeper) handleMessages(ctx context.Context, msgs []Message, watermark 
 		if !seen {
 			// Content-based dedupe for carrier retries that create a second row.
 			dupKey := fmt.Sprintf("%s|%d|%s|%s", msg.Sender, msg.TimestampSentMS, strings.Join(msg.Recipients, ","), msg.Body)
-			if s.state.SeenDuplicate(dupKey, msg.TimestampMS, snapshotRetentionMS) {
+			if s.state.SeenDuplicate(sha256Hex(dupKey), msg.TimestampMS, snapshotRetentionMS) {
 				s.zlog.Debug().Str("message_id", msg.ID).Msg("Skipping duplicate provider row")
 				s.state.PutSnapshot(key, msg.TimestampMS, value)
 				continue
@@ -163,7 +163,7 @@ func (s *Sweeper) sweepThreads(ctx context.Context) {
 		return
 	}
 	for _, thread := range threads {
-		value := strings.Join(thread.Recipients, ",") + fmt.Sprintf("|%t", thread.Read)
+		value := sha256Hex(strings.Join(thread.Recipients, ",")) + fmt.Sprintf("|%t", thread.Read)
 		snap, seen := s.state.ThreadSnapshot(thread.ID)
 		if seen && snap.V == value {
 			continue
@@ -189,5 +189,5 @@ func snapshotValue(msg Message) string {
 	sort.Strings(attachments)
 	return fmt.Sprintf("%d|%t|%t|%d|%d|%s|%s",
 		msg.Type, msg.Read, msg.Seen, msg.Status, msg.TimestampSentMS,
-		strings.Join(attachments, ","), msg.Body)
+		strings.Join(attachments, ","), sha256Hex(msg.Body))
 }
