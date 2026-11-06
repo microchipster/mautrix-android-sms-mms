@@ -88,6 +88,10 @@ func (nc *MyNetworkClient) cardDAVCredentials() *CardDAVCredentials {
 		return nil
 	}
 	creds := *meta.CardDAV
+	if meta.CardDAVKeyMode == cardDAVKeyModeMemory && !cardDAVRAMKeyActive() {
+		creds.Password = ""
+		return &creds
+	}
 	if creds.Password == "" {
 		return &creds
 	}
@@ -128,7 +132,7 @@ func (nc *MyNetworkClient) setCardDAVCredentials(ctx context.Context, creds *Car
 	stored := *creds
 	encrypted, err := encryptCardDAVValue(nc.cardDAVConfig(), stored.Password)
 	if err != nil {
-		return fmt.Errorf("encrypt CardDAV password: %w", err)
+		return fmt.Errorf("encrypt CardDAV password: %w (run `carddav-unlock <secret>` to set an in-memory key)", err)
 	}
 	stored.Password = encrypted
 	meta.CardDAV = &stored
@@ -147,6 +151,28 @@ func (nc *MyNetworkClient) clearCardDAVCredentials(ctx context.Context) error {
 	meta.CardDAV = nil
 	nc.login.Metadata = meta
 	return nc.login.Save(ctx)
+}
+
+// cardDAVLocked reports whether the login uses the in-memory key and the key
+// is not present (e.g. after a restart until `carddav-unlock` is run again).
+func (nc *MyNetworkClient) cardDAVLocked() bool {
+	if nc == nil || nc.login == nil {
+		return false
+	}
+	meta, _ := nc.login.Metadata.(*LoginMetadata)
+	return meta != nil && meta.CardDAVKeyMode == cardDAVKeyModeMemory && !cardDAVRAMKeyActive()
+}
+
+// cardDAVEncryptionNote describes how stored CardDAV credentials are protected.
+func (nc *MyNetworkClient) cardDAVEncryptionNote() string {
+	meta, _ := nc.login.Metadata.(*LoginMetadata)
+	if meta != nil && meta.CardDAVKeyMode == cardDAVKeyModeMemory {
+		return "Credentials are encrypted with your in-memory unlock secret; the key is never written to disk."
+	}
+	if cardDAVLegacyKeyFileExists() {
+		return "Credentials are encrypted at rest with the key file; run `carddav-unlock <secret>` to switch to an in-memory key instead."
+	}
+	return "Credentials are encrypted at rest."
 }
 
 // validateCardDAVURL checks the URL scheme and rejects private targets unless
@@ -829,6 +855,9 @@ func (nc *MyNetworkClient) syncCardDAV(ctx context.Context, apply bool) (*cardDA
 	if creds == nil || strings.TrimSpace(creds.URL) == "" {
 		return nil, fmt.Errorf("CardDAV is not configured. Run: carddav-login <addressbook URL> <username> <password>")
 	}
+	if nc.cardDAVLocked() {
+		return nil, fmt.Errorf("CardDAV is locked: run `carddav-unlock <secret>` in the management room to restore the in-memory key")
+	}
 	cfg := nc.cardDAVConfig()
 	data, err := fetchCardDAVAddressbook(ctx, cfg, creds)
 	if err != nil {
@@ -997,7 +1026,7 @@ func (nc *MyNetworkClient) cardDAVAutoSyncLoop(ctx context.Context, stopCh <-cha
 			return
 		case <-timer.C:
 		}
-		if creds := nc.cardDAVCredentials(); creds != nil && strings.TrimSpace(creds.URL) != "" {
+		if creds := nc.cardDAVCredentials(); creds != nil && !nc.cardDAVLocked() && strings.TrimSpace(creds.URL) != "" {
 			result, err := nc.syncCardDAV(ctx, true)
 			if err != nil {
 				nc.log.Warn().Err(err).Msg("Background CardDAV sync failed")

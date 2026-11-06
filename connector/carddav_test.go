@@ -370,3 +370,53 @@ func TestCardDAVEncryptionRoundTrip(t *testing.T) {
 		t.Errorf("expected the key file to exist: %v", err)
 	}
 }
+
+func TestCardDAVUnlockKeyFromSecret(t *testing.T) {
+	first := cardDAVUnlockKeyFromSecret("correct horse battery staple")
+	second := cardDAVUnlockKeyFromSecret("correct horse battery staple")
+	third := cardDAVUnlockKeyFromSecret("another secret")
+	if len(first) != 32 {
+		t.Fatalf("expected a 32-byte key, got %d", len(first))
+	}
+	if string(first) != string(second) {
+		t.Fatal("expected the same secret to derive the same key")
+	}
+	if string(first) == string(third) {
+		t.Fatal("expected different secrets to derive different keys")
+	}
+}
+
+func TestCardDAVRAMKeyPrecedence(t *testing.T) {
+	cardDAVProcessKeyMu.Lock()
+	prevSource := cardDAVProcessKeySource
+	prevValue := cardDAVProcessKeyValue
+	prevErr := cardDAVProcessKeyErr
+	prevReady := cardDAVProcessKeyReady
+	cardDAVProcessKeyMu.Unlock()
+	clearCardDAVRAMKey()
+	defer func() {
+		clearCardDAVRAMKey()
+		cardDAVProcessKeyMu.Lock()
+		cardDAVProcessKeySource = prevSource
+		cardDAVProcessKeyValue = prevValue
+		cardDAVProcessKeyErr = prevErr
+		cardDAVProcessKeyReady = prevReady
+		cardDAVProcessKeyMu.Unlock()
+	}()
+
+	setCardDAVProcessKeyResolver(func() ([]byte, error) {
+		return nil, fmt.Errorf("no key configured")
+	})
+	setCardDAVRAMKey([]byte("test-in-memory-key"))
+	key, err := cardDAVProcessKey()
+	if err != nil {
+		t.Fatalf("unexpected error with the RAM key set: %v", err)
+	}
+	if string(key) != "test-in-memory-key" {
+		t.Fatalf("expected the RAM key, got %q", key)
+	}
+	clearCardDAVRAMKey()
+	if _, err := cardDAVProcessKey(); err == nil {
+		t.Fatal("expected the resolver error after clearing the RAM key")
+	}
+}

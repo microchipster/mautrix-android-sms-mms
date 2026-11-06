@@ -45,6 +45,10 @@ var CommandCardDAVLogin = &commands.FullHandler{
 			return
 		}
 		cfg := client.cardDAVConfig()
+		if client.cardDAVLocked() {
+			ce.Reply("CardDAV is locked. Run `carddav-unlock <secret>` first to restore the in-memory key (nothing on disk can unlock it).")
+			return
+		}
 		var creds *CardDAVCredentials
 		var data []byte
 		if cardDAVLooksLikeURL(ce.Args[0]) {
@@ -111,7 +115,7 @@ var CommandCardDAVLogin = &commands.FullHandler{
 			ce.Reply("Failed to store CardDAV credentials: %v", err)
 			return
 		}
-		ce.Reply("CardDAV connection test passed: %d contact(s) with %d phone number(s). Credentials stored for %s.\n\nRun `carddav-sync --no-apply` to preview the import, then `carddav-sync` to apply the names (and photos) to your rooms.\n\nCredentials are encrypted at rest.", len(contacts), numbers, creds.URL)
+		ce.Reply("CardDAV connection test passed: %d contact(s) with %d phone number(s). Credentials stored for %s.\n\nRun `carddav-sync --no-apply` to preview the import, then `carddav-sync` to apply the names (and photos) to your rooms.\n\n%s", len(contacts), numbers, creds.URL, client.cardDAVEncryptionNote())
 	},
 	Name: "carddav-login",
 	Help: commands.HelpMeta{
@@ -157,6 +161,15 @@ var CommandCardDAVStatus = &commands.FullHandler{
 			fmt.Sprintf("CardDAV default country code: +%s", cfg.DefaultCountryCode),
 			fmt.Sprintf("Allow insecure HTTP: %t", cfg.AllowInsecureHTTP),
 			fmt.Sprintf("Allow private hosts: %t", cfg.AllowPrivateHosts),
+		}
+		if client.cardDAVLocked() {
+			lines = append(lines, "Encryption: locked — run `carddav-unlock <secret>` (the key is kept in memory only)")
+		} else if meta, _ := login.Metadata.(*LoginMetadata); meta != nil && meta.CardDAVKeyMode == cardDAVKeyModeMemory {
+			lines = append(lines, "Encryption: unlocked (in-memory key; not stored on disk)")
+		} else if cardDAVLegacyKeyFileExists() {
+			lines = append(lines, "Encryption: legacy key file (/data/carddav.key) — run `carddav-unlock <secret>` to switch to an in-memory key")
+		} else {
+			lines = append(lines, "Encryption: no key set (run `carddav-login` or `carddav-unlock <secret>`)")
 		}
 		if creds == nil || strings.TrimSpace(creds.URL) == "" {
 			lines = append(lines, "Credentials: not configured (run `carddav-login`)")
@@ -210,6 +223,10 @@ var CommandCardDAVSync = &commands.FullHandler{
 		}
 		_, client, ok := cardDAVClientFromEvent(ce)
 		if !ok {
+			return
+		}
+		if client.cardDAVLocked() {
+			ce.Reply("CardDAV is locked. Run `carddav-unlock <secret>` first (the key is kept in memory only).")
 			return
 		}
 		result, err := client.syncCardDAV(ce.Ctx, apply)
@@ -324,4 +341,143 @@ var CommandClearContactNames = &commands.FullHandler{
 		Args:        "[--source explicit|carddav|phone] [<phone number>]",
 	},
 	RequiresLogin: true,
+}
+
+var CommandCardDAVUnlock = &commands.FullHandler{
+	Name: "carddav-unlock",
+	Help: commands.HelpMeta{
+		Section:     commands.HelpSectionAuth,
+		Description: "Derive the CardDAV encryption key from a secret and keep it in memory only",
+	},
+	RequiresLogin: true,
+	Func: func(ce *commands.Event) {
+		if len(ce.Args) < 1 {
+			ce.Reply("Usage: `carddav-unlock <secret>`")
+			ce.Reply("The secret derives the key that encrypts your stored CardDAV password and contact names. The key is kept in memory only, so nothing readable is written to disk. Run this after every bridge restart, in an encrypted room. If you ever lose the secret: `carddav-reset yes`, then `carddav-login` again to refetch from your CardDAV server.")
+			return
+		}
+		ce.Redact()
+		login, client, ok := cardDAVClientFromEvent(ce)
+		if !ok {
+			return
+		}
+		secret := strings.TrimSpace(strings.Join(ce.Args, " "))
+		if secret == "" {
+			ce.Reply("Usage: `carddav-unlock <secret>`")
+			return
+		}
+		oldKey, _ := cardDAVProcessKey()
+		newKey := cardDAVUnlockKeyFromSecret(secret)
+		meta, _ := login.Metadata.(*LoginMetadata)
+		if meta == nil {
+			meta = &LoginMetadata{}
+		}
+		staged := meta.CardDAV
+		if staged != nil {
+			clone := *staged
+			if clone.Password != "" {
+				if cardDAVNameIsEncrypted(clone.Password) {
+					if len(oldKey) == 0 {
+						ce.Reply("The stored CardDAV password is encrypted with a key that is not available any more. Run `carddav-reset yes`, then `carddav-login` again to refetch from your CardDAV server.")
+						return
+					}
+					plain, err := decryptCardDAVWithKey(oldKey, clone.Password)
+					if err != nil {
+						ce.Reply("Failed to decrypt the stored CardDAV password: %v", err)
+						return
+					}
+					clone.Password = plain
+				}
+				encrypted, err := encryptCardDAVWithKey(newKey, clone.Password)
+				if err != nil {
+					ce.Reply("Failed to encrypt the stored CardDAV password: %v", err)
+					return
+				}
+				clone.Password = encrypted
+			}
+			staged = &clone
+		}
+		setCardDAVRAMKey(newKey)
+		meta.CardDAV = staged
+		meta.CardDAVKeyMode = cardDAVKeyModeMemory
+		login.Metadata = meta
+		if err := login.Save(ce.Ctx); err != nil {
+			ce.Reply("Failed to store the CardDAV unlock state: %v", err)
+			return
+		}
+		legacy := ""
+		if cardDAVLegacyKeyFileExists() {
+			legacy = " The legacy key file /data/carddav.key is no longer needed and can be deleted."
+		}
+		if creds := client.cardDAVCredentials(); creds != nil && strings.TrimSpace(creds.URL) != "" {
+			result, err := client.syncCardDAV(ce.Ctx, true)
+			if err != nil {
+				ce.Reply("CardDAV is unlocked. Refresh it later with `carddav-sync` (now: %v).%s", err, legacy)
+				return
+			}
+			ce.Reply("CardDAV is unlocked and the address book was re-synced (%d updated, %d added).%s", result.Updated, result.Added, legacy)
+			return
+		}
+		ce.Reply("CardDAV is unlocked. Run `carddav-login <email> <password>` to connect your address book.%s", legacy)
+	},
+}
+
+var CommandCardDAVLock = &commands.FullHandler{
+	Name: "carddav-lock",
+	Help: commands.HelpMeta{
+		Section:     commands.HelpSectionAuth,
+		Description: "Forget the in-memory CardDAV encryption key and pause syncing",
+	},
+	RequiresLogin: true,
+	Func: func(ce *commands.Event) {
+		_, client, ok := cardDAVClientFromEvent(ce)
+		if !ok {
+			return
+		}
+		clearCardDAVRAMKey()
+		if client.cardDAVLocked() {
+			ce.Reply("CardDAV is locked: the in-memory key was forgotten and background syncing is paused. Run `carddav-unlock <secret>` with the same secret to unlock again; nothing is lost.")
+			return
+		}
+		ce.Reply("The in-memory CardDAV key was forgotten. If a legacy key file is in use, encryption continues with that file.")
+	},
+}
+
+var CommandCardDAVReset = &commands.FullHandler{
+	Name: "carddav-reset",
+	Help: commands.HelpMeta{
+		Section:     commands.HelpSectionAuth,
+		Description: "Remove stored CardDAV credentials, imported names and the in-memory key (use: carddav-reset yes)",
+	},
+	RequiresLogin: true,
+	Func: func(ce *commands.Event) {
+		if len(ce.Args) != 1 || strings.ToLower(ce.Args[0]) != "yes" {
+			ce.Reply("Usage: `carddav-reset yes`")
+			ce.Reply("This forgets the stored CardDAV credentials, removes all imported names and photos, and locks the encryption key. The address book stays on your CardDAV server: run `carddav-unlock <secret>`, `carddav-login <email> <password>` and `carddav-sync` to fetch it again.")
+			return
+		}
+		login, client, ok := cardDAVClientFromEvent(ce)
+		if !ok {
+			return
+		}
+		cleared, err := client.clearContactNameSources(ce.Ctx, login, contactNameSourceCardDAV, "")
+		if err != nil {
+			ce.Reply("Failed to remove the imported names: %v", err)
+			return
+		}
+		if err := client.clearCardDAVCredentials(ce.Ctx); err != nil {
+			ce.Reply("Failed to remove the CardDAV credentials: %v", err)
+			return
+		}
+		if meta, _ := login.Metadata.(*LoginMetadata); meta != nil {
+			meta.CardDAVKeyMode = ""
+			login.Metadata = meta
+			if err := login.Save(ce.Ctx); err != nil {
+				ce.Reply("Failed to store the reset state: %v", err)
+				return
+			}
+		}
+		clearCardDAVRAMKey()
+		ce.Reply("CardDAV was reset: credentials, imported names and photos removed (%d name(s)), and the encryption key forgotten. The address book still lives on your CardDAV server — run `carddav-unlock <secret>`, `carddav-login <email> <password>` and `carddav-sync` to fetch it again.", cleared)
+	},
 }

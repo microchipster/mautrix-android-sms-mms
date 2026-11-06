@@ -73,6 +73,9 @@ type LoginMetadata struct {
 
 	// CardDAV stores the address book credentials and sync state for this login.
 	CardDAV *CardDAVCredentials `json:"carddav,omitempty"`
+	// CardDAVKeyMode records how CardDAV secrets are encrypted ("memory" =
+	// unlocked with an in-memory key; empty = legacy key file mode).
+	CardDAVKeyMode string `json:"carddav_key_mode,omitempty"`
 }
 
 // SubscriptionInfo describes one SIM slot.
