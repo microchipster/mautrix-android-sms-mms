@@ -5,6 +5,10 @@
 package connector
 
 import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -163,5 +167,99 @@ func TestNameTokensLookGenerated(t *testing.T) {
 	}
 	if !nameTokensLookGenerated("TestOffice", []string{"TestOffice"}) {
 		t.Fatal("single known token alone should be recognized")
+	}
+}
+
+func TestFetchCardDAVAddressbookDAVDiscovery(t *testing.T) {
+	const aliceVCard = "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Alice Example\r\nTEL:+15551230001\r\nEND:VCARD\r\n"
+	const bobVCard = "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Bob Example\r\nTEL:+15551230002\r\nEND:VCARD\r\n"
+
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			if strings.HasSuffix(r.URL.Path, ".vcf") {
+				w.Header().Set("Content-Type", "text/vcard")
+				fmt.Fprint(w, aliceVCard, bobVCard)
+				return
+			}
+			w.Header().Set("Content-Type", "text/html")
+			fmt.Fprint(w, "<html><body>not a vcard export</body></html>")
+		case "PROPFIND":
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusMultiStatus)
+			fmt.Fprint(w, `<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav">
+  <d:response><d:href>/dav/</d:href><d:propstat><d:prop><d:resourcetype><c:addressbook/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+  <d:response><d:href>/dav/alice.vcf</d:href><d:propstat><d:prop><d:getcontenttype>text/vcard</d:getcontenttype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+  <d:response><d:href>/dav/bob.vcf</d:href><d:propstat><d:prop><d:getcontenttype>text/vcard</d:getcontenttype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+</d:multistatus>`)
+		case "REPORT":
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusMultiStatus)
+			fmt.Fprintf(w, `<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav">
+  <d:response><d:href>/dav/alice.vcf</d:href><d:propstat><d:prop><c:address-data>%s</c:address-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+  <d:response><d:href>/dav/bob.vcf</d:href><d:propstat><d:prop><c:address-data>%s</c:address-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+</d:multistatus>`, aliceVCard, bobVCard)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}
+	server := httptest.NewServer(http.HandlerFunc(handler))
+	defer server.Close()
+
+	cfg := CardDAVConfig{AllowInsecureHTTP: true, AllowPrivateHosts: true, DefaultCountryCode: "1"}
+	creds := &CardDAVCredentials{URL: server.URL + "/dav/", Username: "alice", Password: "secret"}
+	data, err := fetchCardDAVAddressbook(context.Background(), cfg, creds)
+	if err != nil {
+		t.Fatalf("fetchCardDAVAddressbook: %v", err)
+	}
+	contacts := parseVCards(data)
+	if len(contacts) != 2 {
+		t.Fatalf("expected 2 contacts, got %d", len(contacts))
+	}
+	if contacts[0].Name != "Alice Example" || contacts[1].Name != "Bob Example" {
+		t.Fatalf("unexpected contact names: %q, %q", contacts[0].Name, contacts[1].Name)
+	}
+}
+
+func TestFetchCardDAVAddressbookDAVFallback(t *testing.T) {
+	const carolVCard = "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Carol Example\r\nTEL:+15551230003\r\nEND:VCARD\r\n"
+
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			if strings.HasSuffix(r.URL.Path, ".vcf") {
+				w.Header().Set("Content-Type", "text/vcard")
+				fmt.Fprint(w, carolVCard)
+				return
+			}
+			w.Header().Set("Content-Type", "text/html")
+			fmt.Fprint(w, "<html><body>not a vcard export</body></html>")
+		case "PROPFIND":
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusMultiStatus)
+			fmt.Fprint(w, `<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav">
+  <d:response><d:href>/dav/carol.vcf</d:href><d:propstat><d:prop><d:getcontenttype>text/vcard</d:getcontenttype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+</d:multistatus>`)
+		case "REPORT":
+			w.WriteHeader(http.StatusNotImplemented)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}
+	server := httptest.NewServer(http.HandlerFunc(handler))
+	defer server.Close()
+
+	cfg := CardDAVConfig{AllowInsecureHTTP: true, AllowPrivateHosts: true, DefaultCountryCode: "1"}
+	creds := &CardDAVCredentials{URL: server.URL + "/dav/", Username: "alice", Password: "secret"}
+	data, err := fetchCardDAVAddressbook(context.Background(), cfg, creds)
+	if err != nil {
+		t.Fatalf("fetchCardDAVAddressbook: %v", err)
+	}
+	contacts := parseVCards(data)
+	if len(contacts) != 1 || contacts[0].Name != "Carol Example" {
+		t.Fatalf("expected Carol Example contact, got %#v", contacts)
 	}
 }

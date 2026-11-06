@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net"
@@ -390,7 +391,9 @@ func allowedVCardAvatarMime(mime string) bool {
 	return false
 }
 
-// fetchCardDAVAddressbook downloads and size-checks the address book.
+// fetchCardDAVAddressbook downloads and size-checks the address book. It first
+// tries a plain vCard export and falls back to CardDAV discovery (PROPFIND +
+// REPORT) for servers like SOGo that do not serve a combined export.
 func fetchCardDAVAddressbook(ctx context.Context, cfg CardDAVConfig, creds *CardDAVCredentials) ([]byte, error) {
 	if creds == nil {
 		return nil, fmt.Errorf("CardDAV credentials are missing")
@@ -400,16 +403,31 @@ func fetchCardDAVAddressbook(ctx context.Context, cfg CardDAVConfig, creds *Card
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, cardDAVFetchTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, strings.TrimSpace(creds.URL), nil)
-	if err != nil {
-		return nil, fmt.Errorf("build CardDAV request: %w", err)
-	}
-	if strings.TrimSpace(creds.Username) != "" {
-		req.SetBasicAuth(creds.Username, creds.Password)
-	}
-	req.Header.Set("Accept", "text/vcard, text/x-vcard, text/directory")
 	client := &http.Client{Timeout: cardDAVFetchTimeout}
-	resp, err := client.Do(req)
+	data, plainErr := fetchCardDAVPlain(requestCtx, client, creds)
+	if plainErr == nil && looksLikeVCardData(data) {
+		return data, nil
+	}
+	discovered, discoveryErr := fetchCardDAVViaDiscovery(requestCtx, client, creds)
+	if discoveryErr == nil && looksLikeVCardData(discovered) {
+		return discovered, nil
+	}
+	switch {
+	case plainErr != nil && discoveryErr != nil:
+		return nil, fmt.Errorf("fetch CardDAV address book: %v; CardDAV discovery failed: %v", plainErr, discoveryErr)
+	case discoveryErr != nil:
+		return nil, fmt.Errorf("addressbook response did not contain any vCards; CardDAV discovery failed: %v", discoveryErr)
+	case plainErr != nil:
+		return nil, plainErr
+	default:
+		return nil, fmt.Errorf("addressbook response did not contain any vCards")
+	}
+}
+
+// fetchCardDAVPlain performs a plain GET of the address book URL (the vCard
+// export behavior the bridge has always supported).
+func fetchCardDAVPlain(ctx context.Context, client *http.Client, creds *CardDAVCredentials) ([]byte, error) {
+	resp, err := cardDAVDoRequest(ctx, client, http.MethodGet, strings.TrimSpace(creds.URL), "", "", creds)
 	if err != nil {
 		return nil, fmt.Errorf("fetch CardDAV address book: %w", err)
 	}
@@ -425,6 +443,249 @@ func fetchCardDAVAddressbook(ctx context.Context, cfg CardDAVConfig, creds *Card
 		return nil, fmt.Errorf("addressbook is larger than %d bytes", maxCardDAVAddressbookSize)
 	}
 	return body, nil
+}
+
+// looksLikeVCardData reports whether the payload contains at least one vCard.
+func looksLikeVCardData(data []byte) bool {
+	return strings.Contains(strings.ToUpper(string(data)), "BEGIN:VCARD")
+}
+
+// cardDAVDoRequest builds and executes one CardDAV HTTP request.
+func cardDAVDoRequest(ctx context.Context, client *http.Client, method, rawURL, depth, body string, creds *CardDAVCredentials) (*http.Response, error) {
+	var reader io.Reader
+	if body != "" {
+		reader = strings.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, rawURL, reader)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(creds.Username) != "" {
+		req.SetBasicAuth(creds.Username, creds.Password)
+	}
+	if method == http.MethodGet {
+		req.Header.Set("Accept", "text/vcard, text/x-vcard, text/directory")
+	} else {
+		req.Header.Set("Content-Type", "application/xml; charset=utf-8")
+	}
+	if depth != "" {
+		req.Header.Set("Depth", depth)
+	}
+	return client.Do(req)
+}
+
+// cardDAVMultiStatus is a parsed DAV multistatus response.
+type cardDAVMultiStatus struct {
+	Responses []cardDAVMultiStatusResponse `xml:"response"`
+}
+
+type cardDAVMultiStatusResponse struct {
+	Href     string                       `xml:"href"`
+	Propstat []cardDAVMultiStatusPropstat `xml:"propstat"`
+}
+
+type cardDAVMultiStatusPropstat struct {
+	Prop cardDAVMultiStatusProp `xml:"prop"`
+}
+
+type cardDAVMultiStatusProp struct {
+	ResourceType cardDAVResourceType `xml:"resourcetype"`
+	ContentType  string              `xml:"getcontenttype"`
+	AddressData  string              `xml:"address-data"`
+}
+
+type cardDAVResourceType struct {
+	Addressbook *struct{} `xml:"addressbook"`
+}
+
+// cardDAVPropfindBody asks a collection for its resource types and content
+// types so the vCard members can be identified.
+const cardDAVPropfindBody = `<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav">
+  <d:prop>
+    <d:resourcetype/>
+    <d:getcontenttype/>
+  </d:prop>
+</d:propfind>`
+
+// fetchCardDAVViaDiscovery walks a CardDAV collection: PROPFIND lists the
+// vCard resources and a REPORT addressbook-multiget downloads them.
+func fetchCardDAVViaDiscovery(ctx context.Context, client *http.Client, creds *CardDAVCredentials) ([]byte, error) {
+	hrefs, err := cardDAVDiscoveryHrefs(ctx, client, creds)
+	if err != nil {
+		return nil, err
+	}
+	if len(hrefs) == 0 {
+		return nil, fmt.Errorf("no contacts were discovered in the address book")
+	}
+	return cardDAVMultiget(ctx, client, creds, hrefs)
+}
+
+// cardDAVDiscoveryHrefs lists the vCard resources of a collection.
+func cardDAVDiscoveryHrefs(ctx context.Context, client *http.Client, creds *CardDAVCredentials) ([]string, error) {
+	raw := strings.TrimSpace(creds.URL)
+	base, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid CardDAV URL: %w", err)
+	}
+	resp, err := cardDAVDoRequest(ctx, client, "PROPFIND", raw, "1", cardDAVPropfindBody, creds)
+	if err != nil {
+		return nil, fmt.Errorf("CardDAV PROPFIND: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMultiStatus {
+		return nil, fmt.Errorf("CardDAV PROPFIND failed with status %s", resp.Status)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxCardDAVAddressbookSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("read CardDAV PROPFIND response: %w", err)
+	}
+	if len(body) > maxCardDAVAddressbookSize {
+		return nil, fmt.Errorf("CardDAV PROPFIND response is larger than %d bytes", maxCardDAVAddressbookSize)
+	}
+	var multiStatus cardDAVMultiStatus
+	if err := xml.Unmarshal(body, &multiStatus); err != nil {
+		return nil, fmt.Errorf("parse CardDAV PROPFIND response: %w", err)
+	}
+	self := strings.TrimRight(base.Path, "/")
+	seen := map[string]struct{}{}
+	var hrefs []string
+	for _, item := range multiStatus.Responses {
+		href := strings.TrimSpace(item.Href)
+		if href == "" {
+			continue
+		}
+		resolved, err := base.Parse(href)
+		if err != nil || resolved.Path == "" {
+			continue
+		}
+		resolved.Fragment = ""
+		if strings.TrimRight(resolved.Path, "/") == self {
+			continue // the collection itself
+		}
+		isVCard := strings.HasSuffix(strings.ToLower(resolved.Path), ".vcf")
+		for _, propstat := range item.Propstat {
+			if propstat.Prop.ResourceType.Addressbook != nil {
+				isVCard = false
+				break
+			}
+			if strings.Contains(strings.ToLower(propstat.Prop.ContentType), "vcard") {
+				isVCard = true
+			}
+		}
+		if !isVCard {
+			continue
+		}
+		key := resolved.String()
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		hrefs = append(hrefs, key)
+	}
+	return hrefs, nil
+}
+
+// cardDAVMultiget downloads the listed contacts with a REPORT
+// addressbook-multiget, falling back to individual GETs when the server does
+// not answer with address data.
+func cardDAVMultiget(ctx context.Context, client *http.Client, creds *CardDAVCredentials, hrefs []string) ([]byte, error) {
+	const batchSize = 200
+	var vcards strings.Builder
+	for start := 0; start < len(hrefs); start += batchSize {
+		end := start + batchSize
+		if end > len(hrefs) {
+			end = len(hrefs)
+		}
+		data, err := cardDAVMultigetBatch(ctx, client, creds, hrefs[start:end])
+		if err != nil || data == "" {
+			return cardDAVIndividualGets(ctx, client, creds, hrefs)
+		}
+		vcards.WriteString(data)
+	}
+	return []byte(vcards.String()), nil
+}
+
+// cardDAVMultigetBatch fetches one batch of contacts via REPORT.
+func cardDAVMultigetBatch(ctx context.Context, client *http.Client, creds *CardDAVCredentials, hrefs []string) (string, error) {
+	var body strings.Builder
+	body.WriteString("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n")
+	body.WriteString("<c:addressbook-multiget xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:carddav\">\n")
+	body.WriteString("  <d:prop><d:getetag/><c:address-data/></d:prop>\n")
+	for _, href := range hrefs {
+		body.WriteString("  <d:href>")
+		if err := xml.EscapeText(&body, []byte(href)); err != nil {
+			return "", fmt.Errorf("build CardDAV REPORT request: %w", err)
+		}
+		body.WriteString("</d:href>\n")
+	}
+	body.WriteString("</c:addressbook-multiget>\n")
+	resp, err := cardDAVDoRequest(ctx, client, "REPORT", strings.TrimSpace(creds.URL), "1", body.String(), creds)
+	if err != nil {
+		return "", fmt.Errorf("CardDAV REPORT: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMultiStatus {
+		return "", fmt.Errorf("CardDAV REPORT failed with status %s", resp.Status)
+	}
+	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, maxCardDAVAddressbookSize+1))
+	if err != nil {
+		return "", fmt.Errorf("read CardDAV REPORT response: %w", err)
+	}
+	if len(responseBody) > maxCardDAVAddressbookSize {
+		return "", fmt.Errorf("CardDAV REPORT response is larger than %d bytes", maxCardDAVAddressbookSize)
+	}
+	var multiStatus cardDAVMultiStatus
+	if err := xml.Unmarshal(responseBody, &multiStatus); err != nil {
+		return "", fmt.Errorf("parse CardDAV REPORT response: %w", err)
+	}
+	var out strings.Builder
+	for _, item := range multiStatus.Responses {
+		for _, propstat := range item.Propstat {
+			data := strings.TrimSpace(propstat.Prop.AddressData)
+			if data == "" {
+				continue
+			}
+			out.WriteString(data)
+			out.WriteString("\r\n")
+		}
+	}
+	return out.String(), nil
+}
+
+// cardDAVIndividualGets fetches contacts one by one when REPORT address data
+// is unavailable.
+func cardDAVIndividualGets(ctx context.Context, client *http.Client, creds *CardDAVCredentials, hrefs []string) ([]byte, error) {
+	const maxContacts = 1000
+	var out strings.Builder
+	size := 0
+	for index, href := range hrefs {
+		if index >= maxContacts || size >= maxCardDAVAddressbookSize {
+			break
+		}
+		resp, err := cardDAVDoRequest(ctx, client, http.MethodGet, href, "", "", creds)
+		if err != nil {
+			return nil, fmt.Errorf("fetch CardDAV contact: %w", err)
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, int64(maxCardDAVAddressbookSize-size)+1))
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("read CardDAV contact: %w", err)
+		}
+		if resp.StatusCode < 200 || resp.StatusCode > 299 {
+			continue
+		}
+		if !looksLikeVCardData(body) {
+			continue
+		}
+		if len(body) > maxCardDAVAddressbookSize-size {
+			break
+		}
+		out.Write(body)
+		out.WriteString("\r\n")
+		size += len(body)
+	}
+	return []byte(out.String()), nil
 }
 
 // cardDAVSyncResult summarizes one address book sync.
