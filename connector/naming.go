@@ -80,7 +80,7 @@ func GhostDisplayName(meta *GhostMetadata, address string) string {
 		if name := strings.TrimSpace(meta.CustomName); name != "" {
 			return name
 		}
-		if name := strings.TrimSpace(meta.CardDAVName); name != "" {
+		if name := strings.TrimSpace(cardDAVDecryptStoredName(meta.CardDAVName)); name != "" {
 			return name
 		}
 		if name := strings.TrimSpace(meta.RemoteName); name != "" {

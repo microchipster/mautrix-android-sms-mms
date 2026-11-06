@@ -57,10 +57,15 @@ func (nc *MyNetworkClient) setGhostCardDAVName(ctx context.Context, address, nam
 		meta = &GhostMetadata{}
 	}
 	conflict := strings.TrimSpace(meta.CustomName) != "" && strings.TrimSpace(meta.CustomName) != trimmed
-	if meta.CardDAVName == trimmed {
+	if nc.cardDAVStoredName(meta) == trimmed && cardDAVNameIsEncrypted(meta.CardDAVName) {
 		return conflict
 	}
-	meta.CardDAVName = trimmed
+	storedName, err := encryptCardDAVValue(nc.cardDAVConfig(), trimmed)
+	if err != nil {
+		nc.log.Warn().Err(err).Str("address", canonical).Msg("CardDAV encryption unavailable; storing the contact name unencrypted")
+		storedName = trimmed
+	}
+	meta.CardDAVName = storedName
 	ghost.Metadata = meta
 	if err := nc.bridge.DB.Ghost.Update(ctx, ghost.Ghost); err != nil {
 		nc.log.Warn().Err(err).Str("address", canonical).Msg("Failed to store CardDAV contact name")

@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -261,5 +263,110 @@ func TestFetchCardDAVAddressbookDAVFallback(t *testing.T) {
 	contacts := parseVCards(data)
 	if len(contacts) != 1 || contacts[0].Name != "Carol Example" {
 		t.Fatalf("expected Carol Example contact, got %#v", contacts)
+	}
+}
+
+func TestCardDAVCandidateURLs(t *testing.T) {
+	candidates := cardDAVCandidateURLs("alice@example.com", "alice@example.com")
+	if len(candidates) == 0 {
+		t.Fatal("expected candidate URLs for an email address")
+	}
+	joined := strings.Join(candidates, "\n")
+	for _, want := range []string{".well-known/carddav", "/SOGo/dav/", "remote.php/dav/addressbooks", "carddav.fastmail.com"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("candidate list is missing %q:\n%s", want, joined)
+		}
+	}
+	seen := map[string]struct{}{}
+	for _, candidate := range candidates {
+		if !strings.HasPrefix(candidate, "https://") {
+			t.Errorf("candidate %q is not an https URL", candidate)
+		}
+		if _, ok := seen[candidate]; ok {
+			t.Errorf("candidate %q is duplicated", candidate)
+		}
+		seen[candidate] = struct{}{}
+	}
+	fastmail := cardDAVCandidateURLs("bob@fastmail.com", "bob@fastmail.com")
+	if len(fastmail) == 0 || !strings.HasPrefix(fastmail[0], "https://carddav.fastmail.com/") {
+		t.Errorf("expected the Fastmail endpoint first, got %v", fastmail)
+	}
+	if got := cardDAVCandidateURLs("", ""); len(got) != 0 {
+		t.Errorf("expected no candidates for an empty hint, got %v", got)
+	}
+	if got := cardDAVCandidateURLs("https://example.com/dav/", ""); len(got) != 0 {
+		t.Errorf("expected no candidates for a URL hint, got %v", got)
+	}
+}
+
+func TestDiscoverCardDAVAddressbook(t *testing.T) {
+	cfg := CardDAVConfig{AllowInsecureHTTP: true, AllowPrivateHosts: true, DefaultCountryCode: "1"}
+	candidates := cardDAVCandidateURLs("alice@example.com", "alice@example.com")
+	if len(candidates) < 2 {
+		t.Fatalf("expected at least two candidates, got %d", len(candidates))
+	}
+	fetcher := func(ctx context.Context, cfg CardDAVConfig, creds *CardDAVCredentials) ([]byte, error) {
+		if creds.URL != candidates[1] {
+			return nil, fmt.Errorf("not this one")
+		}
+		return []byte("BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Alice Example\r\nEND:VCARD\r\n"), nil
+	}
+	found, data, tried, err := discoverCardDAVAddressbookWith(context.Background(), cfg, candidates, "alice@example.com", "secret", fetcher)
+	if err != nil {
+		t.Fatalf("discovery failed: %v", err)
+	}
+	if found != candidates[1] {
+		t.Errorf("expected %q, got %q", candidates[1], found)
+	}
+	if !looksLikeVCardData(data) {
+		t.Errorf("expected vCard data, got %q", data)
+	}
+	if tried != 2 {
+		t.Errorf("expected 2 attempts, got %d", tried)
+	}
+	failing := func(ctx context.Context, cfg CardDAVConfig, creds *CardDAVCredentials) ([]byte, error) {
+		return nil, fmt.Errorf("nope")
+	}
+	if _, _, tried, err := discoverCardDAVAddressbookWith(context.Background(), cfg, candidates, "alice@example.com", "secret", failing); err == nil {
+		t.Error("expected an error when every candidate fails")
+	} else if tried != len(candidates) {
+		t.Errorf("expected %d attempts, got %d", len(candidates), tried)
+	}
+}
+
+func TestCardDAVEncryptionRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	keyFile := filepath.Join(dir, "carddav.key")
+	cfg := CardDAVConfig{KeyFile: keyFile}
+	encrypted, err := encryptCardDAVValue(cfg, "s3cret")
+	if err != nil {
+		t.Fatalf("encrypt failed: %v", err)
+	}
+	if !strings.HasPrefix(encrypted, "enc:v1:") {
+		t.Fatalf("expected the encrypted prefix, got %q", encrypted)
+	}
+	if encrypted == "s3cret" {
+		t.Fatal("the encrypted value must differ from the plaintext")
+	}
+	if !cardDAVNameIsEncrypted(encrypted) {
+		t.Error("expected the encrypted value to be recognized")
+	}
+	decrypted, err := decryptCardDAVValue(cfg, encrypted)
+	if err != nil {
+		t.Fatalf("decrypt failed: %v", err)
+	}
+	if decrypted != "s3cret" {
+		t.Errorf("expected %q, got %q", "s3cret", decrypted)
+	}
+	legacy, err := decryptCardDAVValue(cfg, "plaintext")
+	if err != nil || legacy != "plaintext" {
+		t.Errorf("expected legacy plaintext passthrough, got %q err %v", legacy, err)
+	}
+	other := CardDAVConfig{KeyFile: filepath.Join(dir, "other.key")}
+	if _, err := decryptCardDAVValue(other, encrypted); err == nil {
+		t.Error("expected a decryption error with a different key")
+	}
+	if _, err := os.Stat(keyFile); err != nil {
+		t.Errorf("expected the key file to exist: %v", err)
 	}
 }

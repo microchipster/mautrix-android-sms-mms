@@ -246,6 +246,12 @@ func (c *MyConnector) GetBridgeInfoVersion() (int, int) {
 // Start implements bridgev2.NetworkConnector. It only logs the stored login
 // inventory; per-login work happens in LoadUserLogin/Connect.
 func (c *MyConnector) Start(ctx context.Context) error {
+	setCardDAVProcessKeyResolver(func() ([]byte, error) {
+		if c.config == nil {
+			return cardDAVEncryptionKey(DefaultCardDAVConfig())
+		}
+		return cardDAVEncryptionKey(c.config.CardDAV)
+	})
 	c.log.Info().Msg("MyConnector Start called")
 	if c.bridge == nil {
 		c.log.Error().Msg("MyConnector started without bridge instance")

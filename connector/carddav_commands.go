@@ -27,13 +27,16 @@ func cardDAVClientFromEvent(ce *commands.Event) (*bridgev2.UserLogin, *MyNetwork
 	return login, client, true
 }
 
-const cardDAVLoginUsage = "carddav-login <addressbook URL> <username> <password>"
+const cardDAVLoginUsage = "carddav-login <email or addressbook URL> [username] <password>"
 
 // CommandCardDAVLogin stores CardDAV credentials after a connection test.
+// It accepts an email address and finds the address book URL automatically,
+// or a full addressbook URL with username and password.
 var CommandCardDAVLogin = &commands.FullHandler{
 	Func: func(ce *commands.Event) {
-		if len(ce.Args) < 3 {
+		if len(ce.Args) < 2 {
 			ce.Reply("Usage: %s", cardDAVLoginUsage)
+			ce.Reply("With just an email address and password, the bridge tries the common CardDAV locations automatically. Arguments are removed from the room after the command runs; nothing is stored unless the connection test succeeds.")
 			return
 		}
 		ce.Redact()
@@ -42,19 +45,58 @@ var CommandCardDAVLogin = &commands.FullHandler{
 			return
 		}
 		cfg := client.cardDAVConfig()
-		creds := &CardDAVCredentials{
-			URL:      strings.TrimSpace(ce.Args[0]),
-			Username: strings.TrimSpace(ce.Args[1]),
-			Password: strings.Join(ce.Args[2:], " "),
-		}
-		if err := validateCardDAVURL(cfg, creds.URL); err != nil {
-			ce.Reply("%v", err)
-			return
-		}
-		data, err := fetchCardDAVAddressbook(ce.Ctx, cfg, creds)
-		if err != nil {
-			ce.Reply("CardDAV connection test failed: %v — credentials were not saved.", err)
-			return
+		var creds *CardDAVCredentials
+		var data []byte
+		if cardDAVLooksLikeURL(ce.Args[0]) {
+			if len(ce.Args) < 3 {
+				ce.Reply("Usage: %s", cardDAVLoginUsage)
+				return
+			}
+			creds = &CardDAVCredentials{
+				URL:      strings.TrimSpace(ce.Args[0]),
+				Username: strings.TrimSpace(ce.Args[1]),
+				Password: strings.Join(ce.Args[2:], " "),
+			}
+			if err := validateCardDAVURL(cfg, creds.URL); err != nil {
+				ce.Reply("%v", err)
+				return
+			}
+			var err error
+			data, err = fetchCardDAVAddressbook(ce.Ctx, cfg, creds)
+			if err != nil {
+				ce.Reply("CardDAV connection test failed: %v — credentials were not saved.", err)
+				return
+			}
+		} else {
+			hint := strings.TrimSpace(ce.Args[0])
+			if !strings.Contains(hint, "@") {
+				ce.Reply("That does not look like an email address. Use: %s", cardDAVLoginUsage)
+				return
+			}
+			username := hint
+			password := ce.Args[1]
+			if len(ce.Args) > 2 {
+				username = strings.TrimSpace(ce.Args[1])
+				password = strings.Join(ce.Args[2:], " ")
+			}
+			if strings.TrimSpace(password) == "" {
+				ce.Reply("A password is required.")
+				return
+			}
+			candidates := cardDAVCandidateURLs(hint, username)
+			if len(candidates) == 0 {
+				ce.Reply("Could not work out any address book URLs for %s. If you know the URL, use: carddav-login <addressbook URL> <username> <password>.", hint)
+				return
+			}
+			ce.Reply("Looking for your CardDAV address book for %s (trying %d common addresses)…", hint, len(candidates))
+			url, found, tried, err := discoverCardDAVAddressbook(ce.Ctx, cfg, candidates, username, password)
+			if err != nil {
+				ce.Reply("Could not find your CardDAV address book automatically (%d addresses tried). If you know the URL, use: carddav-login <addressbook URL> <username> <password>.", tried)
+				return
+			}
+			ce.Reply("Found your address book: %s", url)
+			creds = &CardDAVCredentials{URL: url, Username: username, Password: password}
+			data = found
 		}
 		contacts := parseVCards(data)
 		numbers := 0
@@ -69,14 +111,13 @@ var CommandCardDAVLogin = &commands.FullHandler{
 			ce.Reply("Failed to store CardDAV credentials: %v", err)
 			return
 		}
-		ce.Reply("CardDAV connection test passed: %d contact(s) with %d phone number(s). Credentials stored for %s.\n\nRun `carddav-sync --no-apply` to preview the import, then `carddav-sync` to apply the names (and photos) to your rooms.",
-			len(contacts), numbers, creds.URL)
+		ce.Reply("CardDAV connection test passed: %d contact(s) with %d phone number(s). Credentials stored for %s.\n\nRun `carddav-sync --no-apply` to preview the import, then `carddav-sync` to apply the names (and photos) to your rooms.\n\nCredentials are encrypted at rest.", len(contacts), numbers, creds.URL)
 	},
 	Name: "carddav-login",
 	Help: commands.HelpMeta{
 		Section:     commands.HelpSectionAuth,
-		Description: "Connect a CardDAV address book for contact names and photos",
-		Args:        "<addressbook URL> <username> <password>",
+		Description: "Connect a CardDAV address book for contact names and photos (an email address is enough; the URL is found automatically)",
+		Args:        "[email or addressbook URL] [username] <password>",
 	},
 	RequiresLogin: true,
 }
