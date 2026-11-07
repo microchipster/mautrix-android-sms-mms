@@ -730,6 +730,7 @@ func managementRoomHelpText() string {
 		"- logout [login_id]\n" +
 		"- logout [login_id] purge\n" +
 		"- delete-all-portals yes\n" +
+		"- delete-spam-rooms [yes]\n" +
 		"- cdn list | view <id> | expire <id> | revoke <id> | stats | gc\n" +
 		"\n" +
 		"One Matrix room is maintained per phone thread; participant changes update the room " +
