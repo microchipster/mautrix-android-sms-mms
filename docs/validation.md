@@ -9,7 +9,7 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 The per-repo end-to-end harness for the SMS/MMS bridge, the adb agent and the app fork.
 It is env-driven: nothing assumes a specific workstation, phone or deployment. `t01` is the
 smoke test that must report no FAILs before any of the acceptance tests run; `t02`–`t14`
-follow the acceptance matrix in `todo.md` §3 and always assert real state (provider rows,
+follow the acceptance matrix in `TODO.md` and always assert real state (provider rows,
 bridge channel ids, room membership, timestamps, SHA-256 hashes).
 
 ## Contents
@@ -276,7 +276,7 @@ never as a failure.
 ## Evidence rules
 
 - Record **ids, senders, timestamps, cursors and hashes only — never message bodies**
-  (this matches the tracker rule in `todo.md` §0).
+  (this matches the tracker rule in `docs/DEVELOPMENT.md` (conventions)).
 - Use full `!room_id`s in iamb interactions; fuzzy names hang on prompts.
 - Waits are 60–120 s and use `--reply-mode different-sender`.
 - Attachment checks compare full SHA-256; `sha256_16` in `lib.sh` prints a short,
@@ -319,7 +319,7 @@ from ImageMagick drawing primitives and ffmpeg `lavfi` sources, no third-party c
 binary round trips and PDF sniffing — python3 stdlib only (`struct`/`zlib`), no
 third-party content; the CDN matrix also reuses `tiny.mp4` from the media fixtures.
 
-## Test map (acceptance matrix, `todo.md` §3)
+## Test map (`TODO.md` acceptance matrix)
 
 | # | Acceptance step | Test | Live probe (opt-in) |
 | --- | --- | --- | --- |

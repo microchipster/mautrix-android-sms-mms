@@ -14,7 +14,7 @@ zero-code fallback). No code was written and **nothing in this document was exec
 the probes in §6 are designed, not yet run. Claims taken from third-party repositories are marked as
 claimed/not independently verified.
 
-Device context in this repo (todo.md): office phone = LineageOS 21, rooted, US Mobile SIM; plus a
+Device context in this repo (TODO.md): office phone = LineageOS 21, rooted, US Mobile SIM; plus a
 Pixel for comparison; carrier-side plan is a normal US number.
 
 ---
@@ -481,7 +481,7 @@ version.
   rooms must be unencrypted (documented).
   <https://github.com/williamkray/mrtc-sip-bridge>
 - Internal: `mautrix-jmpchat/docs/SFRAME_CALLS_M0_FINDINGS.md` (LiveKit Go SDK SFrame, key
-  delivery M2), `mautrix-android-sms-mms/docs/PLAN.md` (app transport), repo `todo.md`
+  delivery M2), `mautrix-android-sms-mms/docs/PLAN.md` (app transport), repo `TODO.md`
   (device/carrier facts).
 - Gateway pricing/background: GoIP8-4G US$620 <https://goantifraud.com/goip-equipment/48-goip8-4g>;
   Portech MV-370L €474.81
