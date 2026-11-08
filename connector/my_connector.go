@@ -106,6 +106,7 @@ func (c *MyConnector) Init(br *bridgev2.Bridge) {
 		proc.AddHandler(CommandListUsers)
 		proc.AddHandler(CommandDeleteAllPortals)
 		proc.AddHandler(CommandLogout)
+		proc.AddHandler(CommandPruneLogins)
 		proc.AddHandler(CommandRebindRoom)
 		proc.AddHandler(CommandDevices)
 		proc.AddHandler(CommandUnpair)

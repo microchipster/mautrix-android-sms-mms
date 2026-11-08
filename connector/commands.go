@@ -731,10 +731,61 @@ func managementRoomHelpText() string {
 		"- logout [login_id] purge\n" +
 		"- delete-all-portals yes\n" +
 		"- delete-spam-rooms [yes]\n" +
+		"- prune-logins [yes]\n" +
 		"- cdn list | view <id> | expire <id> | revoke <id> | stats | gc\n" +
 		"\n" +
 		"One Matrix room is maintained per phone thread; participant changes update the room " +
 		"instead of creating a new one. If a phone restore changes thread IDs, use rebind-room " +
 		"to point the new thread at the existing room. If Android fractures one conversation " +
 		"across several threads, use merge to route them into one room."
+}
+
+// CommandPruneLogins deletes the rooms (and login records) of logins that are
+// already logged out, so old bridges do not leave rooms behind.
+var CommandPruneLogins = &commands.FullHandler{
+	Func: func(ce *commands.Event) {
+		logins := ce.User.GetUserLogins()
+		var candidates []*bridgev2.UserLogin
+		for _, login := range logins {
+			if login == nil || login.BridgeState == nil {
+				continue
+			}
+			if login.BridgeState.GetPrev().StateEvent != status.StateLoggedOut {
+				continue
+			}
+			candidates = append(candidates, login)
+		}
+		if len(candidates) == 0 {
+			ce.Reply("No logged-out logins to prune.")
+			return
+		}
+		if len(ce.Args) == 0 || (ce.Args[0] != "yes" && ce.Args[0] != "--yes") {
+			lines := []string{fmt.Sprintf("Found %d logged-out login(s):", len(candidates))}
+			for _, login := range candidates {
+				remote := strings.TrimSpace(login.RemoteName)
+				if remote == "" {
+					remote = "(unknown)"
+				}
+				lines = append(lines, fmt.Sprintf("- %s - %s", login.ID, remote))
+			}
+			lines = append(lines, "Run: prune-logins yes to delete their rooms and spaces.")
+			ce.Reply("%s", strings.Join(lines, "\n"))
+			return
+		}
+		pruned := 0
+		for _, login := range candidates {
+			if err := deleteAllPortals(ce, login); err != nil {
+				ce.Reply("Failed to prune login %s: %v", login.ID, err)
+				return
+			}
+			pruned++
+		}
+		ce.Reply("Pruned %d logged-out login(s): their rooms and spaces were deleted and the logins removed.", pruned)
+	},
+	Name: "prune-logins",
+	Help: commands.HelpMeta{
+		Section:     commands.HelpSectionAdmin,
+		Description: "Delete the rooms and spaces of logins that are already logged out (preview; use: prune-logins yes)",
+	},
+	RequiresLogin: true,
 }
