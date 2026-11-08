@@ -35,16 +35,16 @@ drop-in replacement for the agent, and both must produce identical room/ghost id
 
 | Repo | Path (this machine) | Branch | Remote |
 |---|---|---|---|
-| Bridge + agent | `~/src/repos/matrix-docker-ansible-deploy/mautrix-android-sms-mms` | `main` | `ssh://git@git.example.com:2222/microchipster/mautrix-android-sms-mms.git` |
-| App fork (Fossify Messages) | `~/src/repos/fossify-messages` | `bridge` | `git.example.com/repos/fossify-messages-bridge` (upstream = `FossifyOrg/Messages`) |
-| mmslib fork | `~/src/repos/fossify-mmslib` | `bridge` | `git.example.com/repos/fossify-mmslib-bridge` (upstream = `FossifyOrg/android-smsmms`) |
-| Playbook (MDAD) | `~/src/repos/matrix-docker-ansible-deploy` (dev, dirty allowed) | `master` | `git.example.com/microchipster/matrix-docker-ansible-deploy` |
+| Bridge + agent | `~/src/repos/matrix-docker-ansible-deploy/mautrix-android-sms-mms` | `main` | `git@github.com:microchipster/mautrix-android-sms-mms.git` |
+| App fork (Fossify Messages) | `~/src/repos/fossify-messages` | `bridge` | `github.com/microchipster/fossify-messages-bridge` (upstream = `FossifyOrg/Messages`) |
+| mmslib fork | `~/src/repos/fossify-mmslib` | `bridge` | `github.com/microchipster/fossify-mmslib-bridge` (upstream = `FossifyOrg/android-smsmms`) |
+| Playbook (MDAD) | `~/src/repos/matrix-docker-ansible-deploy` (dev, dirty allowed) | `master` | `github.com/microchipster/matrix-docker-ansible-deploy` |
 | Playbook (deploy clone) | `~/src/other/ansible/spantaleev/matrix-docker-ansible-deploy` (pristine) | `master` | same, force-pushed before deploys |
 | Private deploy vars | `~/src/repos/private/cloud/matrix_ansible/inventory/host_vars/matrix.example.com/vars.yml` | - | separate private repo, user edits in flight - do not commit others' changes |
 
-`git.example.com` API token: `FORGEJO_TOKEN` in `~/src/repos/matrix-docker-ansible-deploy/.env`
-(`set -a; . .env; set +a`; `Authorization: token $FORGEJO_TOKEN`; API base
-`https://git.example.com/api/v1`).
+Development happens on a self-hosted Forgejo instance; the repository is mirrored to
+GitHub (`github.com/microchipster/mautrix-android-sms-mms`). Hosting credentials live
+outside the repository and are never committed.
 
 Branches in the bridge repo (oldest → newest, all pushed): `e46460c` initial project,
 `1bcc8fa` pairing API, `21bf25b` app-pair login flow, `4e79a5e` app transport routing,

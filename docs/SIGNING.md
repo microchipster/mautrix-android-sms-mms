@@ -45,9 +45,8 @@ Keys for the fork live in `pass` under namespace `<user>`:
   O=<user>`, SHA-256 `678d78dd1d9953c6363739c136bafa59683c66760b63dc33f88416889df2b34b`
   (check with `apksigner verify --print-certs <apk>`)
 
-`~/.password-store` is a git repository with remote
-`ssh://git@git.example.com/<user>/auth.git`; the fork's keystore and password are committed
-and pushed (`git -C ~/.password-store log -- <user>/android/org.fossify.messages.bridge`).
+`~/.password-store` is a git repository with a private remote; the fork's keystore and
+password are committed and pushed (`git -C ~/.password-store log -- <user>/android/org.fossify.messages.bridge`).
 That is the primary off-machine copy — **keep it pushed** after any key change.
 
 Things that have bitten us and are now guarded:

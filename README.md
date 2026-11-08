@@ -21,7 +21,7 @@ Two transports, same bridge:
 
 | Transport | What it needs | What it gives you |
 |---|---|---|
-| **App mode** (recommended) | The [Fossify Messages bridge app](https://git.example.com/repos/fossify-messages-bridge/releases) on the phone, paired to your homeserver over HTTPS | Everything: incoming and outgoing SMS/MMS, group MMS, attachments, read-state sync. Works from anywhere — no cables, no LAN. |
+| **App mode** (recommended) | The [Fossify Messages bridge app](https://github.com/microchipster/fossify-messages-bridge/releases) on the phone, paired to your homeserver over HTTPS | Everything: incoming and outgoing SMS/MMS, group MMS, attachments, read-state sync. Works from anywhere — no cables, no LAN. |
 | **ADB agent mode** | A computer with the phone plugged in over USB, `adb`, optional root | SMS/MMS reading, SMS sending, attachments. MMS **sending** is not possible over ADB — use app mode if you need it. |
 
 Both transports identify the phone the same way, so a phone can move between
@@ -62,7 +62,7 @@ pairing listener (default `:29322`).
 ### 2. Install the app
 
 Grab the signed APK from the
-[releases page](https://git.example.com/repos/fossify-messages-bridge/releases):
+[releases page](https://github.com/microchipster/fossify-messages-bridge/releases):
 
 ```sh
 adb install -r MessagesBridge-<version>.apk
