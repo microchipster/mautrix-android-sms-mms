@@ -40,10 +40,10 @@ smsmms://pair?hs=<urlencoded homeserver_url>&b=<urlencoded bridge_base_url>&code
   typed by the user.
 
 Discovery (when `b` is absent/broken): app fetches `{hs}/.well-known/matrix/client` and
-reads the custom key `chat.example.bridge.sms_mms`:
+reads the custom key `chat.<namespace>.bridge.sms_mms`:
 
 ```json
-{"chat.example.bridge.sms_mms": {"url": "https://matrix.example.com", "protocol_version": 1}}
+{"chat.<namespace>.bridge.sms_mms": {"url": "https://matrix.example.com", "protocol_version": 1}}
 ```
 
 The playbook injects this key; a manual override in the app settings always wins.

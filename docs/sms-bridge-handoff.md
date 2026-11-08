@@ -102,7 +102,7 @@ Verified:
 - `https://matrix.example.com/_smsmms/v1/info` →
   `{"protocol_version":1,"bridge_name":"mautrix-android-sms-mms","homeserver_url":"https://matrix.example.com","pairing_enabled":true}`
   (Traefik routes `/_smsmms/` → container `:29322`; `.well-known` key
-  `chat.example.bridge.sms_mms` is published by the playbook).
+  `chat.mdad.bridge.sms_mms` is published by the playbook).
 - Service `matrix-mautrix-android-sms-mms.service` active; container `matrix-mautrix-android-sms-mms`
   runs with the playbook-provided command line; appservice token accepted; bot
   `@android-sms-mmsbot:example.com` syncing.

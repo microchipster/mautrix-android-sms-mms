@@ -51,7 +51,7 @@ matrix_bridge_mautrix_android_sms_mms_enabled: true
 then run the playbook for the `install-mautrix-android-sms-mms` tag (or the
 usual setup/install tags). The role self-builds the bridge from this repository,
 serves `/_smsmms/` through Traefik, and advertises the bridge URL in
-`.well-known/matrix/client` (`chat.example.bridge.sms_mms`) so the app can
+`.well-known/matrix/client` (`chat.<namespace>.bridge.sms_mms`) so the app can
 discover it automatically.
 
 Not using the playbook? `docs/AGENT_API.md` and `docs/PAIRING_PROTOCOL.md`
