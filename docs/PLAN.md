@@ -1,6 +1,6 @@
 # mautrix-android-sms-mms — bridge between Matrix and Android SMS/MMS
 
-Status: **draft plan v1** (2026-10-22). Owner: microchipster. Base: forked/adapted from
+Status: **draft plan v1** (2026-10-22). Owner: the maintainers. Base: forked/adapted from
 `mautrix-jmpchat` (bridgev2, Go, known-good, modern).
 
 ## 1. Goal
